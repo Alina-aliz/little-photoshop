@@ -3,7 +3,7 @@
 import {
   ArrowDown, ArrowUp, Bot, Brush, Check, ChevronDown, CircleHelp, Download,
   Eraser, Eye, EyeOff, Hand, ImagePlus, Layers3, MousePointer2, Plus, Redo2,
-  Sparkles, Trash2, Undo2, WandSparkles, X, ZoomIn, ZoomOut,
+  Sparkles, Trash2, Undo2, WandSparkles, X,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
@@ -44,11 +44,17 @@ function makeCanvas() { const canvas = document.createElement('canvas'); canvas.
 export function BabyPhotoshop() {
   const displayRef = useRef<HTMLCanvasElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const layerCanvases = useRef(new Map<string, HTMLCanvasElement>());
   const initialized = useRef(false);
   const drawing = useRef(false);
   const lastPoint = useRef({ x: 0, y: 0 });
   const selectionStart = useRef({ x: 0, y: 0 });
+  const panStart = useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 });
+  const panning = useRef(false);
+  const zoomRef = useRef(82);
+  const zoomFrame = useRef<number | null>(null);
   const undoStack = useRef<Array<{ layerId: string; image: ImageData }>>([]);
   const redoStack = useRef<Array<{ layerId: string; image: ImageData }>>([]);
   const pendingEdits = useRef(new Map<string, PendingEdit>());
@@ -70,6 +76,53 @@ export function BabyPhotoshop() {
     { id: 1, title: 'Agent added a layer', detail: 'Warm window light', time: 'now' },
     { id: 2, title: 'Region selected', detail: '300 × 330 px', time: '1m' },
   ]);
+
+  const zoomAt = useCallback((requestedZoom: number, clientX?: number, clientY?: number) => {
+    const viewport = viewportRef.current;
+    const stage = stageRef.current;
+    if (!viewport || !stage) return;
+    const nextZoom = Math.max(25, Math.min(400, Math.round(requestedZoom * 10) / 10));
+    if (nextZoom === zoomRef.current) return;
+
+    const viewportRect = viewport.getBoundingClientRect();
+    const before = stage.getBoundingClientRect();
+    const focusX = clientX ?? viewportRect.left + viewportRect.width / 2;
+    const focusY = clientY ?? viewportRect.top + viewportRect.height / 2;
+    const anchorX = before.width ? (focusX - before.left) / before.width : .5;
+    const anchorY = before.height ? (focusY - before.top) / before.height : .5;
+
+    zoomRef.current = nextZoom;
+    setZoom(nextZoom);
+    if (zoomFrame.current !== null) cancelAnimationFrame(zoomFrame.current);
+    zoomFrame.current = requestAnimationFrame(() => {
+      const after = stage.getBoundingClientRect();
+      viewport.scrollLeft += after.left + anchorX * after.width - focusX;
+      viewport.scrollTop += after.top + anchorY * after.height - focusY;
+      zoomFrame.current = null;
+    });
+  }, []);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const wheel = (event: WheelEvent) => {
+      if (event.ctrlKey) {
+        event.preventDefault();
+        const limitedDelta = Math.max(-24, Math.min(24, event.deltaY));
+        zoomAt(zoomRef.current * Math.exp(-limitedDelta * .012), event.clientX, event.clientY);
+        return;
+      }
+      if (event.shiftKey && Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+        event.preventDefault();
+        viewport.scrollLeft += event.deltaY;
+      }
+    };
+    viewport.addEventListener('wheel', wheel, { passive: false });
+    return () => {
+      viewport.removeEventListener('wheel', wheel);
+      if (zoomFrame.current !== null) cancelAnimationFrame(zoomFrame.current);
+    };
+  }, [zoomAt]);
 
   const addActivity = useCallback((title: string, detail: string) => {
     setActivities((items) => [{ id: Date.now(), title, detail, time: 'now' }, ...items.slice(0, 4)]);
@@ -231,21 +284,33 @@ export function BabyPhotoshop() {
   const pointer = (event: React.PointerEvent<HTMLCanvasElement>) => { const rect = event.currentTarget.getBoundingClientRect(); return { x: ((event.clientX - rect.left) / rect.width) * WIDTH, y: ((event.clientY - rect.top) / rect.height) * HEIGHT }; };
   const drawStroke = (from: { x: number; y: number }, to: { x: number; y: number }) => { const ctx = layerCanvases.current.get(activeLayer)?.getContext('2d'); if (!ctx) return; ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.lineWidth = brushSize; ctx.strokeStyle = brushColor; ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over'; ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke(); ctx.restore(); render(); };
   const startPointer = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    if (tool === 'pan') return; const point = pointer(event); event.currentTarget.setPointerCapture(event.pointerId);
+    if (tool === 'pan') {
+      const viewport = viewportRef.current; if (!viewport) return;
+      event.currentTarget.setPointerCapture(event.pointerId); panning.current = true;
+      panStart.current = { x: event.clientX, y: event.clientY, scrollLeft: viewport.scrollLeft, scrollTop: viewport.scrollTop };
+      return;
+    }
+    const point = pointer(event); event.currentTarget.setPointerCapture(event.pointerId);
     if (tool === 'select') { selectionStart.current = point; setSelection({ x: point.x, y: point.y, width: 0, height: 0 }); drawing.current = true; return; }
     const ctx = layerCanvases.current.get(activeLayer)?.getContext('2d'); if (!ctx) return;
     undoStack.current.push({ layerId: activeLayer, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
     drawing.current = true; lastPoint.current = point; drawStroke(point, point);
   };
   const movePointer = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (panning.current) {
+      const viewport = viewportRef.current; if (!viewport) return;
+      viewport.scrollLeft = panStart.current.scrollLeft - (event.clientX - panStart.current.x);
+      viewport.scrollTop = panStart.current.scrollTop - (event.clientY - panStart.current.y);
+      return;
+    }
     if (!drawing.current) return; const point = pointer(event);
     if (tool === 'select') { const start = selectionStart.current; setSelection({ x: Math.min(start.x, point.x), y: Math.min(start.y, point.y), width: Math.abs(point.x - start.x), height: Math.abs(point.y - start.y) }); return; }
     drawStroke(lastPoint.current, point); lastPoint.current = point;
   };
-  const endPointer = () => { if (drawing.current && tool === 'select') addActivity('Region selected', `${Math.round(selection.width)} × ${Math.round(selection.height)} px`); drawing.current = false; };
+  const endPointer = () => { if (drawing.current && tool === 'select') addActivity('Region selected', `${Math.round(selection.width)} × ${Math.round(selection.height)} px`); drawing.current = false; panning.current = false; };
   const undo = useCallback(() => { const entry = undoStack.current.pop(); if (!entry) return; const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return; redoStack.current.push({ layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render(); }, [render]);
   const redo = () => { const entry = redoStack.current.pop(); if (!entry) return; const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return; undoStack.current.push({ layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render(); };
-  useEffect(() => { const keydown = (event: KeyboardEvent) => { if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return; const next = toolMeta.find((item) => item.key.toLowerCase() === event.key.toLowerCase()); if (next) setTool(next.id); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); } }; window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown); }, [undo]);
+  useEffect(() => { const keydown = (event: KeyboardEvent) => { if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return; const next = toolMeta.find((item) => item.key.toLowerCase() === event.key.toLowerCase()); if (next) setTool(next.id); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); } if ((event.metaKey || event.ctrlKey) && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomAt(zoomRef.current * 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '-') { event.preventDefault(); zoomAt(zoomRef.current / 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '0') { event.preventDefault(); zoomAt(82); } }; window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown); }, [undo, zoomAt]);
 
   const importImage = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]; if (!file) return; const image = new Image();
@@ -271,7 +336,7 @@ export function BabyPhotoshop() {
       </aside>
       <div className="canvas-column">
         <div className="context-bar"><div className="context-group"><strong>{tool === 'select' ? 'Region select' : tool[0].toUpperCase() + tool.slice(1)}</strong>{(tool === 'brush' || tool === 'eraser') && <><span className="bar-label">Size</span><Slider className="brush-slider" min={2} max={96} value={[brushSize]} onValueChange={(value) => setBrushSize(Array.isArray(value) ? value[0] : Number(value))} /><span className="size-readout">{brushSize}px</span></>}{tool === 'select' && <span className="bar-hint">Drag to focus the next AI edit</span>}</div><div className="history-controls"><Button variant="ghost" size="icon-sm" onClick={undo} aria-label="Undo"><Undo2 /></Button><Button variant="ghost" size="icon-sm" onClick={redo} aria-label="Redo"><Redo2 /></Button></div></div>
-        <div className="stage-viewport"><div className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={endPointer} onPointerCancel={endPointer} />{selection.width > 3 && selection.height > 3 && <div className="selection-box" style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></div>}</div></div><div className="zoom-control"><Button variant="ghost" size="icon-xs" aria-label="Zoom out" onClick={() => setZoom((v) => Math.max(36, v - 10))}><ZoomOut /></Button><span>{zoom}%</span><Button variant="ghost" size="icon-xs" aria-label="Zoom in" onClick={() => setZoom((v) => Math.min(150, v + 10))}><ZoomIn /></Button></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
+        <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={endPointer} onPointerCancel={endPointer} />{selection.width > 3 && selection.height > 3 && <div className="selection-box" style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></div>}</div></div><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
       </div>
       <aside className="right-panel">
         <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span>no backend</span></div><Textarea value={prompt} onChange={(event) => { setPrompt(event.target.value); setPreparedEdit(null); }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') prepareAiEdit(); }} placeholder="Optional — let the agent decide…" aria-label="Agent edit prompt" className="prompt-input" /><div className="prompt-meta"><span><MousePointer2 size={12} /> Selected region</span><span>{Math.round(selection.width)} × {Math.round(selection.height)}</span></div><Button className="ai-button" onClick={() => prepareAiEdit()} disabled={busy}>{busy ? <span className="spinner" /> : preparedEdit ? <Check /> : <Sparkles />}{busy ? 'Receiving agent image…' : preparedEdit ? 'Ready for your agent' : 'Prepare edit package'}{!busy && !preparedEdit && <kbd>⌘↵</kbd>}</Button><p className="demo-note">{preparedEdit ? `Edit ${preparedEdit.id.split('-').slice(-1)[0]} is ready. Ask your browser agent to finish it.` : 'WebMCP sends the crop and mask to your agent; its generated image returns as a new layer.'}</p></section>
