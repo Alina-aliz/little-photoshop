@@ -15,6 +15,7 @@ type Tool = 'select' | 'brush' | 'eraser' | 'pan';
 type Layer = { id: string; name: string; visible: boolean; opacity: number; blend: GlobalCompositeOperation; swatch: string; ai?: boolean };
 type Selection = { x: number; y: number; width: number; height: number };
 type Activity = { id: number; title: string; detail: string; time: string };
+type PendingEdit = { id: string; prompt: string; source: Selection; selection: Selection; createdAt: number };
 type WebMCPTool = { name: string; title?: string; description: string; inputSchema?: Record<string, unknown>; execute: (input: Record<string, unknown>) => Promise<unknown> | unknown };
 
 declare global {
@@ -50,6 +51,7 @@ export function BabyPhotoshop() {
   const selectionStart = useRef({ x: 0, y: 0 });
   const undoStack = useRef<Array<{ layerId: string; image: ImageData }>>([]);
   const redoStack = useRef<Array<{ layerId: string; image: ImageData }>>([]);
+  const pendingEdits = useRef(new Map<string, PendingEdit>());
   const actionsRef = useRef<Record<string, (...args: any[]) => any>>({});
 
   const [layers, setLayers] = useState(initialLayers);
@@ -61,6 +63,7 @@ export function BabyPhotoshop() {
   const [selection, setSelection] = useState<Selection>({ x: 490, y: 155, width: 300, height: 330 });
   const [prompt, setPrompt] = useState('Soften the background and add warm, late-afternoon light');
   const [busy, setBusy] = useState(false);
+  const [preparedEdit, setPreparedEdit] = useState<{ id: string; prompt: string } | null>(null);
   const [webMcp, setWebMcp] = useState<'ready' | 'fallback'>('fallback');
   const [saved, setSaved] = useState(false);
   const [activities, setActivities] = useState<Activity[]>([
@@ -123,30 +126,89 @@ export function BabyPhotoshop() {
     setActiveLayer(id); addActivity('Layer created', name); return id;
   }, [addActivity]);
 
-  const runAiEdit = useCallback(async (editPrompt = prompt) => {
-    const clean = editPrompt.trim(); if (!clean || busy) return null;
-    setBusy(true); addActivity('Agent is editing', clean); await new Promise((resolve) => setTimeout(resolve, 900));
-    const id = `ai-${Date.now()}`; const canvas = makeCanvas(); const ctx = canvas.getContext('2d')!;
-    const target = selection.width > 4 && selection.height > 4 ? selection : { x: 0, y: 0, width: WIDTH, height: HEIGHT };
-    ctx.save(); ctx.beginPath(); ctx.rect(target.x, target.y, target.width, target.height); ctx.clip();
-    const warm = /warm|sun|gold|orange/i.test(clean); const cool = /cool|blue|night|moon/i.test(clean);
-    const a = warm ? 'rgba(255,197,96,.68)' : cool ? 'rgba(85,156,255,.56)' : 'rgba(176,102,255,.52)';
-    const b = warm ? 'rgba(255,92,92,0)' : cool ? 'rgba(99,76,190,0)' : 'rgba(255,126,171,0)';
-    const g = ctx.createRadialGradient(target.x + target.width * .34, target.y + target.height * .3, 0, target.x + target.width * .5, target.y + target.height * .5, Math.max(target.width, target.height) * .8);
-    g.addColorStop(0, a); g.addColorStop(1, b); ctx.fillStyle = g; ctx.fillRect(target.x, target.y, target.width, target.height);
-    if (/soft|blur|dream/i.test(clean)) { ctx.fillStyle = 'rgba(255,255,255,.12)'; ctx.fillRect(target.x, target.y, target.width, target.height); }
-    ctx.restore(); layerCanvases.current.set(id, canvas);
-    const name = `AI — ${clean.slice(0, 34)}${clean.length > 34 ? '…' : ''}`;
-    setLayers((items) => [{ id, name, visible: true, opacity: 84, blend: 'soft-light', swatch: warm ? 'linear-gradient(135deg,#ffc560,#ff5c5c)' : cool ? 'linear-gradient(135deg,#559cff,#634cbe)' : 'linear-gradient(135deg,#b066ff,#ff7eab)', ai: true }, ...items]);
-    setActiveLayer(id); setBusy(false); addActivity('AI result added as layer', clean); return id;
-  }, [addActivity, busy, prompt, selection]);
+  const compositeCanvas = useCallback(() => {
+    const canvas = makeCanvas();
+    const ctx = canvas.getContext('2d')!;
+    [...layers].reverse().forEach((layer) => {
+      const source = layerCanvases.current.get(layer.id);
+      if (!source || !layer.visible) return;
+      ctx.save(); ctx.globalAlpha = layer.opacity / 100; ctx.globalCompositeOperation = layer.blend; ctx.drawImage(source, 0, 0); ctx.restore();
+    });
+    return canvas;
+  }, [layers]);
+
+  const prepareAiEdit = useCallback((editPrompt = prompt) => {
+    const cleanPrompt = editPrompt.trim();
+    const target = selection.width > 4 && selection.height > 4
+      ? selection
+      : { x: 0, y: 0, width: WIDTH, height: HEIGHT };
+    const padding = Math.min(96, Math.max(36, Math.round(Math.min(target.width, target.height) * .18)));
+    const source: Selection = {
+      x: Math.max(0, Math.floor(target.x - padding)),
+      y: Math.max(0, Math.floor(target.y - padding)),
+      width: 0,
+      height: 0,
+    };
+    source.width = Math.min(WIDTH - source.x, Math.ceil(target.x + target.width + padding) - source.x);
+    source.height = Math.min(HEIGHT - source.y, Math.ceil(target.y + target.height + padding) - source.y);
+
+    const crop = (input: HTMLCanvasElement, mimeType: 'image/png' | 'image/jpeg', quality?: number) => {
+      const output = document.createElement('canvas'); output.width = source.width; output.height = source.height;
+      output.getContext('2d')!.drawImage(input, source.x, source.y, source.width, source.height, 0, 0, source.width, source.height);
+      return output.toDataURL(mimeType, quality);
+    };
+    const mask = document.createElement('canvas'); mask.width = source.width; mask.height = source.height;
+    const maskCtx = mask.getContext('2d')!; maskCtx.fillStyle = '#000'; maskCtx.fillRect(0, 0, mask.width, mask.height);
+    maskCtx.fillStyle = '#fff'; maskCtx.fillRect(target.x - source.x, target.y - source.y, target.width, target.height);
+    const active = layerCanvases.current.get(activeLayer) || makeCanvas();
+    const id = `edit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const pending: PendingEdit = { id, prompt: cleanPrompt, source, selection: { ...target }, createdAt: Date.now() };
+    pendingEdits.current.set(id, pending);
+    while (pendingEdits.current.size > 6) pendingEdits.current.delete(pendingEdits.current.keys().next().value!);
+    setPreparedEdit({ id, prompt: cleanPrompt });
+    addActivity('Edit package ready for agent', cleanPrompt || 'No prompt — visual judgment');
+    return {
+      editId: id,
+      prompt: cleanPrompt || null,
+      compositeCrop: { dataUrl: crop(compositeCanvas(), 'image/jpeg', .9), mimeType: 'image/jpeg', width: source.width, height: source.height },
+      activeLayerCrop: { dataUrl: crop(active, 'image/png'), mimeType: 'image/png', width: source.width, height: source.height },
+      mask: { dataUrl: mask.toDataURL('image/png'), mimeType: 'image/png', width: source.width, height: source.height, whiteMeans: 'editable' },
+      selection: { x: target.x - source.x, y: target.y - source.y, width: target.width, height: target.height },
+      placement: source,
+      outputContract: `Return one PNG or WebP of exactly ${source.width}×${source.height}px representing the complete crop. The app will reveal only the masked selection as a new layer.`,
+    };
+  }, [activeLayer, addActivity, compositeCanvas, prompt, selection]);
+
+  const insertAiResult = useCallback(async (editId: string, imageDataUrl: string, requestedName?: string) => {
+    const pending = pendingEdits.current.get(editId);
+    if (!pending) throw new Error('Unknown or expired editId. Call prepare_ai_edit again.');
+    if (Date.now() - pending.createdAt > 10 * 60 * 1000) { pendingEdits.current.delete(editId); throw new Error('Edit package expired. Call prepare_ai_edit again.'); }
+    if (!/^data:image\/(png|jpeg|webp);base64,/i.test(imageDataUrl)) throw new Error('imageDataUrl must be a base64 PNG, JPEG, or WebP data URL.');
+    if (imageDataUrl.length > 14_000_000) throw new Error('Generated image is larger than the 10 MB MVP limit.');
+    setBusy(true);
+    try {
+      const image = new Image();
+      await new Promise<void>((resolve, reject) => { image.onload = () => resolve(); image.onerror = () => reject(new Error('Generated image could not be decoded.')); image.src = imageDataUrl; });
+      if (!image.naturalWidth || !image.naturalHeight || image.naturalWidth > 4096 || image.naturalHeight > 4096) throw new Error('Generated image dimensions are invalid or exceed 4096px.');
+      const id = `ai-result-${Date.now()}`; const canvas = makeCanvas(); const ctx = canvas.getContext('2d')!;
+      ctx.save(); ctx.beginPath(); ctx.rect(pending.selection.x, pending.selection.y, pending.selection.width, pending.selection.height); ctx.clip();
+      ctx.drawImage(image, pending.source.x, pending.source.y, pending.source.width, pending.source.height); ctx.restore();
+      layerCanvases.current.set(id, canvas);
+      const name = requestedName?.trim() || `AI — ${pending.prompt.slice(0, 34) || 'agent edit'}${pending.prompt.length > 34 ? '…' : ''}`;
+      setLayers((items) => [{ id, name, visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#f28d68,#9a59ee)', ai: true }, ...items]);
+      setActiveLayer(id); pendingEdits.current.delete(editId); setPreparedEdit(null);
+      addActivity('Agent image inserted as layer', name);
+      return { layerId: id, name, placement: pending.source, clippedToSelection: pending.selection };
+    } finally { setBusy(false); }
+  }, [addActivity]);
 
   actionsRef.current = {
     getState: () => ({ canvas: { width: WIDTH, height: HEIGHT, zoom }, activeTool: tool, activeLayer, selection, layers: layers.map(({ id, name, visible, opacity, ai }) => ({ id, name, visible, opacity, ai: !!ai })) }),
     createLayer,
     setTool: (next: Tool) => { setTool(next); addActivity('Agent changed tool', next); return next; },
     select: (next: Selection) => { const safe = { x: Math.max(0, Math.min(WIDTH - 1, next.x)), y: Math.max(0, Math.min(HEIGHT - 1, next.y)), width: Math.max(1, Math.min(WIDTH, next.width)), height: Math.max(1, Math.min(HEIGHT, next.height)) }; setSelection(safe); addActivity('Agent selected region', `${Math.round(safe.width)} × ${Math.round(safe.height)} px`); return safe; },
-    aiEdit: runAiEdit,
+    prepareAiEdit,
+    insertAiResult,
     toggleLayer: (id: string, visible: boolean) => { setLayers((items) => items.map((layer) => layer.id === id ? { ...layer, visible } : layer)); addActivity('Agent updated layer', visible ? 'Shown' : 'Hidden'); return { id, visible }; },
   };
 
@@ -158,7 +220,8 @@ export function BabyPhotoshop() {
       { name: 'create_layer', title: 'Create an editable layer', description: 'Creates a transparent paint layer and makes it active.', inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'Short layer name' } } }, execute: ({ name }) => response({ layerId: actionsRef.current.createLayer(String(name || 'Agent layer')) }) },
       { name: 'set_active_tool', title: 'Choose an editing tool', description: 'Selects the brush, eraser, region selection, or pan tool.', inputSchema: { type: 'object', properties: { tool: { type: 'string', enum: ['select', 'brush', 'eraser', 'pan'] } }, required: ['tool'] }, execute: ({ tool: next }) => response({ tool: actionsRef.current.setTool(next as Tool) }) },
       { name: 'select_region', title: 'Select a canvas region', description: 'Creates the region that the next AI edit should modify.', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } }, required: ['x', 'y', 'width', 'height'] }, execute: ({ x, y, width, height }) => response(actionsRef.current.select({ x: Number(x), y: Number(y), width: Number(width), height: Number(height) })) },
-      { name: 'apply_ai_edit', title: 'Apply an AI edit as a layer', description: 'Applies a non-destructive local preview edit to the selected region and returns a new layer.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Visual edit instruction' } }, required: ['prompt'] }, execute: async ({ prompt: edit }) => response({ layerId: await actionsRef.current.aiEdit(String(edit)) }) },
+      { name: 'prepare_ai_edit', title: 'Prepare pixels for an agent edit', description: 'Returns a composited context crop, active-layer crop, selection mask, placement metadata, and optional prompt under a temporary edit ID. Use this before generating an image.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional visual edit instruction. Omit to let the agent decide.' } } }, execute: ({ prompt: edit }) => response(actionsRef.current.prepareAiEdit(typeof edit === 'string' ? edit : '')) },
+      { name: 'insert_ai_result', title: 'Insert an agent-generated image layer', description: 'Accepts a generated PNG, JPEG, or WebP data URL for a prepared edit ID, aligns it to the saved crop, clips it to the original selection, and creates a new editable layer.', inputSchema: { type: 'object', properties: { editId: { type: 'string', description: 'Temporary ID returned by prepare_ai_edit' }, imageDataUrl: { type: 'string', description: 'Base64 image data URL for the complete prepared crop' }, name: { type: 'string', description: 'Optional new layer name' } }, required: ['editId', 'imageDataUrl'] }, execute: async ({ editId, imageDataUrl, name }) => response(await actionsRef.current.insertAiResult(String(editId), String(imageDataUrl), typeof name === 'string' ? name : undefined)) },
       { name: 'set_layer_visibility', title: 'Show or hide a layer', description: 'Changes layer visibility without destroying its pixels.', inputSchema: { type: 'object', properties: { layerId: { type: 'string' }, visible: { type: 'boolean' } }, required: ['layerId', 'visible'] }, execute: ({ layerId, visible }) => response(actionsRef.current.toggleLayer(String(layerId), Boolean(visible))) },
     ];
     Promise.all(tools.map((item) => mc.registerTool(item, { signal: controller.signal }))).then(() => setWebMcp('ready')).catch(() => setWebMcp('fallback'));
@@ -197,7 +260,7 @@ export function BabyPhotoshop() {
     <header className="topbar">
       <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>baby photoshop</span><span className="mvp-pill">MVP</span></div>
       <div className="document-title"><span>Untitled portrait</span><ChevronDown size={13} /></div>
-      <div className="header-actions"><div className="mcp-status" title={webMcp === 'ready' ? 'Native WebMCP tools are registered' : 'Tools activate in a WebMCP-compatible browser'}><span className={`status-dot ${webMcp === 'ready' ? 'ready' : ''}`} /><Bot size={14} /><span>{webMcp === 'ready' ? 'WebMCP ready' : '6 agent tools'}</span></div><Button variant="ghost" size="sm" onClick={() => { setSaved(true); setTimeout(() => setSaved(false), 1400); }}>{saved && <Check />}{saved ? 'Saved' : 'Save'}</Button><Button size="sm" className="export-button" onClick={exportImage}><Download />Export</Button></div>
+      <div className="header-actions"><div className="mcp-status" title={webMcp === 'ready' ? 'Native WebMCP tools are registered' : 'Tools activate in a WebMCP-compatible browser'}><span className={`status-dot ${webMcp === 'ready' ? 'ready' : ''}`} /><Bot size={14} /><span>{webMcp === 'ready' ? 'WebMCP ready' : '7 agent tools'}</span></div><Button variant="ghost" size="sm" onClick={() => { setSaved(true); setTimeout(() => setSaved(false), 1400); }}>{saved && <Check />}{saved ? 'Saved' : 'Save'}</Button><Button size="sm" className="export-button" onClick={exportImage}><Download />Export</Button></div>
     </header>
     <section className="workspace">
       <aside className="tool-rail" aria-label="Editing tools">
@@ -211,7 +274,7 @@ export function BabyPhotoshop() {
         <div className="stage-viewport"><div className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={endPointer} onPointerCancel={endPointer} />{selection.width > 3 && selection.height > 3 && <div className="selection-box" style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></div>}</div></div><div className="zoom-control"><Button variant="ghost" size="icon-xs" aria-label="Zoom out" onClick={() => setZoom((v) => Math.max(36, v - 10))}><ZoomOut /></Button><span>{zoom}%</span><Button variant="ghost" size="icon-xs" aria-label="Zoom in" onClick={() => setZoom((v) => Math.min(150, v + 10))}><ZoomIn /></Button></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
       </div>
       <aside className="right-panel">
-        <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>AI edit</strong></div><span>non-destructive</span></div><Textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') void runAiEdit(); }} placeholder="Describe the change…" aria-label="AI edit prompt" className="prompt-input" /><div className="prompt-meta"><span><MousePointer2 size={12} /> Selected region</span><span>{Math.round(selection.width)} × {Math.round(selection.height)}</span></div><Button className="ai-button" onClick={() => void runAiEdit()} disabled={busy || !prompt.trim()}>{busy ? <span className="spinner" /> : <Sparkles />}{busy ? 'Making a new layer…' : 'Generate edit'}{!busy && <kbd>⌘↵</kbd>}</Button><p className="demo-note">MVP uses an instant local visual treatment. Connect your image model in one server action later.</p></section>
+        <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span>no backend</span></div><Textarea value={prompt} onChange={(event) => { setPrompt(event.target.value); setPreparedEdit(null); }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') prepareAiEdit(); }} placeholder="Optional — let the agent decide…" aria-label="Agent edit prompt" className="prompt-input" /><div className="prompt-meta"><span><MousePointer2 size={12} /> Selected region</span><span>{Math.round(selection.width)} × {Math.round(selection.height)}</span></div><Button className="ai-button" onClick={() => prepareAiEdit()} disabled={busy}>{busy ? <span className="spinner" /> : preparedEdit ? <Check /> : <Sparkles />}{busy ? 'Receiving agent image…' : preparedEdit ? 'Ready for your agent' : 'Prepare edit package'}{!busy && !preparedEdit && <kbd>⌘↵</kbd>}</Button><p className="demo-note">{preparedEdit ? `Edit ${preparedEdit.id.split('-').slice(-1)[0]} is ready. Ask your browser agent to finish it.` : 'WebMCP sends the crop and mask to your agent; its generated image returns as a new layer.'}</p></section>
         <section className="layers-panel"><div className="panel-heading layer-heading"><div><Layers3 size={16} /><strong>Layers</strong><span className="layer-count">{layers.length}</span></div><div className="layer-actions"><Button variant="ghost" size="icon-xs" aria-label="Move layer up" onClick={() => moveLayer(-1)}><ArrowUp /></Button><Button variant="ghost" size="icon-xs" aria-label="Move layer down" onClick={() => moveLayer(1)}><ArrowDown /></Button><Button variant="ghost" size="icon-xs" aria-label="New layer" onClick={() => createLayer()}><Plus /></Button></div></div><div className="opacity-row"><span>Opacity</span><Slider min={0} max={100} value={[activeOpacity]} onValueChange={(value) => { const opacity = Array.isArray(value) ? value[0] : Number(value); setLayers((items) => items.map((layer) => layer.id === activeLayer ? { ...layer, opacity } : layer)); }} /><span>{Math.round(activeOpacity)}%</span></div><div className="layer-list">{layers.map((layer) => <button key={layer.id} className={`layer-row ${activeLayer === layer.id ? 'active' : ''}`} onClick={() => setActiveLayer(layer.id)}><span className="visibility-toggle" role="button" tabIndex={0} aria-label={layer.visible ? 'Hide layer' : 'Show layer'} onClick={(event) => { event.stopPropagation(); setLayers((items) => items.map((item) => item.id === layer.id ? { ...item, visible: !item.visible } : item)); }}>{layer.visible ? <Eye size={14} /> : <EyeOff size={14} />}</span><span className="layer-thumb" style={{ background: layer.swatch }}>{layer.ai && <Sparkles size={10} />}</span><span className="layer-name">{layer.name}<small>{layer.ai ? 'AI result · editable' : 'Pixel layer'}</small></span>{activeLayer === layer.id && <Check size={13} className="active-check" />}</button>)}</div><div className="layer-footer"><Button variant="ghost" size="sm" onClick={() => createLayer()}><Plus />New layer</Button><Button variant="ghost" size="icon-sm" aria-label="Delete layer" onClick={removeActive} disabled={layers.length <= 1}><Trash2 /></Button></div></section>
         <section className="activity-panel"><div className="panel-heading"><div><Bot size={15} /><strong>Shared activity</strong></div><button aria-label="Close activity"><X size={14} /></button></div><div className="activity-list">{activities.slice(0, 3).map((item) => <div className="activity-row" key={item.id}><span className="activity-icon"><Sparkles size={12} /></span><span><strong>{item.title}</strong><small>{item.detail}</small></span><time>{item.time}</time></div>)}</div></section>
       </aside>
