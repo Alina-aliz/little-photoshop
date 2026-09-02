@@ -44,6 +44,8 @@ button,textarea,input { font: inherit; } button { color: inherit; }
 .status-dot,.live-dot { width: 6px; height: 6px; border-radius: 999px; background: #a977ff; box-shadow: 0 0 0 3px rgba(169,119,255,.1); }
 .status-dot.ready,.live-dot { background: #6be5ac; box-shadow: 0 0 0 3px rgba(107,229,172,.1); }
 .status-dot.disconnected { background: #d77c7c; box-shadow: 0 0 0 3px rgba(215,124,124,.08); }
+.header-actions .export-image-button,.header-actions .export-button { height: 30px!important; padding-inline: 9px!important; gap: 5px!important; font-family: var(--font-geist-mono)!important; font-size: 9px!important; font-weight: 560!important; letter-spacing: .08em; text-transform: uppercase; }
+.header-actions .export-image-button svg,.header-actions .export-button svg { width: 14px; height: 14px; }
 .export-button { color: white!important; background: linear-gradient(135deg,#d85fe4,#7959ff)!important; box-shadow: 0 5px 16px rgba(132,77,255,.18); }
 
 .workspace { min-height: 0; display: grid; grid-template-columns: 50px minmax(460px,1fr) 292px; }
