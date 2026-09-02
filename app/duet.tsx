@@ -346,13 +346,13 @@ export function Duet() {
 
   const waitForHumanEdit = useCallback((input: Record<string, unknown> = {}, options?: ToolExecutionOptions) => {
     if (pendingHumanEdit.current) return Promise.reject(new Error('Another agent is already waiting for a human edit.'));
-    if (options?.signal.aborted) return Promise.reject(options.signal.reason || new Error('Agent edit request was cancelled.'));
+    if (options?.signal?.aborted) return Promise.reject(options.signal.reason || new Error('Agent edit request was cancelled.'));
     const requestedPrompt = typeof input.prompt === 'string' ? input.prompt : undefined;
     const requestedTimeout = Number(input.timeoutMs);
     const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0 ? Math.max(30_000, Math.min(24 * 60 * 60_000, requestedTimeout)) : null;
     return new Promise((resolve, reject) => {
-      const onAbort = () => settleHumanEdit(undefined, options?.signal.reason || new Error('Agent edit request was cancelled.'));
-      options?.signal.addEventListener('abort', onAbort, { once: true });
+      const onAbort = () => settleHumanEdit(undefined, options?.signal?.reason || new Error('Agent edit request was cancelled.'));
+      options?.signal?.addEventListener('abort', onAbort, { once: true });
       const timeoutId = timeoutMs ? setTimeout(() => {
         settleHumanEdit(undefined, new Error('Timed out waiting for the human edit. Ask the human to invoke the wait tool again.'));
         addActivity('Agent wait timed out', `${Math.round(timeoutMs / 60_000)} minute limit`);
@@ -361,7 +361,7 @@ export function Duet() {
         resolve,
         reject,
         timeoutId,
-        cleanupSignal: () => options?.signal.removeEventListener('abort', onAbort),
+        cleanupSignal: () => options?.signal?.removeEventListener('abort', onAbort),
         promptOverride: requestedPrompt,
       };
       setAgentWaiting(true);
