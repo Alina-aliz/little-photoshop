@@ -23,7 +23,28 @@ type WebMCPTool = { name: string; title?: string; description: string; inputSche
 type ToolExecutionOptions = { signal: AbortSignal };
 type SavedProjectLayer = Omit<Layer, 'blend'> & { blend: string; pixels: string };
 type LayerSnapshot = { layers: Layer[]; activeLayer: string; pixels: Array<{ id: string; image: ImageData }> };
-type DrawingState = { snapshot: LayerSnapshot; selection: Selection; tool: Tool; brushSize: number; brushOpacity: number; brushColor: string; effectStrength: number; textFont: TextFont; textSize: number; zoom: number };
+type SavedLayerSelection = { layerId: string; base: ImageData; pixels: ImageData; pixelWidth: number; pixelHeight: number; source: Selection; bounds: Selection };
+type DrawingState = {
+  snapshot: LayerSnapshot;
+  selection: Selection;
+  selectionMask: ImageData;
+  selectionMode: SelectionMode;
+  selectionBrushSize: number;
+  layerSelection: SavedLayerSelection | null;
+  tool: Tool;
+  brushSize: number;
+  brushOpacity: number;
+  brushColor: string;
+  effectStrength: number;
+  textFont: TextFont;
+  textSize: number;
+  zoom: number;
+  viewport: { scrollLeft: number; scrollTop: number };
+  chrome: { leftSidebarOpen: boolean; rightSidebarOpen: boolean; showBranding: boolean };
+  activities: Activity[];
+  undo: HistoryEntry[];
+  redo: HistoryEntry[];
+};
 type WorkspaceDrawing = { id: string; name: string; state?: DrawingState };
 type PhotoAsset = { id: string; name: string; dataUrl: string; width: number; height: number; createdAt: number };
 type HistoryEntry =
@@ -529,30 +550,48 @@ export function Duet() {
     setActiveLayer(snapshot.activeLayer);
   }, []);
 
-  const captureDrawingState = useCallback((): DrawingState => ({
-    snapshot: captureLayerSnapshot(layers, activeLayer), selection: { ...selection }, tool, brushSize, brushOpacity, brushColor, effectStrength, textFont, textSize, zoom,
-  }), [activeLayer, brushColor, brushOpacity, brushSize, captureLayerSnapshot, effectStrength, layers, selection, textFont, textSize, tool, zoom]);
+  const captureDrawingState = useCallback((): DrawingState => {
+    const mask = selectionMaskRef.current || makeCanvas(); const selected = layerSelectionRef.current; const viewport = viewportRef.current;
+    const layerSelection: SavedLayerSelection | null = selected ? {
+      layerId: selected.layerId, base: selected.base, pixels: selected.pixels.getContext('2d')!.getImageData(0, 0, selected.pixels.width, selected.pixels.height),
+      pixelWidth: selected.pixels.width, pixelHeight: selected.pixels.height, source: { ...selected.source }, bounds: { ...selected.bounds },
+    } : null;
+    return {
+      snapshot: captureLayerSnapshot(layers, activeLayer), selection: { ...selection }, selectionMask: mask.getContext('2d')!.getImageData(0, 0, WIDTH, HEIGHT), selectionMode, selectionBrushSize, layerSelection,
+      tool, brushSize, brushOpacity, brushColor, effectStrength, textFont, textSize, zoom,
+      viewport: { scrollLeft: viewport?.scrollLeft || 0, scrollTop: viewport?.scrollTop || 0 }, chrome: { leftSidebarOpen, rightSidebarOpen, showBranding },
+      activities: activities.map((activity) => ({ ...activity })), undo: [...undoStack.current], redo: [...redoStack.current],
+    };
+  }, [activeLayer, activities, brushColor, brushOpacity, brushSize, captureLayerSnapshot, effectStrength, layers, leftSidebarOpen, rightSidebarOpen, selection, selectionBrushSize, selectionMode, showBranding, textFont, textSize, tool, zoom]);
   const restoreDrawingState = useCallback((state: DrawingState) => {
-    restoreLayerSnapshot(state.snapshot); setBrushSize(state.brushSize); setBrushOpacity(state.brushOpacity); setColor(state.brushColor); setEffectStrength(state.effectStrength); setTextFont(state.textFont); setTextSize(state.textSize);
-    const nextZoom = clamp(state.zoom, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom); setSelectionMode('rectangle');
-    if (state.tool === 'select') { changeTool('select'); applyRectangleSelection(state.selection); } else changeTool(state.tool);
-    undoStack.current = []; redoStack.current = []; pendingEdits.current.clear(); clearLayerSelection(); setTextDraft(null);
-  }, [applyRectangleSelection, changeTool, clearLayerSelection, restoreLayerSnapshot, setColor]);
+    restoreLayerSnapshot(state.snapshot); clearLayerSelection(); changeTool(state.tool); setBrushSize(state.brushSize); setBrushOpacity(state.brushOpacity); setColor(state.brushColor); setEffectStrength(state.effectStrength); setTextFont(state.textFont); setTextSize(state.textSize);
+    setSelectionMode(state.selectionMode); setSelectionBrushSize(state.selectionBrushSize); setSelection({ ...state.selection });
+    const mask = selectionMaskRef.current || makeCanvas(); mask.getContext('2d')!.putImageData(state.selectionMask, 0, 0); selectionMaskRef.current = mask;
+    if (state.layerSelection) {
+      const pixels = document.createElement('canvas'); pixels.width = state.layerSelection.pixelWidth; pixels.height = state.layerSelection.pixelHeight; pixels.getContext('2d')!.putImageData(state.layerSelection.pixels, 0, 0);
+      layerSelectionRef.current = { layerId: state.layerSelection.layerId, base: state.layerSelection.base, pixels, source: { ...state.layerSelection.source }, bounds: { ...state.layerSelection.bounds } };
+      setLayerSelectionBounds({ ...state.layerSelection.bounds });
+    }
+    const nextZoom = clamp(state.zoom, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom); setLeftSidebarOpen(state.chrome.leftSidebarOpen); setRightSidebarOpen(state.chrome.rightSidebarOpen); setShowBranding(state.chrome.showBranding);
+    setActivities(state.activities.map((activity) => ({ ...activity }))); undoStack.current = [...state.undo]; redoStack.current = [...state.redo]; pendingEdits.current.clear(); setAgentSendState('idle'); setTextDraft(null);
+    requestAnimationFrame(() => { redrawSelectionOverlay(); redrawLayerSelectionOverlay(); render(); requestAnimationFrame(() => { const viewport = viewportRef.current; if (viewport) { viewport.scrollLeft = state.viewport.scrollLeft; viewport.scrollTop = state.viewport.scrollTop; } }); });
+  }, [changeTool, clearLayerSelection, redrawLayerSelectionOverlay, redrawSelectionOverlay, render, restoreLayerSnapshot, setColor]);
   const createBlankDrawing = useCallback(() => {
     const currentState = captureDrawingState(); const id = `drawing-${Date.now()}-${Math.random().toString(16).slice(2)}`; const name = `Untitled drawing ${workspaceDrawings.length + 1}`;
     setWorkspaceDrawings((items) => [...items.map((drawing) => drawing.id === currentDrawingId ? { ...drawing, name: documentName, state: currentState } : drawing), { id, name }]);
     const layerId = `layer-${Date.now()}-${Math.random().toString(16).slice(2)}`; layerCanvases.current = new Map([[layerId, makeCanvas()]]);
     setLayers([{ id: layerId, name: 'Paint layer', visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#ffffff,#d5d1e8)' }]); setActiveLayer(layerId);
     setCurrentDrawingId(id); setDocumentName(name); setDocumentNameDraft(name); setDocumentMenuOpen(false); clearSelection(); clearLayerSelection(); changeTool('brush'); setTextDraft(null);
-    undoStack.current = []; redoStack.current = []; pendingEdits.current.clear(); addActivity('New drawing created', name); requestAnimationFrame(render);
-  }, [addActivity, captureDrawingState, changeTool, clearLayerSelection, clearSelection, currentDrawingId, documentName, render, workspaceDrawings.length]);
+    const defaultZoom = 82; zoomRef.current = defaultZoom; setZoom(defaultZoom); undoStack.current = []; redoStack.current = []; pendingEdits.current.clear(); setActivities([{ id: Date.now(), title: 'New drawing created', detail: name, time: 'now' }]);
+    requestAnimationFrame(() => { render(); const viewport = viewportRef.current; if (viewport) { viewport.scrollLeft = 0; viewport.scrollTop = 0; } });
+  }, [captureDrawingState, changeTool, clearLayerSelection, clearSelection, currentDrawingId, documentName, render, workspaceDrawings.length]);
   const switchDrawing = useCallback((drawingId: string) => {
     if (drawingId === currentDrawingId) { setDocumentMenuOpen(false); return; }
     const target = workspaceDrawings.find((drawing) => drawing.id === drawingId); if (!target?.state) return;
     const currentState = captureDrawingState();
     setWorkspaceDrawings((items) => items.map((drawing) => drawing.id === currentDrawingId ? { ...drawing, name: documentName, state: currentState } : drawing));
-    restoreDrawingState(target.state); setCurrentDrawingId(target.id); setDocumentName(target.name); setDocumentNameDraft(target.name); setDocumentMenuOpen(false); addActivity('Drawing switched', target.name); requestAnimationFrame(render);
-  }, [addActivity, captureDrawingState, currentDrawingId, documentName, render, restoreDrawingState, workspaceDrawings]);
+    restoreDrawingState(target.state); setCurrentDrawingId(target.id); setDocumentName(target.name); setDocumentNameDraft(target.name); setDocumentMenuOpen(false); addActivity('Drawing switched', target.name);
+  }, [addActivity, captureDrawingState, currentDrawingId, documentName, restoreDrawingState, workspaceDrawings]);
 
   const createLayer = useCallback((name = 'Paint layer') => {
     const id = `layer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
