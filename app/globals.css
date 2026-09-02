@@ -82,6 +82,8 @@ button,textarea,input { font: inherit; } button { color: inherit; }
 .size-readout { width: 29px; color: #a7a2ad; font-family: var(--font-geist-mono); }
 .brush-slider { width: 82px!important; }.history-controls { gap: 1px; }
 .brush-opacity-slider { width: 72px!important; }.opacity-readout { width: 26px; color: #8d8792; font: 8px var(--font-geist-mono); }
+.text-size-slider { width: 66px!important; }
+.font-select { height: 25px; padding: 0 22px 0 7px; border: 1px solid rgba(255,255,255,.09); border-radius: 5px; outline: 0; color: #bdb7c3; background: #222027; font-size: 9px; cursor: pointer; }
 .layer-lasso-actions { display: flex; align-items: center; gap: 3px; }.layer-lasso-actions button { height: 25px; display: inline-flex; align-items: center; gap: 4px; padding: 0 8px; border: 1px solid rgba(128,221,255,.16); border-radius: 5px; color: #a7dff2; background: rgba(89,174,211,.08); cursor: pointer; font-size: 8px; }.layer-lasso-actions button:hover { color: #e5f9ff; background: rgba(89,174,211,.16); }.layer-lasso-actions button.icon-only { width: 25px; justify-content: center; padding: 0; color: #817c86; border-color: rgba(255,255,255,.07); background: transparent; }.layer-lasso-actions svg { width: 12px; height: 12px; }
 .selection-modes { display: flex; align-items: center; gap: 2px; padding: 2px; border: 1px solid rgba(255,255,255,.07); border-radius: 6px; background: rgba(255,255,255,.025); }
 .selection-modes button,.selection-clear { width: 25px; height: 23px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 4px; color: #77717d; background: transparent; cursor: pointer; }
@@ -90,10 +92,12 @@ button,textarea,input { font: inherit; } button { color: inherit; }
 .stage-viewport { position: relative; min-height: 0; overflow: auto; display: flex; align-items: safe center; justify-content: safe center; padding: 44px 68px 62px; overscroll-behavior: contain; scrollbar-width: none; background-color: #121116; background-image: radial-gradient(rgba(255,255,255,.055) .65px,transparent .65px); background-size: 12px 12px; }
 .stage-viewport::-webkit-scrollbar { display: none; }
 .canvas-stage { flex: 0 0 auto; min-width: 240px; will-change: width; }
-.canvas-wrap { position: relative; width: 100%; aspect-ratio: 3/2; box-shadow: 0 24px 65px rgba(0,0,0,.48),0 0 0 1px rgba(255,255,255,.12); background: repeating-conic-gradient(#eee 0 25%,#d7d7d7 0 50%) 50%/18px 18px; }
+.canvas-wrap { position: relative; width: 100%; aspect-ratio: 3/2; container-type: inline-size; box-shadow: 0 24px 65px rgba(0,0,0,.48),0 0 0 1px rgba(255,255,255,.12); background: repeating-conic-gradient(#eee 0 25%,#d7d7d7 0 50%) 50%/18px 18px; }
 .main-canvas { display: block; width: 100%; height: 100%; touch-action: none; user-select: none; }
 .selection-overlay,.layer-selection-overlay { position: absolute; z-index: 2; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-.tool-brush,.tool-select,.tool-layer-lasso,.tool-eyedropper { cursor: crosshair; }.tool-transform { cursor: move; }.tool-eraser { cursor: cell; }.tool-pan { cursor: grab; }.tool-pan:active { cursor: grabbing; }
+.tool-brush,.tool-select,.tool-layer-lasso,.tool-eyedropper,.tool-smudge,.tool-blur { cursor: crosshair; }.tool-transform { cursor: move; }.tool-text { cursor: text; }.tool-eraser { cursor: cell; }.tool-pan { cursor: grab; }.tool-pan:active { cursor: grabbing; }
+.text-entry { position: absolute; z-index: 15; width: min(54%, 520px); min-width: 100px; min-height: 1.45em; padding: .12em .2em; overflow: hidden; resize: both; border: 1px dashed rgba(255,255,255,.9); border-radius: 3px; outline: 1px solid rgba(112,84,206,.9); background: rgba(21,18,27,.18); caret-color: #fff; line-height: 1.18; white-space: pre-wrap; box-shadow: 0 0 0 3px rgba(118,87,215,.15); }
+.text-entry::placeholder { color: rgba(255,255,255,.52); }
 .eyedropper-preview { position: absolute; z-index: 12; display: flex; flex-direction: column; align-items: center; gap: 4px; translate: -50% calc(-100% - 13px); pointer-events: none; filter: drop-shadow(0 5px 9px rgba(0,0,0,.42)); }
 .eyedropper-preview::after { content: ''; width: 1px; height: 12px; margin-bottom: -12px; background: rgba(255,255,255,.92); box-shadow: 0 0 0 1px rgba(0,0,0,.55); }
 .eyedropper-colour { width: 35px; height: 35px; display: grid; place-items: center; border: 3px solid #fff; border-radius: 50%; color: rgba(255,255,255,.94); box-shadow: 0 0 0 1px rgba(0,0,0,.72),inset 0 0 0 1px rgba(0,0,0,.2); }
