@@ -371,16 +371,16 @@ export function Duet() {
     setActivities((items) => [{ id: Date.now(), title, detail, time: 'now' }, ...items.slice(0, 4)]);
   }, []);
 
-  const render = useCallback(() => {
+  const renderLayerList = useCallback((layerList: Layer[]) => {
     const ctx = displayRef.current?.getContext('2d');
     if (!ctx) return;
     ctx.clearRect(0, 0, WIDTH, HEIGHT);
-    [...layers].reverse().forEach((layer) => {
+    [...layerList].reverse().forEach((layer) => {
       const source = layerCanvases.current.get(layer.id);
       if (!source || !layer.visible) return;
       ctx.save(); ctx.globalAlpha = layer.opacity / 100; ctx.globalCompositeOperation = layer.blend; ctx.drawImage(source, 0, 0); ctx.restore();
     });
-    layers.forEach((layer) => {
+    layerList.forEach((layer) => {
       const source = layerCanvases.current.get(layer.id);
       const thumbnail = thumbnailRefs.current.get(layer.id);
       if (!source || !thumbnail) return;
@@ -392,7 +392,8 @@ export function Duet() {
       thumbnailCtx.drawImage(source, 0, 0, WIDTH, HEIGHT, 0, 0, thumbnail.width, thumbnail.height);
       thumbnailCtx.restore();
     });
-  }, [layers]);
+  }, []);
+  const render = useCallback(() => renderLayerList(layers), [layers, renderLayerList]);
 
   const redrawSelectionOverlay = useCallback(() => {
     const overlay = selectionOverlayRef.current; const mask = selectionMaskRef.current;
@@ -574,8 +575,9 @@ export function Duet() {
     }
     const nextZoom = clamp(state.zoom, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom); setLeftSidebarOpen(state.chrome.leftSidebarOpen); setRightSidebarOpen(state.chrome.rightSidebarOpen); setShowBranding(state.chrome.showBranding);
     setActivities(state.activities.map((activity) => ({ ...activity }))); undoStack.current = [...state.undo]; redoStack.current = [...state.redo]; pendingEdits.current.clear(); setAgentSendState('idle'); setTextDraft(null);
-    requestAnimationFrame(() => { redrawSelectionOverlay(); redrawLayerSelectionOverlay(); render(); requestAnimationFrame(() => { const viewport = viewportRef.current; if (viewport) { viewport.scrollLeft = state.viewport.scrollLeft; viewport.scrollTop = state.viewport.scrollTop; } }); });
-  }, [changeTool, clearLayerSelection, redrawLayerSelectionOverlay, redrawSelectionOverlay, render, restoreLayerSnapshot, setColor]);
+    renderLayerList(state.snapshot.layers);
+    requestAnimationFrame(() => { redrawSelectionOverlay(); redrawLayerSelectionOverlay(); renderLayerList(state.snapshot.layers); requestAnimationFrame(() => { const viewport = viewportRef.current; if (viewport) { viewport.scrollLeft = state.viewport.scrollLeft; viewport.scrollTop = state.viewport.scrollTop; } }); });
+  }, [changeTool, clearLayerSelection, redrawLayerSelectionOverlay, redrawSelectionOverlay, renderLayerList, restoreLayerSnapshot, setColor]);
   const createBlankDrawing = useCallback(() => {
     const currentState = captureDrawingState(); const id = `drawing-${Date.now()}-${Math.random().toString(16).slice(2)}`; const name = `Untitled drawing ${workspaceDrawings.length + 1}`;
     setWorkspaceDrawings((items) => [...items.map((drawing) => drawing.id === currentDrawingId ? { ...drawing, name: documentName, state: currentState } : drawing), { id, name }]);
