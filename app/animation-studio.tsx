@@ -123,7 +123,104 @@ export function AnimationStudio({ active, documentName, onModeChange, getIllustr
   const setPlayheadFromLane = (event: React.PointerEvent<HTMLDivElement>) => { if (event.target !== event.currentTarget) return; const rect = event.currentTarget.getBoundingClientRect(); setPlaying(false); setPlayhead(clamp(Math.floor((event.clientX - rect.left) / PX), 0, timelineFrames - 1)); };
   const useIllustration = () => { if (activeClip?.type !== 'cel') return; const image = getIllustrationImage(); const canvas = frameCanvases.current.get(activeFrameId); if (!image || !canvas) return; pushUndo(); canvas.getContext('2d')!.putImageData(image, 0, 0); render(); };
   const saveFrame = () => { const canvas = makeCanvas(); drawAt(canvas.getContext('2d')!, playhead); canvas.toBlob((blob) => { if (blob) download(blob, `${safeName(documentName)}-frame-${playhead + 1}.png`); }, 'image/png'); };
-  const exportAnimation = async () => { if (exporting) return; setExporting(true); try { const canvas = makeCanvas(); const context = canvas.getContext('2d')!; if (!('MediaRecorder' in window) || typeof canvas.captureStream !== 'function') { const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png')); if (blob) download(blob, `${safeName(documentName)}-frame.png`); return; } const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm'; const stream = canvas.captureStream(0); const track = stream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack; const recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 5_000_000 }); const chunks: BlobPart[] = []; recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); }; const stopped = new Promise<void>((resolve) => { recorder.onstop = () => resolve(); }); recorder.start(); for (let frame = 0; frame < timelineFrames; frame += 1) { drawAt(context, frame); track.requestFrame(); await new Promise((resolve) => window.setTimeout(resolve, 1000 / fps)); } recorder.stop(); await stopped; stream.getTracks().forEach((item) => item.stop()); download(new Blob(chunks, { type: mime }), `${safeName(documentName)}.webm`); } finally { setExporting(false); } };
+  const exportAnimation = async () => {
+    if (exporting) return;
+    setExporting(true);
+    setPlaying(false);
+    audioElements.current.forEach((audio) => audio.pause());
+
+    let audioContext: AudioContext | null = null;
+    let mediaStream: MediaStream | null = null;
+    const scheduledSources: AudioBufferSourceNode[] = [];
+
+    try {
+      const canvas = makeCanvas();
+      const context = canvas.getContext('2d')!;
+      drawAt(context, 0);
+
+      if (!('MediaRecorder' in window) || typeof canvas.captureStream !== 'function') {
+        const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+        if (blob) download(blob, `${safeName(documentName)}-frame.png`);
+        return;
+      }
+
+      const audibleClips = clips.filter((clip): clip is AudioClip => {
+        const track = tracks.find((item) => item.id === clip.trackId);
+        return clip.type === 'audio' && Boolean(track?.visible) && clip.volume > 0;
+      });
+      const canvasStream = canvas.captureStream(0);
+      const canvasTrack = canvasStream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack;
+      const streamTracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
+      let audioStartAt = 0;
+
+      if (audibleClips.length) {
+        audioContext = new AudioContext();
+        await audioContext.resume();
+        const destination = audioContext.createMediaStreamDestination();
+        const decodedClips: { clip: AudioClip; buffer: AudioBuffer }[] = [];
+
+        for (const clip of audibleClips) {
+          try {
+            const response = await fetch(clip.url);
+            if (!response.ok) continue;
+            const buffer = await audioContext.decodeAudioData(await response.arrayBuffer());
+            decodedClips.push({ clip, buffer });
+          } catch {
+            // A bad audio asset should not prevent the visual timeline from exporting.
+          }
+        }
+
+        audioStartAt = audioContext.currentTime + 0.1;
+        decodedClips.forEach(({ clip, buffer }) => {
+          const source = audioContext!.createBufferSource();
+          const gain = audioContext!.createGain();
+          const duration = Math.min(buffer.duration, clip.duration / fps);
+          source.buffer = buffer;
+          gain.gain.value = clip.volume / 100;
+          source.connect(gain).connect(destination);
+          source.start(audioStartAt + clip.start / fps, 0, duration);
+          scheduledSources.push(source);
+        });
+        streamTracks.push(...destination.stream.getAudioTracks());
+      }
+
+      mediaStream = new MediaStream(streamTracks);
+      const mime = [
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm',
+      ].find((candidate) => MediaRecorder.isTypeSupported(candidate)) || '';
+      const recorder = new MediaRecorder(mediaStream, {
+        ...(mime ? { mimeType: mime } : {}),
+        videoBitsPerSecond: 5_000_000,
+        audioBitsPerSecond: 192_000,
+      });
+      const chunks: BlobPart[] = [];
+      recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+      const stopped = new Promise<void>((resolve) => { recorder.onstop = () => resolve(); });
+
+      recorder.start();
+      if (audioContext && audioStartAt > audioContext.currentTime) {
+        await new Promise((resolve) => window.setTimeout(resolve, (audioStartAt - audioContext!.currentTime) * 1000));
+      }
+      const exportStartedAt = performance.now();
+      for (let frame = 0; frame < timelineFrames; frame += 1) {
+        drawAt(context, frame);
+        canvasTrack.requestFrame();
+        const nextFrameAt = exportStartedAt + (frame + 1) * 1000 / fps;
+        const delay = Math.max(0, nextFrameAt - performance.now());
+        await new Promise((resolve) => window.setTimeout(resolve, delay));
+      }
+      recorder.stop();
+      await stopped;
+      download(new Blob(chunks, { type: mime || 'video/webm' }), `${safeName(documentName)}.webm`);
+    } finally {
+      scheduledSources.forEach((source) => { try { source.stop(); } catch {} });
+      mediaStream?.getTracks().forEach((track) => track.stop());
+      if (audioContext) await audioContext.close();
+      setExporting(false);
+    }
+  };
 
   useEffect(() => { if (initialized.current) return; initialized.current = true; frameCanvases.current.set('animation-frame-1', makeCanvas()); }, []);
   useEffect(() => { requestAnimationFrame(render); }, [render]);
