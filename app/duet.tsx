@@ -108,6 +108,13 @@ export function Duet() {
     { id: 1, title: 'Agent added a layer', detail: 'Warm window light', time: 'now' },
     { id: 2, title: 'Region selected', detail: '300 × 330 px', time: '1m' },
   ]);
+  const changeTool = useCallback((next: Tool) => {
+    setTool(next);
+    if (next !== 'select') {
+      setSelection({ x: 0, y: 0, width: 0, height: 0 });
+      setPreparedEdit(null);
+    }
+  }, []);
 
   const zoomAt = useCallback((requestedZoom: number, clientX?: number, clientY?: number) => {
     const viewport = viewportRef.current;
@@ -364,6 +371,10 @@ export function Duet() {
   }, [addActivity, settleHumanEdit]);
 
   const prepareOrSendToAgent = useCallback(() => {
+    if (tool !== 'select') {
+      addActivity('Select tool required', 'Choose Region select before sending to the agent');
+      return;
+    }
     const waiting = pendingHumanEdit.current;
     const packageData = prepareAiEdit(waiting?.promptOverride || prompt);
     if (waiting) {
@@ -372,7 +383,7 @@ export function Duet() {
       addActivity('Edit package sent to agent', packageData.prompt || 'No prompt — visual judgment');
       return;
     }
-  }, [addActivity, prepareAiEdit, prompt, settleHumanEdit]);
+  }, [addActivity, prepareAiEdit, prompt, settleHumanEdit, tool]);
 
   const mergeLayerDown = useCallback(() => {
     const index = layers.findIndex((layer) => layer.id === activeLayer);
@@ -429,7 +440,7 @@ export function Duet() {
   actionsRef.current = {
     getState: () => ({ canvas: { width: WIDTH, height: HEIGHT, zoom }, activeTool: tool, activeLayer, selection, layers: layers.map(({ id, name, visible, opacity, ai }) => ({ id, name, visible, opacity, ai: !!ai })) }),
     createLayer,
-    setTool: (next: Tool) => { setTool(next); addActivity('Agent changed tool', next); return next; },
+    setTool: (next: Tool) => { changeTool(next); addActivity('Agent changed tool', next); return next; },
     select: (next: Selection) => { const safe = { x: Math.max(0, Math.min(WIDTH - 1, next.x)), y: Math.max(0, Math.min(HEIGHT - 1, next.y)), width: Math.max(1, Math.min(WIDTH, next.width)), height: Math.max(1, Math.min(HEIGHT, next.height)) }; setSelection(safe); addActivity('Agent selected region', `${Math.round(safe.width)} × ${Math.round(safe.height)} px`); return safe; },
     prepareAiEdit,
     insertAiResult,
@@ -497,7 +508,7 @@ export function Duet() {
     const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return;
     undoStack.current.push({ kind: 'pixels', layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render();
   };
-  useEffect(() => { const keydown = (event: KeyboardEvent) => { if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return; const next = toolMeta.find((item) => item.key.toLowerCase() === event.key.toLowerCase()); if (next) setTool(next.id); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); } if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'e') { event.preventDefault(); mergeLayerDown(); } if ((event.metaKey || event.ctrlKey) && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomAt(zoomRef.current * 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '-') { event.preventDefault(); zoomAt(zoomRef.current / 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '0') { event.preventDefault(); zoomAt(82); } }; window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown); }, [mergeLayerDown, undo, zoomAt]);
+  useEffect(() => { const keydown = (event: KeyboardEvent) => { if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return; const next = toolMeta.find((item) => item.key.toLowerCase() === event.key.toLowerCase()); if (next) changeTool(next.id); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); } if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'e') { event.preventDefault(); mergeLayerDown(); } if ((event.metaKey || event.ctrlKey) && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomAt(zoomRef.current * 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '-') { event.preventDefault(); zoomAt(zoomRef.current / 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '0') { event.preventDefault(); zoomAt(82); } }; window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown); }, [changeTool, mergeLayerDown, undo, zoomAt]);
 
   const loadImage = (source: string) => new Promise<HTMLImageElement>((resolve, reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = () => reject(new Error('One of the project layers could not be decoded.')); image.src = source; });
   const importRasterImage = async (file: File) => {
@@ -535,7 +546,7 @@ export function Duet() {
     layerCanvases.current = new Map(restored.map(({ layer, canvas }) => [layer.id, canvas]));
     undoStack.current = []; redoStack.current = []; pendingEdits.current.clear();
     setLayers(restored.map(({ layer }) => layer)); setActiveLayer(nextActiveLayer); setSelection(safeSelection(parsed.document.selection));
-    setPrompt(typeof parsed.document.prompt === 'string' ? parsed.document.prompt.slice(0, 2_000) : ''); setTool(nextTool);
+    setPrompt(typeof parsed.document.prompt === 'string' ? parsed.document.prompt.slice(0, 2_000) : ''); changeTool(nextTool);
     setBrushSize(Math.round(boundedNumber(parsed.document.brushSize, 28, 2, 96))); setBrushColor(typeof parsed.document.brushColor === 'string' && /^#[0-9a-f]{6}$/i.test(parsed.document.brushColor) ? parsed.document.brushColor : '#ff6b5f');
     const nextZoom = boundedNumber(parsed.document.zoom, 82, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom); setPreparedEdit(null); setBusy(false);
     addActivity('Project imported', `${restored.length} editable layers`);
@@ -585,6 +596,7 @@ export function Duet() {
     setEditingLayerName('');
   };
   const activeOpacity = layers.find((layer) => layer.id === activeLayer)?.opacity ?? 100;
+  const isRegionTool = tool === 'select';
 
   return <TooltipProvider delay={350}><main className="editor-shell">
     <header className="topbar">
@@ -594,7 +606,7 @@ export function Duet() {
     </header>
     <section className="workspace">
       <aside className="tool-rail" aria-label="Editing tools">
-        {toolMeta.map(({ id, label, icon: Icon, key }) => <Tooltip key={id}><TooltipTrigger aria-label={label} className={`tool-button ${tool === id ? 'active' : ''}`} onClick={() => setTool(id)}><Icon size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">{label} · {key}</TooltipContent></Tooltip>)}
+        {toolMeta.map(({ id, label, icon: Icon, key }) => <Tooltip key={id}><TooltipTrigger aria-label={label} className={`tool-button ${tool === id ? 'active' : ''}`} onClick={() => changeTool(id)}><Icon size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">{label} · {key}</TooltipContent></Tooltip>)}
         <div className="rail-divider" /><label className="color-control" title="Brush color"><input type="color" value={brushColor} onChange={(event) => setBrushColor(event.target.value)} /><span style={{ background: brushColor }} /></label>
         <Tooltip><TooltipTrigger aria-label="Import image or project" className="tool-button" onClick={() => fileRef.current?.click()}><ImagePlus size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">Import image or .duet project</TooltipContent></Tooltip><input ref={fileRef} className="hidden" type="file" accept="image/*,.duet,.babyps,application/x-duet-project+json,application/x-baby-photoshop+json" onChange={importFile} />
         <div className="rail-spacer" /><Tooltip><TooltipTrigger aria-label="Help" className="tool-button"><CircleHelp size={18} /></TooltipTrigger><TooltipContent side="right">B brush · E erase · V select</TooltipContent></Tooltip>
@@ -604,7 +616,7 @@ export function Duet() {
         <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={endPointer} onPointerCancel={endPointer} />{selection.width > 3 && selection.height > 3 && <div className="selection-box" style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></div>}</div></div><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
       </div>
       <aside className="right-panel">
-        <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span className={agentWaiting ? 'agent-waiting' : ''}>{agentWaiting ? 'agent waiting' : 'no backend'}</span></div><Textarea value={prompt} onChange={(event) => { setPrompt(event.target.value); setPreparedEdit(null); }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') prepareOrSendToAgent(); }} placeholder="Optional — let the agent decide…" aria-label="Agent edit prompt" className="prompt-input" /><div className="prompt-meta"><span><MousePointer2 size={12} /> Selected region</span><span>{Math.round(selection.width)} × {Math.round(selection.height)}</span></div><Button className="ai-button" onClick={prepareOrSendToAgent} disabled={busy}>{busy ? <span className="spinner" /> : agentWaiting ? <Check /> : preparedEdit ? <Check /> : <Sparkles />}{busy ? 'Receiving agent image…' : agentWaiting ? 'Send current edit to agent' : preparedEdit ? 'Ready for your agent' : 'Prepare edit package'}{!busy && !preparedEdit && !agentWaiting && <kbd>⌘↵</kbd>}</Button><p className="demo-note">{agentWaiting ? 'Your browser agent is waiting. Take your time, then click Send current edit to agent.' : preparedEdit ? `Edit ${preparedEdit.id.split('-').slice(-1)[0]} is ready. Ask your browser agent to finish it.` : 'WebMCP sends the crop and mask to your agent; its generated image returns as a new layer.'}</p></section>
+        <section className={`ai-panel ${!isRegionTool ? 'ai-panel-disabled' : ''}`} aria-disabled={!isRegionTool}><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span className={agentWaiting ? 'agent-waiting' : ''}>{agentWaiting ? 'agent waiting' : 'no backend'}</span></div>{!isRegionTool && <p className="tool-required-hint">Select the Region select tool first, then choose an area to send to your agent.</p>}<Textarea value={prompt} onChange={(event) => { setPrompt(event.target.value); setPreparedEdit(null); }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') prepareOrSendToAgent(); }} placeholder="Optional — let the agent decide…" aria-label="Agent edit prompt" className="prompt-input" disabled={!isRegionTool || busy} /><div className="prompt-meta"><span><MousePointer2 size={12} /> {isRegionTool ? 'Selected region' : 'Region select required'}</span><span>{isRegionTool ? `${Math.round(selection.width)} × ${Math.round(selection.height)}` : '—'}</span></div><Button className="ai-button" onClick={prepareOrSendToAgent} disabled={!isRegionTool || busy}>{busy ? <span className="spinner" /> : agentWaiting ? <Check /> : preparedEdit ? <Check /> : <Sparkles />}{busy ? 'Receiving agent image…' : agentWaiting ? 'Send current edit to agent' : preparedEdit ? 'Ready for your agent' : 'Prepare edit package'}{!busy && !preparedEdit && !agentWaiting && <kbd>⌘↵</kbd>}</Button><p className="demo-note">{agentWaiting ? 'Your browser agent is waiting. Take your time, then click Send current edit to agent.' : preparedEdit ? `Edit ${preparedEdit.id.split('-').slice(-1)[0]} is ready. Ask your browser agent to finish it.` : 'WebMCP sends the crop and mask to your agent; its generated image returns as a new layer.'}</p></section>
         <section className="layers-panel"><div className="panel-heading layer-heading"><div><Layers3 size={16} /><strong>Layers</strong><span className="layer-count">{layers.length}</span></div><div className="layer-actions"><Button variant="ghost" size="icon-xs" aria-label="Move layer up" onClick={() => moveLayer(-1)}><ArrowUp /></Button><Button variant="ghost" size="icon-xs" aria-label="Move layer down" onClick={() => moveLayer(1)}><ArrowDown /></Button><Button variant="ghost" size="icon-xs" aria-label="New layer" onClick={() => createLayer()}><Plus /></Button></div></div><div className="opacity-row"><span>Opacity</span><Slider min={0} max={100} value={[activeOpacity]} onValueChange={(value) => { const opacity = Array.isArray(value) ? value[0] : Number(value); setLayers((items) => items.map((layer) => layer.id === activeLayer ? { ...layer, opacity } : layer)); }} /><span>{Math.round(activeOpacity)}%</span></div><div className="layer-list">{layers.map((layer) => <button key={layer.id} className={`layer-row ${activeLayer === layer.id ? 'active' : ''}`} onClick={() => setActiveLayer(layer.id)}><span className="visibility-toggle" role="button" tabIndex={0} aria-label={layer.visible ? 'Hide layer' : 'Show layer'} onClick={(event) => { event.stopPropagation(); setLayers((items) => items.map((item) => item.id === layer.id ? { ...item, visible: !item.visible } : item)); }}>{layer.visible ? <Eye size={14} /> : <EyeOff size={14} />}</span><canvas ref={(node) => { if (node) thumbnailRefs.current.set(layer.id, node); else thumbnailRefs.current.delete(layer.id); }} width={68} height={50} className="layer-thumb" style={{ background: layer.swatch }} aria-hidden="true" />{editingLayerId === layer.id ? <input autoFocus value={editingLayerName} aria-label="Layer name" className="layer-name-input" onChange={(event) => setEditingLayerName(event.target.value)} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onBlur={() => finishLayerRename(true)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); finishLayerRename(true); } if (event.key === 'Escape') { event.preventDefault(); finishLayerRename(false); } }} /> : <span className="layer-name" title="Double-click to rename" onDoubleClick={(event) => beginLayerRename(event, layer)}>{layer.name}<small>{layer.ai ? 'AI result · editable' : 'Pixel layer'}</small></span>}{activeLayer === layer.id && <Check size={13} className="active-check" />}</button>)}</div><div className="layer-footer"><div className="layer-footer-main"><Button variant="ghost" size="sm" onClick={() => createLayer()}><Plus />New layer</Button><Button variant="ghost" size="sm" onClick={mergeLayerDown} disabled={layers.findIndex((layer) => layer.id === activeLayer) >= layers.length - 1} title="Merge selected layer into the layer below (⌘E / Ctrl+E)"><Merge className="merge-down-icon" />Merge down</Button></div><Button variant="ghost" size="icon-sm" aria-label="Delete layer" onClick={removeActive} disabled={layers.length <= 1}><Trash2 /></Button></div></section>
         <section className="activity-panel"><div className="panel-heading"><div><Bot size={15} /><strong>Shared activity</strong></div><button aria-label="Close activity"><X size={14} /></button></div><div className="activity-list">{activities.slice(0, 3).map((item) => <div className="activity-row" key={item.id}><span className="activity-icon"><Sparkles size={12} /></span><span><strong>{item.title}</strong><small>{item.detail}</small></span><time>{item.time}</time></div>)}</div></section>
       </aside>
