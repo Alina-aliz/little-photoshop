@@ -65,7 +65,7 @@ function safeSelection(value: unknown): Selection {
   return { x, y, width: boundedNumber(value.width, WIDTH, 1, WIDTH - x), height: boundedNumber(value.height, HEIGHT, 1, HEIGHT - y) };
 }
 function downloadFile(blob: Blob, name: string) {
-  const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = name; document.body.append(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+  const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = name; document.body.appendChild(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
 
 export function Duet() {
@@ -540,9 +540,11 @@ export function Duet() {
     let parsed: unknown;
     try { parsed = JSON.parse(await file.text()); } catch { throw new Error('This is not a valid DUET project file.'); }
     if (!isRecord(parsed) || (parsed.format !== 'duet' && parsed.format !== 'baby-photoshop') || parsed.version !== 1 || !isRecord(parsed.canvas) || parsed.canvas.width !== WIDTH || parsed.canvas.height !== HEIGHT || typeof parsed.canvas.finalImage !== 'string' || !/^data:image\/png;base64,/i.test(parsed.canvas.finalImage) || !Array.isArray(parsed.layers) || !isRecord(parsed.document)) throw new Error('This project file is unsupported or incomplete.');
-    if (!parsed.layers.length || parsed.layers.length > MAX_PROJECT_LAYERS) throw new Error(`Projects must contain between 1 and ${MAX_PROJECT_LAYERS} layers.`);
+    const projectLayers = parsed.layers;
+    const projectDocument = parsed.document;
+    if (!projectLayers.length || projectLayers.length > MAX_PROJECT_LAYERS) throw new Error(`Projects must contain between 1 and ${MAX_PROJECT_LAYERS} layers.`);
     const knownIds = new Set<string>();
-    const restored = await Promise.all(parsed.layers.map(async (item, index) => {
+    const restored = await Promise.all(projectLayers.map(async (item, index) => {
       if (!isRecord(item) || typeof item.id !== 'string' || !item.id || knownIds.has(item.id) || typeof item.pixels !== 'string' || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/i.test(item.pixels) || item.pixels.length > 12_000_000) throw new Error(`Layer ${index + 1} is invalid.`);
       knownIds.add(item.id);
       const image = await loadImage(item.pixels);
@@ -556,14 +558,14 @@ export function Duet() {
       };
       return { layer, canvas };
     }));
-    const nextTool: Tool = typeof parsed.document.tool === 'string' && ['select', 'brush', 'eraser', 'pan'].includes(parsed.document.tool) ? parsed.document.tool as Tool : 'select';
-    const nextActiveLayer = typeof parsed.document.activeLayer === 'string' && restored.some(({ layer }) => layer.id === parsed.document.activeLayer) ? parsed.document.activeLayer : restored[0].layer.id;
+    const nextTool: Tool = typeof projectDocument.tool === 'string' && ['select', 'brush', 'eraser', 'pan'].includes(projectDocument.tool) ? projectDocument.tool as Tool : 'select';
+    const nextActiveLayer = typeof projectDocument.activeLayer === 'string' && restored.some(({ layer }) => layer.id === projectDocument.activeLayer) ? projectDocument.activeLayer : restored[0].layer.id;
     layerCanvases.current = new Map(restored.map(({ layer, canvas }) => [layer.id, canvas]));
     undoStack.current = []; redoStack.current = []; pendingEdits.current.clear();
-    setLayers(restored.map(({ layer }) => layer)); setActiveLayer(nextActiveLayer); setSelection(safeSelection(parsed.document.selection));
-    setPrompt(typeof parsed.document.prompt === 'string' ? parsed.document.prompt.slice(0, 2_000) : ''); changeTool(nextTool);
-    setBrushSize(Math.round(boundedNumber(parsed.document.brushSize, 28, 2, 96))); setBrushColor(typeof parsed.document.brushColor === 'string' && /^#[0-9a-f]{6}$/i.test(parsed.document.brushColor) ? parsed.document.brushColor : '#ff6b5f');
-    const nextZoom = boundedNumber(parsed.document.zoom, 82, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom); setPreparedEdit(null); setBusy(false);
+    setLayers(restored.map(({ layer }) => layer)); setActiveLayer(nextActiveLayer); setSelection(safeSelection(projectDocument.selection));
+    setPrompt(typeof projectDocument.prompt === 'string' ? projectDocument.prompt.slice(0, 2_000) : ''); changeTool(nextTool);
+    setBrushSize(Math.round(boundedNumber(projectDocument.brushSize, 28, 2, 96))); setBrushColor(typeof projectDocument.brushColor === 'string' && /^#[0-9a-f]{6}$/i.test(projectDocument.brushColor) ? projectDocument.brushColor : '#ff6b5f');
+    const nextZoom = boundedNumber(projectDocument.zoom, 82, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom); setPreparedEdit(null); setBusy(false);
     addActivity('Project imported', `${restored.length} editable layers`);
   };
   const importFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
