@@ -467,7 +467,7 @@ export function Duet() {
 
   return <TooltipProvider delay={350}><main className="editor-shell">
     <header className="topbar">
-      <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>DUET</span><span className="mvp-pill">DRAW TOGETHER</span></div>
+      <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>DUET</span><span className="mvp-pill">CREATE WITH AI</span></div>
       <div className="document-title"><span>Untitled portrait</span><ChevronDown size={13} /></div>
       <div className="header-actions"><div className="mcp-status" title={webMcp === 'ready' ? 'Native WebMCP tools are registered' : 'Tools activate in a WebMCP-compatible browser'}><span className={`status-dot ${webMcp === 'ready' && agentConnection !== 'disconnected' && agentConnection !== 'new' ? 'ready' : agentConnection === 'disconnected' ? 'disconnected' : ''}`} /><Bot size={14} /><span>{webMcp !== 'ready' ? '8 agent tools' : agentConnection === 'waiting' ? 'Agent connected' : agentConnection === 'processing' ? 'Agent processing' : agentConnection === 'disconnected' ? 'Agent disconnected' : 'WebMCP ready'}</span></div><Button variant="ghost" size="sm" onClick={exportImage}><Download />PNG</Button><Button size="sm" className="export-button" onClick={exportProject}><Download />Project</Button></div>
     </header>
