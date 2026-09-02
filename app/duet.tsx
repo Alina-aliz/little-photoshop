@@ -74,6 +74,7 @@ export function Duet() {
   const viewportRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const layerCanvases = useRef(new Map<string, HTMLCanvasElement>());
+  const thumbnailRefs = useRef(new Map<string, HTMLCanvasElement>());
   const initialized = useRef(false);
   const drawing = useRef(false);
   const lastPoint = useRef({ x: 0, y: 0 });
@@ -98,6 +99,8 @@ export function Duet() {
   const [prompt, setPrompt] = useState('Soften the background and add warm, late-afternoon light');
   const [busy, setBusy] = useState(false);
   const [preparedEdit, setPreparedEdit] = useState<{ id: string; prompt: string } | null>(null);
+  const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
+  const [editingLayerName, setEditingLayerName] = useState('');
   const [agentWaiting, setAgentWaiting] = useState(false);
   const [agentConnection, setAgentConnection] = useState<AgentConnection>('new');
   const [webMcp, setWebMcp] = useState<'ready' | 'fallback'>('fallback');
@@ -165,6 +168,18 @@ export function Duet() {
       const source = layerCanvases.current.get(layer.id);
       if (!source || !layer.visible) return;
       ctx.save(); ctx.globalAlpha = layer.opacity / 100; ctx.globalCompositeOperation = layer.blend; ctx.drawImage(source, 0, 0); ctx.restore();
+    });
+    layers.forEach((layer) => {
+      const source = layerCanvases.current.get(layer.id);
+      const thumbnail = thumbnailRefs.current.get(layer.id);
+      if (!source || !thumbnail) return;
+      const thumbnailCtx = thumbnail.getContext('2d');
+      if (!thumbnailCtx) return;
+      thumbnailCtx.clearRect(0, 0, thumbnail.width, thumbnail.height);
+      thumbnailCtx.save();
+      thumbnailCtx.globalAlpha = layer.opacity / 100;
+      thumbnailCtx.drawImage(source, 0, 0, WIDTH, HEIGHT, 0, 0, thumbnail.width, thumbnail.height);
+      thumbnailCtx.restore();
     });
   }, [layers]);
 
@@ -551,6 +566,24 @@ export function Duet() {
   };
   const removeActive = () => { if (layers.length <= 1) return; layerCanvases.current.delete(activeLayer); setLayers((items) => { const next = items.filter((layer) => layer.id !== activeLayer); setActiveLayer(next[0]?.id || ''); return next; }); addActivity('Layer removed', 'Canvas preserved'); };
   const moveLayer = (direction: -1 | 1) => setLayers((items) => { const index = items.findIndex((layer) => layer.id === activeLayer); const nextIndex = Math.max(0, Math.min(items.length - 1, index + direction)); if (index < 0 || index === nextIndex) return items; const next = [...items]; [next[index], next[nextIndex]] = [next[nextIndex], next[index]]; return next; });
+  const beginLayerRename = (event: React.MouseEvent, layer: Layer) => {
+    event.stopPropagation();
+    setActiveLayer(layer.id);
+    setEditingLayerId(layer.id);
+    setEditingLayerName(layer.name);
+  };
+  const finishLayerRename = (save: boolean) => {
+    if (!editingLayerId) return;
+    const layerId = editingLayerId;
+    const nextName = editingLayerName.trim().slice(0, 80);
+    if (save && nextName) {
+      const previousName = layers.find((layer) => layer.id === layerId)?.name;
+      setLayers((items) => items.map((layer) => layer.id === layerId ? { ...layer, name: nextName } : layer));
+      if (previousName && previousName !== nextName) addActivity('Layer renamed', nextName);
+    }
+    setEditingLayerId(null);
+    setEditingLayerName('');
+  };
   const activeOpacity = layers.find((layer) => layer.id === activeLayer)?.opacity ?? 100;
 
   return <TooltipProvider delay={350}><main className="editor-shell">
@@ -572,7 +605,7 @@ export function Duet() {
       </div>
       <aside className="right-panel">
         <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span className={agentWaiting ? 'agent-waiting' : ''}>{agentWaiting ? 'agent waiting' : 'no backend'}</span></div><Textarea value={prompt} onChange={(event) => { setPrompt(event.target.value); setPreparedEdit(null); }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') prepareOrSendToAgent(); }} placeholder="Optional — let the agent decide…" aria-label="Agent edit prompt" className="prompt-input" /><div className="prompt-meta"><span><MousePointer2 size={12} /> Selected region</span><span>{Math.round(selection.width)} × {Math.round(selection.height)}</span></div><Button className="ai-button" onClick={prepareOrSendToAgent} disabled={busy}>{busy ? <span className="spinner" /> : agentWaiting ? <Check /> : preparedEdit ? <Check /> : <Sparkles />}{busy ? 'Receiving agent image…' : agentWaiting ? 'Send current edit to agent' : preparedEdit ? 'Ready for your agent' : 'Prepare edit package'}{!busy && !preparedEdit && !agentWaiting && <kbd>⌘↵</kbd>}</Button><p className="demo-note">{agentWaiting ? 'Your browser agent is waiting. Take your time, then click Send current edit to agent.' : preparedEdit ? `Edit ${preparedEdit.id.split('-').slice(-1)[0]} is ready. Ask your browser agent to finish it.` : 'WebMCP sends the crop and mask to your agent; its generated image returns as a new layer.'}</p></section>
-        <section className="layers-panel"><div className="panel-heading layer-heading"><div><Layers3 size={16} /><strong>Layers</strong><span className="layer-count">{layers.length}</span></div><div className="layer-actions"><Button variant="ghost" size="icon-xs" aria-label="Move layer up" onClick={() => moveLayer(-1)}><ArrowUp /></Button><Button variant="ghost" size="icon-xs" aria-label="Move layer down" onClick={() => moveLayer(1)}><ArrowDown /></Button><Button variant="ghost" size="icon-xs" aria-label="New layer" onClick={() => createLayer()}><Plus /></Button></div></div><div className="opacity-row"><span>Opacity</span><Slider min={0} max={100} value={[activeOpacity]} onValueChange={(value) => { const opacity = Array.isArray(value) ? value[0] : Number(value); setLayers((items) => items.map((layer) => layer.id === activeLayer ? { ...layer, opacity } : layer)); }} /><span>{Math.round(activeOpacity)}%</span></div><div className="layer-list">{layers.map((layer) => <button key={layer.id} className={`layer-row ${activeLayer === layer.id ? 'active' : ''}`} onClick={() => setActiveLayer(layer.id)}><span className="visibility-toggle" role="button" tabIndex={0} aria-label={layer.visible ? 'Hide layer' : 'Show layer'} onClick={(event) => { event.stopPropagation(); setLayers((items) => items.map((item) => item.id === layer.id ? { ...item, visible: !item.visible } : item)); }}>{layer.visible ? <Eye size={14} /> : <EyeOff size={14} />}</span><span className="layer-thumb" style={{ background: layer.swatch }}>{layer.ai && <Sparkles size={10} />}</span><span className="layer-name">{layer.name}<small>{layer.ai ? 'AI result · editable' : 'Pixel layer'}</small></span>{activeLayer === layer.id && <Check size={13} className="active-check" />}</button>)}</div><div className="layer-footer"><div className="layer-footer-main"><Button variant="ghost" size="sm" onClick={() => createLayer()}><Plus />New layer</Button><Button variant="ghost" size="sm" onClick={mergeLayerDown} disabled={layers.findIndex((layer) => layer.id === activeLayer) >= layers.length - 1} title="Merge selected layer into the layer below (⌘E / Ctrl+E)"><Merge className="merge-down-icon" />Merge down</Button></div><Button variant="ghost" size="icon-sm" aria-label="Delete layer" onClick={removeActive} disabled={layers.length <= 1}><Trash2 /></Button></div></section>
+        <section className="layers-panel"><div className="panel-heading layer-heading"><div><Layers3 size={16} /><strong>Layers</strong><span className="layer-count">{layers.length}</span></div><div className="layer-actions"><Button variant="ghost" size="icon-xs" aria-label="Move layer up" onClick={() => moveLayer(-1)}><ArrowUp /></Button><Button variant="ghost" size="icon-xs" aria-label="Move layer down" onClick={() => moveLayer(1)}><ArrowDown /></Button><Button variant="ghost" size="icon-xs" aria-label="New layer" onClick={() => createLayer()}><Plus /></Button></div></div><div className="opacity-row"><span>Opacity</span><Slider min={0} max={100} value={[activeOpacity]} onValueChange={(value) => { const opacity = Array.isArray(value) ? value[0] : Number(value); setLayers((items) => items.map((layer) => layer.id === activeLayer ? { ...layer, opacity } : layer)); }} /><span>{Math.round(activeOpacity)}%</span></div><div className="layer-list">{layers.map((layer) => <button key={layer.id} className={`layer-row ${activeLayer === layer.id ? 'active' : ''}`} onClick={() => setActiveLayer(layer.id)}><span className="visibility-toggle" role="button" tabIndex={0} aria-label={layer.visible ? 'Hide layer' : 'Show layer'} onClick={(event) => { event.stopPropagation(); setLayers((items) => items.map((item) => item.id === layer.id ? { ...item, visible: !item.visible } : item)); }}>{layer.visible ? <Eye size={14} /> : <EyeOff size={14} />}</span><canvas ref={(node) => { if (node) thumbnailRefs.current.set(layer.id, node); else thumbnailRefs.current.delete(layer.id); }} width={68} height={50} className="layer-thumb" style={{ background: layer.swatch }} aria-hidden="true" />{editingLayerId === layer.id ? <input autoFocus value={editingLayerName} aria-label="Layer name" className="layer-name-input" onChange={(event) => setEditingLayerName(event.target.value)} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onBlur={() => finishLayerRename(true)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); finishLayerRename(true); } if (event.key === 'Escape') { event.preventDefault(); finishLayerRename(false); } }} /> : <span className="layer-name" title="Double-click to rename" onDoubleClick={(event) => beginLayerRename(event, layer)}>{layer.name}<small>{layer.ai ? 'AI result · editable' : 'Pixel layer'}</small></span>}{activeLayer === layer.id && <Check size={13} className="active-check" />}</button>)}</div><div className="layer-footer"><div className="layer-footer-main"><Button variant="ghost" size="sm" onClick={() => createLayer()}><Plus />New layer</Button><Button variant="ghost" size="sm" onClick={mergeLayerDown} disabled={layers.findIndex((layer) => layer.id === activeLayer) >= layers.length - 1} title="Merge selected layer into the layer below (⌘E / Ctrl+E)"><Merge className="merge-down-icon" />Merge down</Button></div><Button variant="ghost" size="icon-sm" aria-label="Delete layer" onClick={removeActive} disabled={layers.length <= 1}><Trash2 /></Button></div></section>
         <section className="activity-panel"><div className="panel-heading"><div><Bot size={15} /><strong>Shared activity</strong></div><button aria-label="Close activity"><X size={14} /></button></div><div className="activity-list">{activities.slice(0, 3).map((item) => <div className="activity-row" key={item.id}><span className="activity-icon"><Sparkles size={12} /></span><span><strong>{item.title}</strong><small>{item.detail}</small></span><time>{item.time}</time></div>)}</div></section>
       </aside>
     </section>
