@@ -20,6 +20,13 @@ type ToolExecutionOptions = { signal: AbortSignal };
 type WebMCPTool = { name: string; title?: string; description: string; inputSchema?: Record<string, unknown>; execute: (input: Record<string, unknown>, options?: ToolExecutionOptions) => Promise<unknown> | unknown };
 type PendingHumanEdit = { resolve: (value: unknown) => void; reject: (reason?: unknown) => void; timeoutId: ReturnType<typeof setTimeout> | null; cleanupSignal: () => void; promptOverride?: string };
 type AgentConnection = 'new' | 'waiting' | 'processing' | 'disconnected';
+type SavedProjectLayer = Omit<Layer, 'blend'> & { blend: string; pixels: string };
+type BabyPhotoshopProject = {
+  format: 'baby-photoshop'; version: 1; exportedAt: string;
+  canvas: { width: number; height: number; finalImage: string };
+  document: { activeLayer: string; selection: Selection; prompt: string; tool: Tool; brushSize: number; brushColor: string; zoom: number };
+  layers: SavedProjectLayer[];
+};
 
 declare global {
   interface Document {
@@ -29,6 +36,9 @@ declare global {
 
 const WIDTH = 960;
 const HEIGHT = 640;
+const MAX_PROJECT_BYTES = 64 * 1024 * 1024;
+const MAX_PROJECT_LAYERS = 64;
+const acceptedBlends = new Set<GlobalCompositeOperation>(['source-over', 'multiply', 'screen', 'overlay', 'soft-light']);
 const initialLayers: Layer[] = [
   { id: 'ai-light', name: 'AI — warm window light', visible: true, opacity: 78, blend: 'soft-light', swatch: 'linear-gradient(135deg,#ffb86b,#9159e8)', ai: true },
   { id: 'portrait', name: 'Studio portrait', visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#e5b58a,#5a3254)' },
@@ -43,6 +53,16 @@ const toolMeta: Array<{ id: Tool; label: string; icon: typeof Brush; key: string
 
 function response(value: unknown) { return { content: [{ type: 'text', text: JSON.stringify(value) }] }; }
 function makeCanvas() { const canvas = document.createElement('canvas'); canvas.width = WIDTH; canvas.height = HEIGHT; return canvas; }
+function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function boundedNumber(value: unknown, fallback: number, min: number, max: number) { const number = typeof value === 'number' ? value : Number(value); return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback; }
+function safeSelection(value: unknown): Selection {
+  if (!isRecord(value)) return { x: 0, y: 0, width: WIDTH, height: HEIGHT };
+  const x = boundedNumber(value.x, 0, 0, WIDTH - 1); const y = boundedNumber(value.y, 0, 0, HEIGHT - 1);
+  return { x, y, width: boundedNumber(value.width, WIDTH, 1, WIDTH - x), height: boundedNumber(value.height, HEIGHT, 1, HEIGHT - y) };
+}
+function downloadFile(blob: Blob, name: string) {
+  const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = name; document.body.append(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
 
 export function BabyPhotoshop() {
   const displayRef = useRef<HTMLCanvasElement>(null);
@@ -77,7 +97,6 @@ export function BabyPhotoshop() {
   const [agentWaiting, setAgentWaiting] = useState(false);
   const [agentConnection, setAgentConnection] = useState<AgentConnection>('new');
   const [webMcp, setWebMcp] = useState<'ready' | 'fallback'>('fallback');
-  const [saved, setSaved] = useState(false);
   const [activities, setActivities] = useState<Activity[]>([
     { id: 1, title: 'Agent added a layer', detail: 'Warm window light', time: 'now' },
     { id: 2, title: 'Region selected', detail: '300 × 330 px', time: '1m' },
@@ -377,11 +396,71 @@ export function BabyPhotoshop() {
   const redo = () => { const entry = redoStack.current.pop(); if (!entry) return; const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return; undoStack.current.push({ layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render(); };
   useEffect(() => { const keydown = (event: KeyboardEvent) => { if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return; const next = toolMeta.find((item) => item.key.toLowerCase() === event.key.toLowerCase()); if (next) setTool(next.id); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); } if ((event.metaKey || event.ctrlKey) && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomAt(zoomRef.current * 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '-') { event.preventDefault(); zoomAt(zoomRef.current / 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '0') { event.preventDefault(); zoomAt(82); } }; window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown); }, [undo, zoomAt]);
 
-  const importImage = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]; if (!file) return; const image = new Image();
-    image.onload = () => { const id = `import-${Date.now()}`; const canvas = makeCanvas(); const ctx = canvas.getContext('2d')!; const scale = Math.min(WIDTH / image.width, HEIGHT / image.height); const width = image.width * scale; const height = image.height * scale; ctx.drawImage(image, (WIDTH - width) / 2, (HEIGHT - height) / 2, width, height); layerCanvases.current.set(id, canvas); setLayers((items) => [{ id, name: file.name, visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#93b8cc,#e4b28d)' }, ...items]); setActiveLayer(id); addActivity('Photo imported', file.name); URL.revokeObjectURL(image.src); }; image.src = URL.createObjectURL(file); event.target.value = '';
+  const loadImage = (source: string) => new Promise<HTMLImageElement>((resolve, reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = () => reject(new Error('One of the project layers could not be decoded.')); image.src = source; });
+  const importRasterImage = async (file: File) => {
+    const objectUrl = URL.createObjectURL(file);
+    try {
+      const image = await loadImage(objectUrl); const id = `import-${Date.now()}`; const canvas = makeCanvas(); const ctx = canvas.getContext('2d')!;
+      const scale = Math.min(WIDTH / image.width, HEIGHT / image.height); const width = image.width * scale; const height = image.height * scale;
+      ctx.drawImage(image, (WIDTH - width) / 2, (HEIGHT - height) / 2, width, height);
+      layerCanvases.current.set(id, canvas); setLayers((items) => [{ id, name: file.name, visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#93b8cc,#e4b28d)' }, ...items]); setActiveLayer(id); addActivity('Photo imported', file.name);
+    } finally { URL.revokeObjectURL(objectUrl); }
   };
-  const exportImage = () => { render(); const link = document.createElement('a'); link.download = 'baby-photoshop-export.png'; link.href = displayRef.current?.toDataURL('image/png') || ''; link.click(); addActivity('Canvas exported', 'PNG · 960 × 640'); };
+  const importProject = async (file: File) => {
+    if (file.size > MAX_PROJECT_BYTES) throw new Error('This project is larger than the 64 MB import limit.');
+    let parsed: unknown;
+    try { parsed = JSON.parse(await file.text()); } catch { throw new Error('This is not a valid Baby Photoshop project file.'); }
+    if (!isRecord(parsed) || parsed.format !== 'baby-photoshop' || parsed.version !== 1 || !isRecord(parsed.canvas) || parsed.canvas.width !== WIDTH || parsed.canvas.height !== HEIGHT || typeof parsed.canvas.finalImage !== 'string' || !/^data:image\/png;base64,/i.test(parsed.canvas.finalImage) || !Array.isArray(parsed.layers) || !isRecord(parsed.document)) throw new Error('This project file is unsupported or incomplete.');
+    if (!parsed.layers.length || parsed.layers.length > MAX_PROJECT_LAYERS) throw new Error(`Projects must contain between 1 and ${MAX_PROJECT_LAYERS} layers.`);
+    const knownIds = new Set<string>();
+    const restored = await Promise.all(parsed.layers.map(async (item, index) => {
+      if (!isRecord(item) || typeof item.id !== 'string' || !item.id || knownIds.has(item.id) || typeof item.pixels !== 'string' || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/i.test(item.pixels) || item.pixels.length > 12_000_000) throw new Error(`Layer ${index + 1} is invalid.`);
+      knownIds.add(item.id);
+      const image = await loadImage(item.pixels);
+      if (image.naturalWidth !== WIDTH || image.naturalHeight !== HEIGHT) throw new Error(`Layer ${index + 1} has the wrong canvas dimensions.`);
+      const canvas = makeCanvas(); canvas.getContext('2d')!.drawImage(image, 0, 0);
+      const blend = typeof item.blend === 'string' && acceptedBlends.has(item.blend as GlobalCompositeOperation) ? item.blend as GlobalCompositeOperation : 'source-over';
+      const layer: Layer = {
+        id: item.id, name: typeof item.name === 'string' ? item.name.slice(0, 80) || `Layer ${index + 1}` : `Layer ${index + 1}`,
+        visible: typeof item.visible === 'boolean' ? item.visible : true, opacity: boundedNumber(item.opacity, 100, 0, 100), blend,
+        swatch: typeof item.swatch === 'string' && /^(#|linear-gradient\()/i.test(item.swatch) ? item.swatch : '#85808d', ai: item.ai === true,
+      };
+      return { layer, canvas };
+    }));
+    const nextTool: Tool = typeof parsed.document.tool === 'string' && ['select', 'brush', 'eraser', 'pan'].includes(parsed.document.tool) ? parsed.document.tool as Tool : 'select';
+    const nextActiveLayer = typeof parsed.document.activeLayer === 'string' && restored.some(({ layer }) => layer.id === parsed.document.activeLayer) ? parsed.document.activeLayer : restored[0].layer.id;
+    layerCanvases.current = new Map(restored.map(({ layer, canvas }) => [layer.id, canvas]));
+    undoStack.current = []; redoStack.current = []; pendingEdits.current.clear();
+    setLayers(restored.map(({ layer }) => layer)); setActiveLayer(nextActiveLayer); setSelection(safeSelection(parsed.document.selection));
+    setPrompt(typeof parsed.document.prompt === 'string' ? parsed.document.prompt.slice(0, 2_000) : ''); setTool(nextTool);
+    setBrushSize(Math.round(boundedNumber(parsed.document.brushSize, 28, 2, 96))); setBrushColor(typeof parsed.document.brushColor === 'string' && /^#[0-9a-f]{6}$/i.test(parsed.document.brushColor) ? parsed.document.brushColor : '#ff6b5f');
+    const nextZoom = boundedNumber(parsed.document.zoom, 82, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom); setPreparedEdit(null); setBusy(false);
+    addActivity('Project imported', `${restored.length} editable layers`);
+  };
+  const importFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]; if (!file) return;
+    try {
+      if (file.name.toLowerCase().endsWith('.babyps') || file.type === 'application/x-baby-photoshop+json') await importProject(file);
+      else await importRasterImage(file);
+    } catch (error) { addActivity('Import failed', error instanceof Error ? error.message : 'Could not read that file.'); }
+    finally { event.target.value = ''; }
+  };
+  const exportImage = () => { render(); const dataUrl = displayRef.current?.toDataURL('image/png'); if (!dataUrl) return; const link = document.createElement('a'); link.download = 'baby-photoshop-final.png'; link.href = dataUrl; link.click(); addActivity('Final image exported', 'PNG · 960 × 640'); };
+  const exportProject = () => {
+    try {
+      const project: BabyPhotoshopProject = {
+        format: 'baby-photoshop', version: 1, exportedAt: new Date().toISOString(),
+        canvas: { width: WIDTH, height: HEIGHT, finalImage: compositeCanvas().toDataURL('image/png') },
+        document: { activeLayer, selection, prompt, tool, brushSize, brushColor, zoom },
+        layers: layers.map((layer) => {
+          const canvas = layerCanvases.current.get(layer.id); if (!canvas) throw new Error(`Layer “${layer.name}” is missing its pixels.`);
+          return { ...layer, blend: layer.blend, pixels: canvas.toDataURL('image/png') };
+        }),
+      };
+      downloadFile(new Blob([JSON.stringify(project)], { type: 'application/x-baby-photoshop+json' }), `baby-photoshop-${new Date().toISOString().slice(0, 10)}.babyps`);
+      addActivity('Project exported', `${layers.length} layers + final PNG`);
+    } catch (error) { addActivity('Export failed', error instanceof Error ? error.message : 'Could not package this project.'); }
+  };
   const removeActive = () => { if (layers.length <= 1) return; layerCanvases.current.delete(activeLayer); setLayers((items) => { const next = items.filter((layer) => layer.id !== activeLayer); setActiveLayer(next[0]?.id || ''); return next; }); addActivity('Layer removed', 'Canvas preserved'); };
   const moveLayer = (direction: -1 | 1) => setLayers((items) => { const index = items.findIndex((layer) => layer.id === activeLayer); const nextIndex = Math.max(0, Math.min(items.length - 1, index + direction)); if (index < 0 || index === nextIndex) return items; const next = [...items]; [next[index], next[nextIndex]] = [next[nextIndex], next[index]]; return next; });
   const activeOpacity = layers.find((layer) => layer.id === activeLayer)?.opacity ?? 100;
@@ -390,13 +469,13 @@ export function BabyPhotoshop() {
     <header className="topbar">
       <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>baby photoshop</span><span className="mvp-pill">MVP</span></div>
       <div className="document-title"><span>Untitled portrait</span><ChevronDown size={13} /></div>
-      <div className="header-actions"><div className="mcp-status" title={webMcp === 'ready' ? 'Native WebMCP tools are registered' : 'Tools activate in a WebMCP-compatible browser'}><span className={`status-dot ${webMcp === 'ready' && agentConnection !== 'disconnected' && agentConnection !== 'new' ? 'ready' : agentConnection === 'disconnected' ? 'disconnected' : ''}`} /><Bot size={14} /><span>{webMcp !== 'ready' ? '8 agent tools' : agentConnection === 'waiting' ? 'Agent connected' : agentConnection === 'processing' ? 'Agent processing' : agentConnection === 'disconnected' ? 'Agent disconnected' : 'WebMCP ready'}</span></div><Button variant="ghost" size="sm" onClick={() => { setSaved(true); setTimeout(() => setSaved(false), 1400); }}>{saved && <Check />}{saved ? 'Saved' : 'Save'}</Button><Button size="sm" className="export-button" onClick={exportImage}><Download />Export</Button></div>
+      <div className="header-actions"><div className="mcp-status" title={webMcp === 'ready' ? 'Native WebMCP tools are registered' : 'Tools activate in a WebMCP-compatible browser'}><span className={`status-dot ${webMcp === 'ready' && agentConnection !== 'disconnected' && agentConnection !== 'new' ? 'ready' : agentConnection === 'disconnected' ? 'disconnected' : ''}`} /><Bot size={14} /><span>{webMcp !== 'ready' ? '8 agent tools' : agentConnection === 'waiting' ? 'Agent connected' : agentConnection === 'processing' ? 'Agent processing' : agentConnection === 'disconnected' ? 'Agent disconnected' : 'WebMCP ready'}</span></div><Button variant="ghost" size="sm" onClick={exportImage}><Download />PNG</Button><Button size="sm" className="export-button" onClick={exportProject}><Download />Project</Button></div>
     </header>
     <section className="workspace">
       <aside className="tool-rail" aria-label="Editing tools">
         {toolMeta.map(({ id, label, icon: Icon, key }) => <Tooltip key={id}><TooltipTrigger aria-label={label} className={`tool-button ${tool === id ? 'active' : ''}`} onClick={() => setTool(id)}><Icon size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">{label} · {key}</TooltipContent></Tooltip>)}
         <div className="rail-divider" /><label className="color-control" title="Brush color"><input type="color" value={brushColor} onChange={(event) => setBrushColor(event.target.value)} /><span style={{ background: brushColor }} /></label>
-        <Tooltip><TooltipTrigger aria-label="Import image" className="tool-button" onClick={() => fileRef.current?.click()}><ImagePlus size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">Import image</TooltipContent></Tooltip><input ref={fileRef} className="hidden" type="file" accept="image/*" onChange={importImage} />
+        <Tooltip><TooltipTrigger aria-label="Import image or project" className="tool-button" onClick={() => fileRef.current?.click()}><ImagePlus size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">Import image or .babyps project</TooltipContent></Tooltip><input ref={fileRef} className="hidden" type="file" accept="image/*,.babyps,application/x-baby-photoshop+json" onChange={importFile} />
         <div className="rail-spacer" /><Tooltip><TooltipTrigger aria-label="Help" className="tool-button"><CircleHelp size={18} /></TooltipTrigger><TooltipContent side="right">B brush · E erase · V select</TooltipContent></Tooltip>
       </aside>
       <div className="canvas-column">
