@@ -87,6 +87,9 @@ export function Duet() {
   const redoStack = useRef<HistoryEntry[]>([]);
   const pendingEdits = useRef(new Map<string, PendingEdit>());
   const pendingHumanEdit = useRef<PendingHumanEdit | null>(null);
+  // A human can submit before the agent has opened its next long-poll. Keep
+  // one handoff locally so the next wait_for_human_edit call receives it.
+  const queuedHumanEdit = useRef<unknown>(null);
   const actionsRef = useRef<Record<string, (...args: any[]) => any>>({});
 
   const [layers, setLayers] = useState(initialLayers);
@@ -113,6 +116,7 @@ export function Duet() {
     if (next !== 'select') {
       setSelection({ x: 0, y: 0, width: 0, height: 0 });
       setPreparedEdit(null);
+      queuedHumanEdit.current = null;
     }
   }, []);
 
@@ -347,6 +351,14 @@ export function Duet() {
   const waitForHumanEdit = useCallback((input: Record<string, unknown> = {}, options?: ToolExecutionOptions) => {
     if (pendingHumanEdit.current) return Promise.reject(new Error('Another agent is already waiting for a human edit.'));
     if (options?.signal?.aborted) return Promise.reject(options.signal.reason || new Error('Agent edit request was cancelled.'));
+    const queued = queuedHumanEdit.current;
+    if (queued) {
+      queuedHumanEdit.current = null;
+      setPreparedEdit(null);
+      setAgentConnection('processing');
+      addActivity('Queued edit delivered to agent', 'The agent opened its next wait');
+      return Promise.resolve(queued);
+    }
     const requestedPrompt = typeof input.prompt === 'string' ? input.prompt : undefined;
     const requestedTimeout = Number(input.timeoutMs);
     const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0 ? Math.max(30_000, Math.min(24 * 60 * 60_000, requestedTimeout)) : null;
@@ -376,10 +388,6 @@ export function Duet() {
       return;
     }
     const waiting = pendingHumanEdit.current;
-    if (!waiting && preparedEdit) {
-      addActivity('Agent is not waiting', 'Ask your browser agent to call wait_for_human_edit first');
-      return;
-    }
     const packageData = prepareAiEdit(waiting?.promptOverride || prompt);
     if (waiting) {
       settleHumanEdit(response(packageData));
@@ -387,7 +395,10 @@ export function Duet() {
       addActivity('Edit package sent to agent', packageData.prompt || 'No prompt — visual judgment');
       return;
     }
-  }, [addActivity, prepareAiEdit, preparedEdit, prompt, settleHumanEdit, tool]);
+    queuedHumanEdit.current = response(packageData);
+    setPreparedEdit({ id: packageData.editId, prompt: packageData.prompt || '' });
+    addActivity('Edit queued for agent', 'It will send as soon as the agent opens its next wait');
+  }, [addActivity, prepareAiEdit, prompt, settleHumanEdit, tool]);
 
   const mergeLayerDown = useCallback(() => {
     const index = layers.findIndex((layer) => layer.id === activeLayer);
@@ -620,7 +631,7 @@ export function Duet() {
         <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={endPointer} onPointerCancel={endPointer} />{selection.width > 3 && selection.height > 3 && <div className="selection-box" style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></div>}</div></div><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
       </div>
       <aside className="right-panel">
-        <section className={`ai-panel ${!isRegionTool ? 'ai-panel-disabled' : ''}`} aria-disabled={!isRegionTool}><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span className={agentWaiting ? 'agent-waiting' : ''}>{agentWaiting ? 'agent waiting' : 'no backend'}</span></div>{!isRegionTool && <p className="tool-required-hint">Select the Region select tool first, then choose an area to send to your agent.</p>}<Textarea value={prompt} onChange={(event) => { setPrompt(event.target.value); setPreparedEdit(null); }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') prepareOrSendToAgent(); }} placeholder="Optional — let the agent decide…" aria-label="Agent edit prompt" className="prompt-input" disabled={!isRegionTool || busy} /><div className="prompt-meta"><span><MousePointer2 size={12} /> {isRegionTool ? 'Selected region' : 'Region select required'}</span><span>{isRegionTool ? `${Math.round(selection.width)} × ${Math.round(selection.height)}` : '—'}</span></div><Button className="ai-button" onClick={prepareOrSendToAgent} disabled={!isRegionTool || busy}>{busy ? <span className="spinner" /> : agentWaiting ? <Check /> : preparedEdit ? <Bot /> : <Sparkles />}{busy ? 'Receiving agent image…' : agentWaiting ? 'Send current edit to agent' : preparedEdit ? 'Agent not waiting' : 'Prepare edit package'}{!busy && !preparedEdit && !agentWaiting && <kbd>⌘↵</kbd>}</Button><p className="demo-note">{agentWaiting ? 'Your browser agent is waiting. Take your time, then click Send current edit to agent.' : preparedEdit ? `Edit ${preparedEdit.id.split('-').slice(-1)[0]} is ready. Ask your browser agent to call wait_for_human_edit, then click Send current edit.` : 'WebMCP sends the crop and mask to your agent; its generated image returns as a new layer.'}</p></section>
+        <section className={`ai-panel ${!isRegionTool ? 'ai-panel-disabled' : ''}`} aria-disabled={!isRegionTool}><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span className={agentWaiting ? 'agent-waiting' : ''}>{agentWaiting ? 'agent waiting' : 'no backend'}</span></div>{!isRegionTool && <p className="tool-required-hint">Select the Region select tool first, then choose an area to send to your agent.</p>}<Textarea value={prompt} onChange={(event) => { setPrompt(event.target.value); setPreparedEdit(null); queuedHumanEdit.current = null; }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') prepareOrSendToAgent(); }} placeholder="Optional — let the agent decide…" aria-label="Agent edit prompt" className="prompt-input" disabled={!isRegionTool || busy} /><div className="prompt-meta"><span><MousePointer2 size={12} /> {isRegionTool ? 'Selected region' : 'Region select required'}</span><span>{isRegionTool ? `${Math.round(selection.width)} × ${Math.round(selection.height)}` : '—'}</span></div><Button className="ai-button" onClick={prepareOrSendToAgent} disabled={!isRegionTool || busy}>{busy ? <span className="spinner" /> : agentWaiting ? <Check /> : preparedEdit ? <Bot /> : <Sparkles />}{busy ? 'Receiving agent image…' : agentWaiting ? 'Send current edit to agent' : preparedEdit ? 'Edit queued for agent' : 'Send current edit'}{!busy && !preparedEdit && !agentWaiting && <kbd>⌘↵</kbd>}</Button><p className="demo-note">{agentWaiting ? 'Your browser agent is waiting. Take your time, then click Send current edit to agent.' : preparedEdit ? `Edit ${preparedEdit.id.split('-').slice(-1)[0]} is queued. It will be delivered automatically when your browser agent calls wait_for_human_edit.` : 'WebMCP sends the crop and mask to your agent; it delivers immediately when the agent is waiting, or queues until its next wait.'}</p></section>
         <section className="layers-panel"><div className="panel-heading layer-heading"><div><Layers3 size={16} /><strong>Layers</strong><span className="layer-count">{layers.length}</span></div><div className="layer-actions"><Button variant="ghost" size="icon-xs" aria-label="Move layer up" onClick={() => moveLayer(-1)}><ArrowUp /></Button><Button variant="ghost" size="icon-xs" aria-label="Move layer down" onClick={() => moveLayer(1)}><ArrowDown /></Button><Button variant="ghost" size="icon-xs" aria-label="New layer" onClick={() => createLayer()}><Plus /></Button></div></div><div className="opacity-row"><span>Opacity</span><Slider min={0} max={100} value={[activeOpacity]} onValueChange={(value) => { const opacity = Array.isArray(value) ? value[0] : Number(value); setLayers((items) => items.map((layer) => layer.id === activeLayer ? { ...layer, opacity } : layer)); }} /><span>{Math.round(activeOpacity)}%</span></div><div className="layer-list">{layers.map((layer) => <button key={layer.id} className={`layer-row ${activeLayer === layer.id ? 'active' : ''}`} onClick={() => setActiveLayer(layer.id)}><span className="visibility-toggle" role="button" tabIndex={0} aria-label={layer.visible ? 'Hide layer' : 'Show layer'} onClick={(event) => { event.stopPropagation(); setLayers((items) => items.map((item) => item.id === layer.id ? { ...item, visible: !item.visible } : item)); }}>{layer.visible ? <Eye size={14} /> : <EyeOff size={14} />}</span><canvas ref={(node) => { if (node) thumbnailRefs.current.set(layer.id, node); else thumbnailRefs.current.delete(layer.id); }} width={68} height={50} className="layer-thumb" style={{ background: layer.swatch }} aria-hidden="true" />{editingLayerId === layer.id ? <input autoFocus value={editingLayerName} aria-label="Layer name" className="layer-name-input" onChange={(event) => setEditingLayerName(event.target.value)} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onBlur={() => finishLayerRename(true)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); finishLayerRename(true); } if (event.key === 'Escape') { event.preventDefault(); finishLayerRename(false); } }} /> : <span className="layer-name" title="Double-click to rename" onDoubleClick={(event) => beginLayerRename(event, layer)}>{layer.name}<small>{layer.ai ? 'AI result · editable' : 'Pixel layer'}</small></span>}{activeLayer === layer.id && <Check size={13} className="active-check" />}</button>)}</div><div className="layer-footer"><div className="layer-footer-main"><Button variant="ghost" size="sm" onClick={() => createLayer()}><Plus />New layer</Button><Button variant="ghost" size="sm" onClick={mergeLayerDown} disabled={layers.findIndex((layer) => layer.id === activeLayer) >= layers.length - 1} title="Merge selected layer into the layer below (⌘E / Ctrl+E)"><Merge className="merge-down-icon" />Merge down</Button></div><Button variant="ghost" size="icon-sm" aria-label="Delete layer" onClick={removeActive} disabled={layers.length <= 1}><Trash2 /></Button></div></section>
         <section className="activity-panel"><div className="panel-heading"><div><Bot size={15} /><strong>Shared activity</strong></div><button aria-label="Close activity"><X size={14} /></button></div><div className="activity-list">{activities.slice(0, 3).map((item) => <div className="activity-row" key={item.id}><span className="activity-icon"><Sparkles size={12} /></span><span><strong>{item.title}</strong><small>{item.detail}</small></span><time>{item.time}</time></div>)}</div></section>
       </aside>
