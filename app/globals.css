@@ -92,6 +92,8 @@ button,textarea,input { font: inherit; } button { color: inherit; }
 .tool-required-hint strong,.agent-ready-hint strong { display: block; margin-bottom: 2px; font-weight: 650; }
 .agent-ready-hint { border: 1px solid rgba(107,229,172,.19); color: #a5dbc0; background: rgba(74,174,126,.08); }
 .agent-ready-hint span { color: #8ca698; }.agent-ready-hint em { color: #d9f2e4; font-style: normal; }
+.agent-send-button { width: 100%; height: 27px!important; margin-top: 8px; color: #fff!important; font-size: 9px!important; background: linear-gradient(135deg,#d85fe4,#7959ff)!important; box-shadow: 0 5px 16px rgba(132,77,255,.16); }
+.agent-send-button:disabled { cursor: default; color: #b8ead0!important; background: rgba(74,174,126,.2)!important; box-shadow: none; opacity: 1!important; }
 .layer-heading { margin-bottom: 8px; }.layer-count { color: #77717d; font-size: 9px; }.layer-actions { margin-left: auto; gap: 1px!important; }
 .opacity-row { display: grid; grid-template-columns: 40px 1fr 28px; align-items: center; gap: 7px; margin-bottom: 8px; color: #77727d; font-size: 8px; }.opacity-row>span:last-child { font-family: var(--font-geist-mono); text-align: right; }
 .layer-list { margin: 0 -5px; display: flex; flex-direction: column; gap: 2px; }

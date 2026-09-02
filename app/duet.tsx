@@ -3,7 +3,7 @@
 import {
   ArrowDown, ArrowUp, Bot, Brush, Check, ChevronDown, CircleHelp, Download,
   Eraser, Eye, EyeOff, Hand, ImagePlus, Layers3, MousePointer2, Plus, Redo2,
-  Merge, Sparkles, Trash2, Undo2, WandSparkles, X,
+  Merge, Send, Sparkles, Trash2, Undo2, WandSparkles, X,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
@@ -99,12 +99,14 @@ export function Duet() {
   const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
   const [editingLayerName, setEditingLayerName] = useState('');
   const [webMcp, setWebMcp] = useState<'ready' | 'fallback'>('fallback');
+  const [agentSendState, setAgentSendState] = useState<'idle' | 'sent'>('idle');
   const [activities, setActivities] = useState<Activity[]>([
     { id: 1, title: 'Agent added a layer', detail: 'Warm window light', time: 'now' },
     { id: 2, title: 'Region selected', detail: '300 × 330 px', time: '1m' },
   ]);
   const changeTool = useCallback((next: Tool) => {
     setTool(next);
+    setAgentSendState('idle');
     if (next !== 'select') {
       setSelection({ x: 0, y: 0, width: 0, height: 0 });
     }
@@ -375,6 +377,11 @@ export function Duet() {
   }, [activeLayer, addActivity, captureLayerSnapshot, layers]);
 
   const canEditWithAgent = hasUsableSelection(tool, selection);
+  const requestAgentEdit = () => {
+    if (!canEditWithAgent) return;
+    setAgentSendState('sent');
+    addActivity('Selection sent to agent', 'Ready for your edit prompt');
+  };
 
   actionsRef.current = {
     getState: () => ({
@@ -389,7 +396,7 @@ export function Duet() {
     }),
     createLayer,
     setTool: (next: Tool) => { changeTool(next); addActivity('Agent changed tool', next); return next; },
-    select: (next: Selection) => { const safe = { x: Math.max(0, Math.min(WIDTH - 1, next.x)), y: Math.max(0, Math.min(HEIGHT - 1, next.y)), width: Math.max(1, Math.min(WIDTH, next.width)), height: Math.max(1, Math.min(HEIGHT, next.height)) }; setSelection(safe); addActivity('Agent selected region', `${Math.round(safe.width)} × ${Math.round(safe.height)} px`); return safe; },
+    select: (next: Selection) => { const safe = { x: Math.max(0, Math.min(WIDTH - 1, next.x)), y: Math.max(0, Math.min(HEIGHT - 1, next.y)), width: Math.max(1, Math.min(WIDTH, next.width)), height: Math.max(1, Math.min(HEIGHT, next.height)) }; setSelection(safe); setAgentSendState('idle'); addActivity('Agent selected region', `${Math.round(safe.width)} × ${Math.round(safe.height)} px`); return safe; },
     prepareAiEdit,
     insertAiResult,
     mergeLayerDown,
@@ -423,7 +430,7 @@ export function Duet() {
       return;
     }
     const point = pointer(event); event.currentTarget.setPointerCapture(event.pointerId);
-    if (tool === 'select') { selectionStart.current = point; setSelection({ x: point.x, y: point.y, width: 0, height: 0 }); drawing.current = true; return; }
+    if (tool === 'select') { selectionStart.current = point; setSelection({ x: point.x, y: point.y, width: 0, height: 0 }); setAgentSendState('idle'); drawing.current = true; return; }
     const ctx = layerCanvases.current.get(activeLayer)?.getContext('2d'); if (!ctx) return;
     undoStack.current.push({ kind: 'pixels', layerId: activeLayer, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
     drawing.current = true; lastPoint.current = point; drawStroke(point, point);
@@ -561,7 +568,7 @@ export function Duet() {
         <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={endPointer} onPointerCancel={endPointer} />{selection.width > 3 && selection.height > 3 && <div className="selection-box" style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></div>}</div></div><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
       </div>
       <aside className="right-panel">
-        <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span>{canEditWithAgent ? 'region ready' : 'select a region'}</span></div>{!canEditWithAgent ? <p className="tool-required-hint"><strong>Select an area first.</strong> Choose the Region select arrow, then drag over the part of the canvas you want your agent to read or edit.</p> : <div className="agent-ready-hint"><strong>Region selected — ready in agent chat.</strong><span>Ask your connected agent in chat to edit this selection. It can use WebMCP to fetch the crop; images are sent and received in chat.</span></div>}</section>
+        <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span>{canEditWithAgent ? 'region ready' : 'select a region'}</span></div>{!canEditWithAgent ? <p className="tool-required-hint"><strong>Select an area first.</strong> Choose the Region select arrow, then drag over the part of the canvas you want your agent to read or edit.</p> : <div className="agent-ready-hint"><strong>{agentSendState === 'sent' ? 'Selection sent — prompt your agent.' : 'Region selected.'}</strong><span>{agentSendState === 'sent' ? 'Ask your connected agent in chat to edit the selected region. It can use WebMCP to fetch the crop; images are sent and received in chat.' : 'Click Send to tell your connected agent this region is ready.'}</span><Button size="sm" className="agent-send-button" onClick={requestAgentEdit} disabled={agentSendState === 'sent'}>{agentSendState === 'sent' ? <Check /> : <Send />}{agentSendState === 'sent' ? 'Sent to agent' : 'Send to agent'}</Button></div>}</section>
         <section className="layers-panel"><div className="panel-heading layer-heading"><div><Layers3 size={16} /><strong>Layers</strong><span className="layer-count">{layers.length}</span></div><div className="layer-actions"><Button variant="ghost" size="icon-xs" aria-label="Move layer up" onClick={() => moveLayer(-1)}><ArrowUp /></Button><Button variant="ghost" size="icon-xs" aria-label="Move layer down" onClick={() => moveLayer(1)}><ArrowDown /></Button><Button variant="ghost" size="icon-xs" aria-label="New layer" onClick={() => createLayer()}><Plus /></Button></div></div><div className="opacity-row"><span>Opacity</span><Slider min={0} max={100} value={[activeOpacity]} onValueChange={(value) => { const opacity = Array.isArray(value) ? value[0] : Number(value); setLayers((items) => items.map((layer) => layer.id === activeLayer ? { ...layer, opacity } : layer)); }} /><span>{Math.round(activeOpacity)}%</span></div><div className="layer-list">{layers.map((layer) => <button key={layer.id} className={`layer-row ${activeLayer === layer.id ? 'active' : ''}`} onClick={() => setActiveLayer(layer.id)}><span className="visibility-toggle" role="button" tabIndex={0} aria-label={layer.visible ? 'Hide layer' : 'Show layer'} onClick={(event) => { event.stopPropagation(); setLayers((items) => items.map((item) => item.id === layer.id ? { ...item, visible: !item.visible } : item)); }}>{layer.visible ? <Eye size={14} /> : <EyeOff size={14} />}</span><canvas ref={(node) => { if (node) thumbnailRefs.current.set(layer.id, node); else thumbnailRefs.current.delete(layer.id); }} width={68} height={50} className="layer-thumb" style={{ background: layer.swatch }} aria-hidden="true" />{editingLayerId === layer.id ? <input autoFocus value={editingLayerName} aria-label="Layer name" className="layer-name-input" onChange={(event) => setEditingLayerName(event.target.value)} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onBlur={() => finishLayerRename(true)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); finishLayerRename(true); } if (event.key === 'Escape') { event.preventDefault(); finishLayerRename(false); } }} /> : <span className="layer-name" title="Double-click to rename" onDoubleClick={(event) => beginLayerRename(event, layer)}>{layer.name}<small>{layer.ai ? 'AI result · editable' : 'Pixel layer'}</small></span>}{activeLayer === layer.id && <Check size={13} className="active-check" />}</button>)}</div><div className="layer-footer"><div className="layer-footer-main"><Button variant="ghost" size="sm" onClick={() => createLayer()}><Plus />New layer</Button><Button variant="ghost" size="sm" onClick={mergeLayerDown} disabled={layers.findIndex((layer) => layer.id === activeLayer) >= layers.length - 1} title="Merge selected layer into the layer below (⌘E / Ctrl+E)"><Merge className="merge-down-icon" />Merge down</Button></div><Button variant="ghost" size="icon-sm" aria-label="Delete layer" onClick={removeActive} disabled={layers.length <= 1}><Trash2 /></Button></div></section>
         <section className="activity-panel"><div className="panel-heading"><div><Bot size={15} /><strong>Shared activity</strong></div><button aria-label="Close activity"><X size={14} /></button></div><div className="activity-list">{activities.slice(0, 3).map((item) => <div className="activity-row" key={item.id}><span className="activity-icon"><Sparkles size={12} /></span><span><strong>{item.title}</strong><small>{item.detail}</small></span><time>{item.time}</time></div>)}</div></section>
       </aside>
