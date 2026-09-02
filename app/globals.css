@@ -32,15 +32,15 @@ html,body { margin: 0; min-height: 100%; background: var(--background); color: v
 body { font-family: var(--font-geist-sans),Arial,Helvetica,sans-serif; overflow: hidden; }
 button,textarea,input { font: inherit; } button { color: inherit; }
 
-.editor-shell { height: 100dvh; min-width: 860px; display: grid; grid-template-rows: 48px minmax(0,1fr); overflow: hidden; background: #17161b; }
-.topbar { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 0 12px 0 14px; border-bottom: 1px solid rgba(255,255,255,.07); background: #201f25; box-shadow: 0 1px 0 rgba(0,0,0,.4); z-index: 20; }
+.editor-shell { width: 100%; height: 100dvh; min-width: 860px; display: grid; grid-template-rows: 48px minmax(0,1fr); overflow: hidden; background: #17161b; }
+.topbar { width: 100%; min-width: 0; display: grid; grid-template-columns: minmax(0,1fr) auto minmax(0,1fr); align-items: center; padding: 0 12px 0 14px; border-bottom: 1px solid rgba(255,255,255,.07); background: #201f25; box-shadow: 0 1px 0 rgba(0,0,0,.4); z-index: 20; }
 .brand-area,.brand-lockup,.header-actions,.document-title,.mcp-status,.panel-heading>div,.context-group,.history-controls,.prompt-meta,.layer-actions,.layer-footer { display: flex; align-items: center; }
 .brand-area { min-width: 0; gap: 7px; }
 .brand-lockup { gap: 8px; font-size: 13px; font-weight: 650; letter-spacing: -.02em; }
 .brand-mark { width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; color: #fff; background: linear-gradient(135deg,#ec6cff,#7959ff); box-shadow: inset 0 1px rgba(255,255,255,.35),0 5px 18px rgba(157,80,255,.22); }
 .mvp-pill { padding: 2px 5px; border-radius: 4px; color: #b89cf8; background: rgba(156,105,255,.1); border: 1px solid rgba(172,128,255,.17); font-size: 8px; letter-spacing: .08em; }
 .document-title { gap: 5px; font-size: 12px; color: #c7c3ca; }
-.header-actions { justify-content: flex-end; gap: 5px; }
+.header-actions { min-width: 0; justify-content: flex-end; gap: 5px; }
 .view-toggle { width: 26px; height: 26px; flex: 0 0 auto; display: grid; place-items: center; padding: 0; border: 1px solid rgba(255,255,255,.07); border-radius: 6px; color: #77727e; background: rgba(255,255,255,.02); cursor: pointer; }.view-toggle:hover,.view-toggle.active { color: #dcd6e1; border-color: rgba(184,132,239,.19); background: rgba(160,94,218,.1); }.view-toggle svg { width: 14px; height: 14px; }
 .mcp-status { gap: 6px; margin-right: 5px; padding: 5px 9px; border: 1px solid rgba(255,255,255,.07); border-radius: 999px; color: #9e99a7; font-size: 10px; background: rgba(255,255,255,.025); }
 .status-dot,.live-dot { width: 6px; height: 6px; border-radius: 999px; background: #a977ff; box-shadow: 0 0 0 3px rgba(169,119,255,.1); }
@@ -139,4 +139,4 @@ button,textarea,input { font: inherit; } button { color: inherit; }
 .activity-row strong,.activity-row small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.activity-row strong { color: #a8a3ad; font-size: 8px; font-weight: 540; }.activity-row small { margin-top: 2px; color: #5f5a65; font-size: 7px; }.activity-row time { color: #55505a; font: 7px var(--font-geist-mono); }
 @media (max-width:1040px) { .workspace { --right-sidebar-width: 260px; }.workspace.right-collapsed { --right-sidebar-width: 0px; }.stage-viewport { padding-inline: 34px; } }
 @media (max-width:1040px) { .header-actions .export-image-button,.header-actions .export-button { height: 30px!important; padding-inline: 8px!important; font-size: 11px!important; }.header-actions .export-image-button svg,.header-actions .export-button svg { width: 15px; height: 15px; } }
-@media (max-width:880px) { body { overflow: auto; }.editor-shell { min-width: 0; overflow: auto; }.topbar { grid-template-columns: 1fr auto; }.document-title,.mcp-status { display: none; }.workspace { min-width: 760px; --right-sidebar-width: 260px; grid-template-columns: var(--left-sidebar-width) minmax(450px,1fr) var(--right-sidebar-width); }.workspace.right-collapsed { --right-sidebar-width: 0px; } }
+@media (max-width:880px) { body { overflow: hidden; }.editor-shell { min-width: 0; overflow: hidden; }.topbar { grid-template-columns: minmax(0,1fr) auto; }.document-title,.mcp-status { display: none; }.workspace { min-width: 0; --right-sidebar-width: 240px; grid-template-columns: var(--left-sidebar-width) minmax(0,1fr) var(--right-sidebar-width); }.workspace.right-collapsed { --right-sidebar-width: 0px; } }
