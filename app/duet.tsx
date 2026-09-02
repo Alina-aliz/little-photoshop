@@ -1,7 +1,7 @@
 'use client';
 
 import {
-  ArrowDown, ArrowUp, Bot, Brush, Check, ChevronDown, CircleHelp, Download,
+  ArrowDown, ArrowUp, Bot, Brush, Check, ChevronDown, CircleHelp, Copy, Download,
   Eraser, Eye, EyeOff, Hand, ImagePlus, LassoSelect, Layers3, MousePointer2, Move, Paintbrush,
   Pipette, Plus, Redo2, Merge, Send, Sparkles, SquareDashed, Trash2, Undo2, WandSparkles, X,
 } from 'lucide-react';
@@ -10,7 +10,7 @@ import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 
-type Tool = 'select' | 'transform' | 'brush' | 'eraser' | 'eyedropper' | 'pan';
+type Tool = 'select' | 'layer-lasso' | 'transform' | 'brush' | 'eraser' | 'eyedropper' | 'pan';
 type SelectionMode = 'rectangle' | 'brush' | 'lasso';
 type Layer = { id: string; name: string; visible: boolean; opacity: number; blend: GlobalCompositeOperation; swatch: string; ai?: boolean };
 type Selection = { x: number; y: number; width: number; height: number };
@@ -25,6 +25,8 @@ type HistoryEntry =
   | { kind: 'layers'; before: LayerSnapshot; after: LayerSnapshot };
 type TransformMode = 'move' | 'tl' | 'tr' | 'bl' | 'br';
 type ActiveTransform = { source: Selection; image: ImageData; pointer: { x: number; y: number }; mode: TransformMode };
+type LayerSelectionData = { layerId: string; base: ImageData; pixels: HTMLCanvasElement; source: Selection; bounds: Selection };
+type ActiveLayerSelectionTransform = { start: Selection; pointer: { x: number; y: number }; mode: TransformMode };
 type DuetProject = {
   format: 'duet'; version: 1; exportedAt: string;
   canvas: { width: number; height: number; finalImage: string };
@@ -51,6 +53,7 @@ const initialLayers: Layer[] = [
 ];
 const toolMeta: Array<{ id: Tool; label: string; icon: typeof Brush; key: string }> = [
   { id: 'select', label: 'Select region', icon: MousePointer2, key: 'V' },
+  { id: 'layer-lasso', label: 'Layer lasso', icon: LassoSelect, key: 'L' },
   { id: 'transform', label: 'Transform layer', icon: Move, key: 'T' },
   { id: 'brush', label: 'Brush', icon: Brush, key: 'B' },
   { id: 'eraser', label: 'Eraser', icon: Eraser, key: 'E' },
@@ -117,6 +120,9 @@ export function Duet() {
   const selectionMaskRef = useRef<HTMLCanvasElement | null>(null);
   const selectionOverlayRef = useRef<HTMLCanvasElement>(null);
   const lassoPoints = useRef<Array<{ x: number; y: number }>>([]);
+  const layerSelectionOverlayRef = useRef<HTMLCanvasElement>(null);
+  const layerLassoPoints = useRef<Array<{ x: number; y: number }>>([]);
+  const layerSelectionRef = useRef<LayerSelectionData | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -135,6 +141,7 @@ export function Duet() {
   const panStart = useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 });
   const panning = useRef(false);
   const activeTransform = useRef<ActiveTransform | null>(null);
+  const activeLayerSelectionTransform = useRef<ActiveLayerSelectionTransform | null>(null);
   const zoomRef = useRef(82);
   const zoomFrame = useRef<number | null>(null);
   const undoStack = useRef<HistoryEntry[]>([]);
@@ -157,6 +164,7 @@ export function Duet() {
   const [eyedropperPreview, setEyedropperPreview] = useState<EyedropperPreview | null>(null);
   const [zoom, setZoom] = useState(82);
   const [selection, setSelection] = useState<Selection>({ x: 490, y: 155, width: 300, height: 330 });
+  const [layerSelectionBounds, setLayerSelectionBounds] = useState<Selection | null>(null);
   const [transformBounds, setTransformBounds] = useState<Selection | null>(null);
   const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
   const [editingLayerName, setEditingLayerName] = useState('');
@@ -175,6 +183,10 @@ export function Duet() {
       const mask = selectionMaskRef.current; if (mask) mask.getContext('2d')?.clearRect(0, 0, WIDTH, HEIGHT);
       selectionOverlayRef.current?.getContext('2d')?.clearRect(0, 0, WIDTH, HEIGHT);
       lassoPoints.current = [];
+    }
+    if (next !== 'layer-lasso') {
+      layerSelectionRef.current = null; layerLassoPoints.current = []; setLayerSelectionBounds(null);
+      layerSelectionOverlayRef.current?.getContext('2d')?.clearRect(0, 0, WIDTH, HEIGHT);
     }
   }, []);
 
@@ -301,6 +313,54 @@ export function Duet() {
       ctx.stroke(); ctx.restore();
     }
   }, []);
+  const redrawLayerSelectionOverlay = useCallback(() => {
+    const overlay = layerSelectionOverlayRef.current; if (!overlay) return;
+    const ctx = overlay.getContext('2d')!; ctx.clearRect(0, 0, WIDTH, HEIGHT);
+    const selected = layerSelectionRef.current;
+    if (selected) {
+      ctx.save(); ctx.globalAlpha = .34;
+      ctx.drawImage(selected.pixels, 0, 0, selected.pixels.width, selected.pixels.height, selected.bounds.x, selected.bounds.y, selected.bounds.width, selected.bounds.height);
+      ctx.globalCompositeOperation = 'source-in'; ctx.fillStyle = '#65d9ff'; ctx.fillRect(0, 0, WIDTH, HEIGHT); ctx.restore();
+    }
+    if (layerLassoPoints.current.length > 1) {
+      ctx.save(); ctx.strokeStyle = 'rgba(128,221,255,.98)'; ctx.lineWidth = 2; ctx.setLineDash([7, 5]); ctx.beginPath();
+      layerLassoPoints.current.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+      ctx.stroke(); ctx.restore();
+    }
+  }, []);
+  const clearLayerSelection = useCallback(() => {
+    layerSelectionRef.current = null; layerLassoPoints.current = []; activeLayerSelectionTransform.current = null; setLayerSelectionBounds(null);
+    layerSelectionOverlayRef.current?.getContext('2d')?.clearRect(0, 0, WIDTH, HEIGHT);
+  }, []);
+  const finishLayerLasso = useCallback(() => {
+    const points = layerLassoPoints.current; const source = layerCanvases.current.get(activeLayer);
+    if (!source || points.length < 3) { clearLayerSelection(); return null; }
+    const mask = makeCanvas(); const maskCtx = mask.getContext('2d')!; maskCtx.fillStyle = '#fff'; maskCtx.beginPath();
+    points.forEach((point, index) => index ? maskCtx.lineTo(point.x, point.y) : maskCtx.moveTo(point.x, point.y)); maskCtx.closePath(); maskCtx.fill();
+    const bounds = contentBounds(mask); if (!bounds || bounds.width < MIN_SELECTION_SIZE || bounds.height < MIN_SELECTION_SIZE) { clearLayerSelection(); return null; }
+    const pixels = document.createElement('canvas'); pixels.width = bounds.width; pixels.height = bounds.height;
+    const pixelsCtx = pixels.getContext('2d')!; pixelsCtx.drawImage(source, bounds.x, bounds.y, bounds.width, bounds.height, 0, 0, bounds.width, bounds.height);
+    pixelsCtx.globalCompositeOperation = 'destination-in'; pixelsCtx.drawImage(mask, bounds.x, bounds.y, bounds.width, bounds.height, 0, 0, bounds.width, bounds.height);
+    const baseCanvas = makeCanvas(); const baseCtx = baseCanvas.getContext('2d')!; baseCtx.drawImage(source, 0, 0); baseCtx.globalCompositeOperation = 'destination-out'; baseCtx.drawImage(mask, 0, 0);
+    const selected: LayerSelectionData = { layerId: activeLayer, base: baseCtx.getImageData(0, 0, WIDTH, HEIGHT), pixels, source: bounds, bounds: { ...bounds } };
+    layerSelectionRef.current = selected; layerLassoPoints.current = []; setLayerSelectionBounds({ ...bounds }); redrawLayerSelectionOverlay(); return bounds;
+  }, [activeLayer, clearLayerSelection, redrawLayerSelectionOverlay]);
+  const redrawLayerSelectionTransform = useCallback((transform: ActiveLayerSelectionTransform, point: { x: number; y: number }) => {
+    const selected = layerSelectionRef.current; if (!selected) return;
+    const canvas = layerCanvases.current.get(selected.layerId); if (!canvas) return;
+    const start = transform.start; let next: Selection;
+    if (transform.mode === 'move') {
+      const dx = point.x - transform.pointer.x; const dy = point.y - transform.pointer.y;
+      next = { x: Math.max(-start.width + 8, Math.min(WIDTH - 8, start.x + dx)), y: Math.max(-start.height + 8, Math.min(HEIGHT - 8, start.y + dy)), width: start.width, height: start.height };
+    } else {
+      const anchorX = transform.mode.includes('l') ? start.x + start.width : start.x; const anchorY = transform.mode.includes('t') ? start.y + start.height : start.y;
+      const rawX = transform.mode.includes('l') ? point.x : start.x; const rawY = transform.mode.includes('t') ? point.y : start.y;
+      const width = Math.max(12, Math.abs(anchorX - rawX)); const height = Math.max(12, Math.abs(anchorY - rawY));
+      next = { x: Math.min(anchorX, rawX), y: Math.min(anchorY, rawY), width, height };
+    }
+    const ctx = canvas.getContext('2d')!; ctx.putImageData(selected.base, 0, 0); ctx.drawImage(selected.pixels, 0, 0, selected.pixels.width, selected.pixels.height, next.x, next.y, next.width, next.height);
+    selected.bounds = next; setLayerSelectionBounds(next); redrawLayerSelectionOverlay(); render();
+  }, [redrawLayerSelectionOverlay, render]);
   const clearSelection = useCallback(() => {
     const mask = selectionMaskRef.current; if (mask) mask.getContext('2d')!.clearRect(0, 0, WIDTH, HEIGHT);
     lassoPoints.current = []; setSelection({ x: 0, y: 0, width: 0, height: 0 }); setAgentSendState('idle'); redrawSelectionOverlay();
@@ -373,6 +433,10 @@ export function Duet() {
     const canvas = layerCanvases.current.get(activeLayer);
     setTransformBounds(canvas ? contentBounds(canvas) : null);
   }, [activeLayer, layers, tool]);
+  useEffect(() => {
+    const selected = layerSelectionRef.current;
+    if (selected && selected.layerId !== activeLayer) clearLayerSelection();
+  }, [activeLayer, clearLayerSelection]);
 
   const captureLayerSnapshot = useCallback((layerList: Layer[], selectedId: string): LayerSnapshot => ({
     layers: layerList.map((layer) => ({ ...layer })),
@@ -400,6 +464,28 @@ export function Duet() {
     setLayers((items) => [{ id, name, visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#ffffff,#d5d1e8)' }, ...items]);
     setActiveLayer(id); addActivity('Layer created', name); return id;
   }, [addActivity]);
+
+  const cloneLayerSelection = useCallback(() => {
+    const selected = layerSelectionRef.current; if (!selected || selected.layerId !== activeLayer) return;
+    const before = captureLayerSnapshot(layers, activeLayer);
+    const id = `layer-${Date.now()}-${Math.random().toString(16).slice(2)}`; const canvas = makeCanvas();
+    canvas.getContext('2d')!.drawImage(selected.pixels, 0, 0, selected.pixels.width, selected.pixels.height, selected.bounds.x, selected.bounds.y, selected.bounds.width, selected.bounds.height);
+    layerCanvases.current.set(id, canvas);
+    const activeIndex = Math.max(0, layers.findIndex((layer) => layer.id === activeLayer));
+    const sourceName = layers[activeIndex]?.name || 'Layer';
+    const clone: Layer = { id, name: `${sourceName} selection copy`.slice(0, 80), visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#80ddff,#7657d7)' };
+    const nextLayers = [...layers]; nextLayers.splice(activeIndex, 0, clone);
+    const after = captureLayerSnapshot(nextLayers, id); undoStack.current.push({ kind: 'layers', before, after }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
+    const blank = makeCanvas().getContext('2d')!.getImageData(0, 0, WIDTH, HEIGHT);
+    layerSelectionRef.current = { ...selected, layerId: id, base: blank, bounds: { ...selected.bounds } };
+    setLayers(nextLayers); setActiveLayer(id); setLayerSelectionBounds({ ...selected.bounds }); redrawLayerSelectionOverlay(); addActivity('Selection cloned', `New layer · ${clone.name}`);
+  }, [activeLayer, addActivity, captureLayerSnapshot, layers, redrawLayerSelectionOverlay]);
+
+  const deleteLayerSelection = useCallback(() => {
+    const selected = layerSelectionRef.current; const canvas = selected && layerCanvases.current.get(selected.layerId); if (!selected || !canvas || selected.layerId !== activeLayer) return;
+    const ctx = canvas.getContext('2d')!; undoStack.current.push({ kind: 'pixels', layerId: activeLayer, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
+    ctx.putImageData(selected.base, 0, 0); clearLayerSelection(); render(); addActivity('Selected pixels deleted', 'Undo available');
+  }, [activeLayer, addActivity, clearLayerSelection, render]);
 
   const compositeCanvas = useCallback(() => {
     const canvas = makeCanvas();
@@ -584,7 +670,7 @@ export function Duet() {
     const tools: WebMCPTool[] = [
       { name: 'get_document_state', title: 'Inspect DUET document — WebMCP-only editing policy', description: 'Returns the canvas, selection, active tool, editable layer stack, and mandatory agent policy. For a requested edit, act through these page-defined WebMCP tools only. Never use browser controls, clicks, drags, or local canvas drawing as a fallback. When agentEdit.ready is false, direct the user to select an area before continuing.', execute: () => response(actionsRef.current.getState()) },
       { name: 'create_layer', title: 'Create an editable layer', description: 'Creates a transparent paint layer and makes it active. This is not a fallback for a blocked AI edit: if pixel transfer, permission, or generation is blocked, leave the document unchanged and report the blocker.', inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'Short layer name' } } }, execute: ({ name }) => response({ layerId: actionsRef.current.createLayer(String(name || 'Agent layer')) }) },
-      { name: 'set_active_tool', title: 'Choose an editing tool', description: 'Selects the transform, brush, eraser, eyedropper, region selection, or pan tool through WebMCP. Do not use it or the browser UI to make a substitute manual edit when the requested AI edit is blocked.', inputSchema: { type: 'object', properties: { tool: { type: 'string', enum: ['select', 'transform', 'brush', 'eraser', 'eyedropper', 'pan'] } }, required: ['tool'] }, execute: ({ tool: next }) => response({ tool: actionsRef.current.setTool(next as Tool) }) },
+      { name: 'set_active_tool', title: 'Choose an editing tool', description: 'Selects the transform, layer lasso, brush, eraser, eyedropper, region selection, or pan tool through WebMCP. Do not use it or the browser UI to make a substitute manual edit when the requested AI edit is blocked.', inputSchema: { type: 'object', properties: { tool: { type: 'string', enum: ['select', 'layer-lasso', 'transform', 'brush', 'eraser', 'eyedropper', 'pan'] } }, required: ['tool'] }, execute: ({ tool: next }) => response({ tool: actionsRef.current.setTool(next as Tool) }) },
       { name: 'select_region', title: 'Select a canvas region', description: 'Creates the region that the next AI edit should modify. It does not authorize a browser-control or manual-canvas fallback.', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } }, required: ['x', 'y', 'width', 'height'] }, execute: ({ x, y, width, height }) => response(actionsRef.current.select({ x: Number(x), y: Number(y), width: Number(width), height: Number(height) })) },
       { name: 'prepare_ai_edit', title: 'Prepare pixels for an agent edit', description: 'Returns a composited context crop, active-layer crop, selection mask, placement metadata, and optional prompt under a temporary edit ID. Use this before generating an image. If this workflow is blocked by privacy or permission, do not edit the canvas by any other route: state the blocker and request the needed permission if one exists; otherwise stop. If no active region is selected, it returns selection_required; tell the user to select an area and try again.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional visual edit instruction. Omit to let the agent decide.' } } }, execute: ({ prompt: edit }) => response(actionsRef.current.prepareAiEdit(typeof edit === 'string' ? edit : '')) },
       { name: 'insert_ai_result', title: 'Insert an agent-generated image layer', description: 'Accepts a generated PNG, JPEG, or WebP data URL for a prepared edit ID, aligns it to the saved crop, clips it to the original selection, and creates a new editable layer. Call only after prepare_ai_edit succeeds; never substitute another local or manual edit when it cannot.', inputSchema: { type: 'object', properties: { editId: { type: 'string', description: 'Temporary ID returned by prepare_ai_edit' }, imageDataUrl: { type: 'string', description: 'Base64 image data URL for the complete prepared crop' }, name: { type: 'string', description: 'Optional new layer name' } }, required: ['editId', 'imageDataUrl'] }, execute: async ({ editId, imageDataUrl, name }) => response(await actionsRef.current.insertAiResult(String(editId), String(imageDataUrl), typeof name === 'string' ? name : undefined)) },
@@ -652,6 +738,18 @@ export function Duet() {
       if (selectionMode === 'lasso') { clearSelection(); lassoPoints.current = [point]; redrawSelectionOverlay(); }
       setAgentSendState('idle'); drawing.current = true; return;
     }
+    if (tool === 'layer-lasso') {
+      const selected = layerSelectionRef.current; const bounds = selected?.bounds;
+      const inside = !!bounds && point.x >= bounds.x - 18 && point.x <= bounds.x + bounds.width + 18 && point.y >= bounds.y - 18 && point.y <= bounds.y + bounds.height + 18;
+      if (selected && selected.layerId === activeLayer && bounds && inside) {
+        const ctx = layerCanvases.current.get(activeLayer)?.getContext('2d'); if (!ctx) return;
+        undoStack.current.push({ kind: 'pixels', layerId: activeLayer, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
+        activeLayerSelectionTransform.current = { start: { ...bounds }, pointer: point, mode: transformModeAtPoint(bounds, point) };
+      } else {
+        clearLayerSelection(); layerLassoPoints.current = [point]; redrawLayerSelectionOverlay();
+      }
+      drawing.current = true; return;
+    }
     if (tool === 'eyedropper') { previewEyedropperColor(point); drawing.current = true; return; }
     const ctx = layerCanvases.current.get(activeLayer)?.getContext('2d'); if (!ctx) return;
     if (tool === 'transform') {
@@ -685,6 +783,15 @@ export function Duet() {
       }
       return;
     }
+    if (tool === 'layer-lasso') {
+      if (activeLayerSelectionTransform.current) redrawLayerSelectionTransform(activeLayerSelectionTransform.current, point);
+      else {
+        const points = layerLassoPoints.current; const previous = points[points.length - 1];
+        if (!previous || Math.hypot(point.x - previous.x, point.y - previous.y) > 2) points.push(point);
+        redrawLayerSelectionOverlay();
+      }
+      return;
+    }
     if (tool === 'eyedropper') { previewEyedropperColor(point); return; }
     if (tool === 'transform' && activeTransform.current) { redrawTransformedLayer(activeTransform.current, point); return; }
     drawStroke(lastPoint.current, point); lastPoint.current = point;
@@ -694,27 +801,51 @@ export function Duet() {
       const finalSelection = cancelled && selectionMode === 'lasso' ? (clearSelection(), { x: 0, y: 0, width: 0, height: 0 }) : selectionMode === 'lasso' ? finishLassoSelection() : updateSelectionFromMask();
       if (finalSelection.width > MIN_SELECTION_SIZE && finalSelection.height > MIN_SELECTION_SIZE) addActivity('Region selected', `${selectionMode === 'rectangle' ? 'Rectangle' : selectionMode === 'brush' ? 'Brush mask' : 'Lasso'} · ${Math.round(finalSelection.width)} × ${Math.round(finalSelection.height)} px`);
     }
+    if (drawing.current && tool === 'layer-lasso') {
+      if (activeLayerSelectionTransform.current) addActivity('Selected pixels transformed', 'Move or resize · undoable');
+      else if (cancelled) clearLayerSelection();
+      else {
+        const bounds = finishLayerLasso();
+        if (bounds) addActivity('Layer pixels selected', `${Math.round(bounds.width)} × ${Math.round(bounds.height)} px`);
+      }
+    }
     if (drawing.current && tool === 'transform') addActivity('Layer transformed', 'Move or resize · undoable');
     if (drawing.current && tool === 'eyedropper') {
       const color = eyedropperColor.current;
       if (!cancelled && color) { setColor(color); addActivity('Colour picked', color.toUpperCase()); changeTool('brush'); }
       eyedropperColor.current = null; setEyedropperPreview(null);
     }
-    drawing.current = false; activeTransform.current = null; panning.current = false;
+    drawing.current = false; activeTransform.current = null; activeLayerSelectionTransform.current = null; panning.current = false;
   };
   const undo = useCallback(() => {
     const entry = undoStack.current.pop(); if (!entry) return;
+    clearLayerSelection();
     if (entry.kind === 'layers') { restoreLayerSnapshot(entry.before); redoStack.current.push(entry); return; }
     const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return;
     redoStack.current.push({ kind: 'pixels', layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render();
-  }, [render, restoreLayerSnapshot]);
+  }, [clearLayerSelection, render, restoreLayerSnapshot]);
   const redo = () => {
     const entry = redoStack.current.pop(); if (!entry) return;
+    clearLayerSelection();
     if (entry.kind === 'layers') { restoreLayerSnapshot(entry.after); undoStack.current.push(entry); return; }
     const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return;
     undoStack.current.push({ kind: 'pixels', layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render();
   };
-  useEffect(() => { const keydown = (event: KeyboardEvent) => { if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return; const next = toolMeta.find((item) => item.key.toLowerCase() === event.key.toLowerCase()); if (next) changeTool(next.id); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); } if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'e') { event.preventDefault(); mergeLayerDown(); } if ((event.metaKey || event.ctrlKey) && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomAt(zoomRef.current * 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '-') { event.preventDefault(); zoomAt(zoomRef.current / 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '0') { event.preventDefault(); zoomAt(82); } }; window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown); }, [changeTool, mergeLayerDown, undo, zoomAt]);
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
+      const next = toolMeta.find((item) => item.key.toLowerCase() === event.key.toLowerCase()); if (next) changeTool(next.id);
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'e') { event.preventDefault(); mergeLayerDown(); }
+      if (tool === 'layer-lasso' && layerSelectionBounds && (event.key === 'Delete' || event.key === 'Backspace')) { event.preventDefault(); deleteLayerSelection(); }
+      if (tool === 'layer-lasso' && layerSelectionBounds && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'j') { event.preventDefault(); cloneLayerSelection(); }
+      if (tool === 'layer-lasso' && event.key === 'Escape') clearLayerSelection();
+      if ((event.metaKey || event.ctrlKey) && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomAt(zoomRef.current * 1.15); }
+      if ((event.metaKey || event.ctrlKey) && event.key === '-') { event.preventDefault(); zoomAt(zoomRef.current / 1.15); }
+      if ((event.metaKey || event.ctrlKey) && event.key === '0') { event.preventDefault(); zoomAt(82); }
+    };
+    window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown);
+  }, [changeTool, clearLayerSelection, cloneLayerSelection, deleteLayerSelection, layerSelectionBounds, mergeLayerDown, tool, undo, zoomAt]);
 
   const loadImage = (source: string) => new Promise<HTMLImageElement>((resolve, reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = () => reject(new Error('One of the project layers could not be decoded.')); image.src = source; });
   const importRasterImage = async (file: File) => {
@@ -749,7 +880,7 @@ export function Duet() {
       };
       return { layer, canvas };
     }));
-    const nextTool: Tool = typeof projectDocument.tool === 'string' && ['select', 'transform', 'brush', 'eraser', 'eyedropper', 'pan'].includes(projectDocument.tool) ? projectDocument.tool as Tool : 'select';
+    const nextTool: Tool = typeof projectDocument.tool === 'string' && ['select', 'layer-lasso', 'transform', 'brush', 'eraser', 'eyedropper', 'pan'].includes(projectDocument.tool) ? projectDocument.tool as Tool : 'select';
     const nextActiveLayer = typeof projectDocument.activeLayer === 'string' && restored.some(({ layer }) => layer.id === projectDocument.activeLayer) ? projectDocument.activeLayer : restored[0].layer.id;
     layerCanvases.current = new Map(restored.map(({ layer, canvas }) => [layer.id, canvas]));
     undoStack.current = []; redoStack.current = []; pendingEdits.current.clear();
@@ -819,8 +950,18 @@ export function Duet() {
         <div className="rail-spacer" /><Tooltip><TooltipTrigger aria-label="Help" className="tool-button"><CircleHelp size={18} /></TooltipTrigger><TooltipContent side="right">B brush · E erase · V select</TooltipContent></Tooltip>
       </aside>
       <div className="canvas-column">
-        <div className="context-bar"><div className="context-group"><strong>{tool === 'select' ? 'Region select' : tool === 'transform' ? 'Transform layer' : tool === 'eyedropper' ? 'Eyedropper' : tool[0].toUpperCase() + tool.slice(1)}</strong>{(tool === 'brush' || tool === 'eraser') && <><span className="bar-label">Size</span><Slider className="brush-slider" min={2} max={96} value={[brushSize]} onValueChange={(value) => setBrushSize(Array.isArray(value) ? value[0] : Number(value))} /><span className="size-readout">{brushSize}px</span></>}{tool === 'brush' && <><span className="bar-label">Opacity</span><Slider className="brush-opacity-slider" min={1} max={100} value={[brushOpacity]} onValueChange={(value) => setBrushOpacity(Math.round(Array.isArray(value) ? value[0] : Number(value)))} /><span className="opacity-readout">{brushOpacity}%</span></>}{tool === 'select' && <><div className="selection-modes" aria-label="Selection shape"><button className={selectionMode === 'rectangle' ? 'active' : ''} title="Rectangle selection" aria-label="Rectangle selection" onClick={() => changeSelectionMode('rectangle')}><SquareDashed /></button><button className={selectionMode === 'brush' ? 'active' : ''} title="Brush selection" aria-label="Brush selection" onClick={() => changeSelectionMode('brush')}><Paintbrush /></button><button className={selectionMode === 'lasso' ? 'active' : ''} title="Lasso selection" aria-label="Lasso selection" onClick={() => changeSelectionMode('lasso')}><LassoSelect /></button></div>{selectionMode === 'brush' && <><span className="bar-label">Size</span><Slider className="selection-brush-slider" min={8} max={180} value={[selectionBrushSize]} onValueChange={(value) => setSelectionBrushSize(Math.round(Array.isArray(value) ? value[0] : Number(value)))} /><span className="size-readout">{selectionBrushSize}px</span></>}<span className="bar-hint">{selectionMode === 'rectangle' ? 'Drag a rectangle' : selectionMode === 'brush' ? 'Paint the area to include' : 'Draw around an area · release to close'}</span><button className="selection-clear" onClick={clearSelection} title="Clear selection" aria-label="Clear selection"><X /></button></>}{tool === 'transform' && <span className="bar-hint">Drag layer to move · drag a corner to resize</span>}{tool === 'eyedropper' && <span className="bar-hint">Press and drag to preview · release to choose</span>}</div><div className="history-controls"><Button variant="ghost" size="icon-sm" onClick={undo} aria-label="Undo"><Undo2 /></Button><Button variant="ghost" size="icon-sm" onClick={redo} aria-label="Redo"><Redo2 /></Button></div></div>
-        <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={() => endPointer()} onPointerCancel={() => endPointer(true)} /><canvas ref={selectionOverlayRef} width={WIDTH} height={HEIGHT} className="selection-overlay" aria-hidden="true" />{eyedropperPreview && <div className="eyedropper-preview" style={{ left: `${eyedropperPreview.x / WIDTH * 100}%`, top: `${eyedropperPreview.y / HEIGHT * 100}%` }}><span className="eyedropper-colour" style={{ background: eyedropperPreview.color }}><Pipette size={15} /></span></div>}{selection.width > 3 && selection.height > 3 && <div className={`selection-box ${selectionMode !== 'rectangle' ? 'freeform' : ''}`} style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span>{selectionMode === 'rectangle' && <><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></>}</div>}{tool === 'transform' && transformBounds && <div className="transform-box" style={{ left: `${transformBounds.x / WIDTH * 100}%`, top: `${transformBounds.y / HEIGHT * 100}%`, width: `${transformBounds.width / WIDTH * 100}%`, height: `${transformBounds.height / HEIGHT * 100}%` }}><span className="transform-label">{layers.find((layer) => layer.id === activeLayer)?.name}</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}</div></div><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
+        <div className="context-bar">
+          <div className="context-group">
+            <strong>{tool === 'select' ? 'Region select' : tool === 'layer-lasso' ? 'Layer lasso' : tool === 'transform' ? 'Transform layer' : tool === 'eyedropper' ? 'Eyedropper' : tool[0].toUpperCase() + tool.slice(1)}</strong>
+            {(tool === 'brush' || tool === 'eraser') && <><span className="bar-label">Size</span><Slider className="brush-slider" min={2} max={96} value={[brushSize]} onValueChange={(value) => setBrushSize(Array.isArray(value) ? value[0] : Number(value))} /><span className="size-readout">{brushSize}px</span></>}
+            {tool === 'brush' && <><span className="bar-label">Opacity</span><Slider className="brush-opacity-slider" min={1} max={100} value={[brushOpacity]} onValueChange={(value) => setBrushOpacity(Math.round(Array.isArray(value) ? value[0] : Number(value)))} /><span className="opacity-readout">{brushOpacity}%</span></>}
+            {tool === 'select' && <><div className="selection-modes" aria-label="Selection shape"><button className={selectionMode === 'rectangle' ? 'active' : ''} title="Rectangle selection" aria-label="Rectangle selection" onClick={() => changeSelectionMode('rectangle')}><SquareDashed /></button><button className={selectionMode === 'brush' ? 'active' : ''} title="Brush selection" aria-label="Brush selection" onClick={() => changeSelectionMode('brush')}><Paintbrush /></button><button className={selectionMode === 'lasso' ? 'active' : ''} title="Lasso selection" aria-label="Lasso selection" onClick={() => changeSelectionMode('lasso')}><LassoSelect /></button></div>{selectionMode === 'brush' && <><span className="bar-label">Size</span><Slider className="selection-brush-slider" min={8} max={180} value={[selectionBrushSize]} onValueChange={(value) => setSelectionBrushSize(Math.round(Array.isArray(value) ? value[0] : Number(value)))} /><span className="size-readout">{selectionBrushSize}px</span></>}<span className="bar-hint">{selectionMode === 'rectangle' ? 'Drag a rectangle' : selectionMode === 'brush' ? 'Paint the area to include' : 'Draw around an area · release to close'}</span><button className="selection-clear" onClick={clearSelection} title="Clear selection" aria-label="Clear selection"><X /></button></>}
+            {tool === 'layer-lasso' && <>{layerSelectionBounds ? <div className="layer-lasso-actions"><button onClick={cloneLayerSelection} title="Clone selection to a new layer"><Copy />Clone</button><button onClick={deleteLayerSelection} title="Delete selected pixels"><Trash2 />Delete</button><button className="icon-only" onClick={clearLayerSelection} title="Clear selection" aria-label="Clear layer selection"><X /></button></div> : <span className="bar-hint">Draw around pixels on the active layer</span>}</>}
+            {tool === 'transform' && <span className="bar-hint">Drag layer to move · drag a corner to resize</span>}{tool === 'eyedropper' && <span className="bar-hint">Press and drag to preview · release to choose</span>}
+          </div>
+          <div className="history-controls"><Button variant="ghost" size="icon-sm" onClick={undo} aria-label="Undo"><Undo2 /></Button><Button variant="ghost" size="icon-sm" onClick={redo} aria-label="Redo"><Redo2 /></Button></div>
+        </div>
+        <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={() => endPointer()} onPointerCancel={() => endPointer(true)} /><canvas ref={selectionOverlayRef} width={WIDTH} height={HEIGHT} className="selection-overlay" aria-hidden="true" /><canvas ref={layerSelectionOverlayRef} width={WIDTH} height={HEIGHT} className="layer-selection-overlay" aria-hidden="true" />{eyedropperPreview && <div className="eyedropper-preview" style={{ left: `${eyedropperPreview.x / WIDTH * 100}%`, top: `${eyedropperPreview.y / HEIGHT * 100}%` }}><span className="eyedropper-colour" style={{ background: eyedropperPreview.color }}><Pipette size={15} /></span></div>}{selection.width > 3 && selection.height > 3 && <div className={`selection-box ${selectionMode !== 'rectangle' ? 'freeform' : ''}`} style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span>{selectionMode === 'rectangle' && <><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></>}</div>}{tool === 'layer-lasso' && layerSelectionBounds && <div className="layer-selection-box" style={{ left: `${layerSelectionBounds.x / WIDTH * 100}%`, top: `${layerSelectionBounds.y / HEIGHT * 100}%`, width: `${layerSelectionBounds.width / WIDTH * 100}%`, height: `${layerSelectionBounds.height / HEIGHT * 100}%` }}><span className="transform-label">Selected pixels</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}{tool === 'transform' && transformBounds && <div className="transform-box" style={{ left: `${transformBounds.x / WIDTH * 100}%`, top: `${transformBounds.y / HEIGHT * 100}%`, width: `${transformBounds.width / WIDTH * 100}%`, height: `${transformBounds.height / HEIGHT * 100}%` }}><span className="transform-label">{layers.find((layer) => layer.id === activeLayer)?.name}</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}</div></div><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
       </div>
       <aside className="right-panel">
         <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span>{canEditWithAgent ? 'region ready' : 'select a region'}</span></div>{!canEditWithAgent ? <p className="tool-required-hint"><strong>Select an area first.</strong> Choose the Region select arrow, then drag over the part of the canvas you want your agent to read or edit.</p> : <div className="agent-ready-hint"><strong>{agentSendState === 'sent' ? 'Selection sent — prompt your agent.' : 'Region selected.'}</strong><span>{agentSendState === 'sent' ? 'Ask your connected agent in chat to edit the selected region. It can use WebMCP to fetch the crop; images are sent and received in chat.' : 'Click Send to tell your connected agent this region is ready.'}</span><Button size="sm" className="agent-send-button" onClick={requestAgentEdit} disabled={agentSendState === 'sent'}>{agentSendState === 'sent' ? <Check /> : <Send />}{agentSendState === 'sent' ? 'Sent to agent' : 'Send to agent'}</Button></div>}</section>
