@@ -2,7 +2,7 @@
 
 import {
   ArrowDown, ArrowUp, Bot, Brush, Check, ChevronDown, CircleHelp, Download,
-  Eraser, Eye, EyeOff, Hand, ImagePlus, Layers3, MousePointer2, Plus, Redo2,
+  Eraser, Eye, EyeOff, Hand, ImagePlus, Layers3, MousePointer2, Move, Plus, Redo2,
   Merge, Send, Sparkles, Trash2, Undo2, WandSparkles, X,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -10,7 +10,7 @@ import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 
-type Tool = 'select' | 'brush' | 'eraser' | 'pan';
+type Tool = 'select' | 'transform' | 'brush' | 'eraser' | 'pan';
 type Layer = { id: string; name: string; visible: boolean; opacity: number; blend: GlobalCompositeOperation; swatch: string; ai?: boolean };
 type Selection = { x: number; y: number; width: number; height: number };
 type Activity = { id: number; title: string; detail: string; time: string };
@@ -22,6 +22,8 @@ type LayerSnapshot = { layers: Layer[]; activeLayer: string; pixels: Array<{ id:
 type HistoryEntry =
   | { kind: 'pixels'; layerId: string; image: ImageData }
   | { kind: 'layers'; before: LayerSnapshot; after: LayerSnapshot };
+type TransformMode = 'move' | 'tl' | 'tr' | 'bl' | 'br';
+type ActiveTransform = { source: Selection; image: ImageData; pointer: { x: number; y: number }; mode: TransformMode };
 type DuetProject = {
   format: 'duet'; version: 1; exportedAt: string;
   canvas: { width: number; height: number; finalImage: string };
@@ -48,6 +50,7 @@ const initialLayers: Layer[] = [
 ];
 const toolMeta: Array<{ id: Tool; label: string; icon: typeof Brush; key: string }> = [
   { id: 'select', label: 'Select region', icon: MousePointer2, key: 'V' },
+  { id: 'transform', label: 'Transform layer', icon: Move, key: 'T' },
   { id: 'brush', label: 'Brush', icon: Brush, key: 'B' },
   { id: 'eraser', label: 'Eraser', icon: Eraser, key: 'E' },
   { id: 'pan', label: 'Pan canvas', icon: Hand, key: 'H' },
@@ -64,6 +67,15 @@ function safeSelection(value: unknown): Selection {
 }
 function hasUsableSelection(tool: Tool, selection: Selection) {
   return tool === 'select' && selection.width > MIN_SELECTION_SIZE && selection.height > MIN_SELECTION_SIZE;
+}
+function contentBounds(canvas: HTMLCanvasElement): Selection | null {
+  const { data } = canvas.getContext('2d')!.getImageData(0, 0, WIDTH, HEIGHT);
+  let left = WIDTH; let top = HEIGHT; let right = -1; let bottom = -1;
+  for (let y = 0; y < HEIGHT; y += 1) for (let x = 0; x < WIDTH; x += 1) {
+    if (data[(y * WIDTH + x) * 4 + 3] < 2) continue;
+    left = Math.min(left, x); top = Math.min(top, y); right = Math.max(right, x); bottom = Math.max(bottom, y);
+  }
+  return right < 0 ? null : { x: left, y: top, width: right - left + 1, height: bottom - top + 1 };
 }
 const agentEditPolicy = {
   requirement: 'For every requested document edit, use this page\'s WebMCP tools. Do not use browser clicks, pointer drags, keyboard shortcuts, or the visible canvas controls as an alternative editing route.',
@@ -87,6 +99,7 @@ export function Duet() {
   const selectionStart = useRef({ x: 0, y: 0 });
   const panStart = useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 });
   const panning = useRef(false);
+  const activeTransform = useRef<ActiveTransform | null>(null);
   const zoomRef = useRef(82);
   const zoomFrame = useRef<number | null>(null);
   const undoStack = useRef<HistoryEntry[]>([]);
@@ -101,6 +114,7 @@ export function Duet() {
   const [brushColor, setBrushColor] = useState('#ff6b5f');
   const [zoom, setZoom] = useState(82);
   const [selection, setSelection] = useState<Selection>({ x: 490, y: 155, width: 300, height: 330 });
+  const [transformBounds, setTransformBounds] = useState<Selection | null>(null);
   const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
   const [editingLayerName, setEditingLayerName] = useState('');
   const [webMcp, setWebMcp] = useState<'ready' | 'fallback'>('fallback');
@@ -223,6 +237,11 @@ export function Duet() {
     requestAnimationFrame(render);
   }, [render]);
   useEffect(() => { render(); }, [render]);
+  useEffect(() => {
+    if (tool !== 'transform') { setTransformBounds(null); return; }
+    const canvas = layerCanvases.current.get(activeLayer);
+    setTransformBounds(canvas ? contentBounds(canvas) : null);
+  }, [activeLayer, layers, tool]);
 
   const captureLayerSnapshot = useCallback((layerList: Layer[], selectedId: string): LayerSnapshot => ({
     layers: layerList.map((layer) => ({ ...layer })),
@@ -417,7 +436,7 @@ export function Duet() {
     const tools: WebMCPTool[] = [
       { name: 'get_document_state', title: 'Inspect DUET document — WebMCP-only editing policy', description: 'Returns the canvas, selection, active tool, editable layer stack, and mandatory agent policy. For a requested edit, act through these page-defined WebMCP tools only. Never use browser controls, clicks, drags, or local canvas drawing as a fallback. When agentEdit.ready is false, direct the user to select an area before continuing.', execute: () => response(actionsRef.current.getState()) },
       { name: 'create_layer', title: 'Create an editable layer', description: 'Creates a transparent paint layer and makes it active. This is not a fallback for a blocked AI edit: if pixel transfer, permission, or generation is blocked, leave the document unchanged and report the blocker.', inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'Short layer name' } } }, execute: ({ name }) => response({ layerId: actionsRef.current.createLayer(String(name || 'Agent layer')) }) },
-      { name: 'set_active_tool', title: 'Choose an editing tool', description: 'Selects the brush, eraser, region selection, or pan tool through WebMCP. Do not use it or the browser UI to make a substitute manual edit when the requested AI edit is blocked.', inputSchema: { type: 'object', properties: { tool: { type: 'string', enum: ['select', 'brush', 'eraser', 'pan'] } }, required: ['tool'] }, execute: ({ tool: next }) => response({ tool: actionsRef.current.setTool(next as Tool) }) },
+      { name: 'set_active_tool', title: 'Choose an editing tool', description: 'Selects the transform, brush, eraser, region selection, or pan tool through WebMCP. Do not use it or the browser UI to make a substitute manual edit when the requested AI edit is blocked.', inputSchema: { type: 'object', properties: { tool: { type: 'string', enum: ['select', 'transform', 'brush', 'eraser', 'pan'] } }, required: ['tool'] }, execute: ({ tool: next }) => response({ tool: actionsRef.current.setTool(next as Tool) }) },
       { name: 'select_region', title: 'Select a canvas region', description: 'Creates the region that the next AI edit should modify. It does not authorize a browser-control or manual-canvas fallback.', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } }, required: ['x', 'y', 'width', 'height'] }, execute: ({ x, y, width, height }) => response(actionsRef.current.select({ x: Number(x), y: Number(y), width: Number(width), height: Number(height) })) },
       { name: 'prepare_ai_edit', title: 'Prepare pixels for an agent edit', description: 'Returns a composited context crop, active-layer crop, selection mask, placement metadata, and optional prompt under a temporary edit ID. Use this before generating an image. If this workflow is blocked by privacy or permission, do not edit the canvas by any other route: state the blocker and request the needed permission if one exists; otherwise stop. If no active region is selected, it returns selection_required; tell the user to select an area and try again.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional visual edit instruction. Omit to let the agent decide.' } } }, execute: ({ prompt: edit }) => response(actionsRef.current.prepareAiEdit(typeof edit === 'string' ? edit : '')) },
       { name: 'insert_ai_result', title: 'Insert an agent-generated image layer', description: 'Accepts a generated PNG, JPEG, or WebP data URL for a prepared edit ID, aligns it to the saved crop, clips it to the original selection, and creates a new editable layer. Call only after prepare_ai_edit succeeds; never substitute another local or manual edit when it cannot.', inputSchema: { type: 'object', properties: { editId: { type: 'string', description: 'Temporary ID returned by prepare_ai_edit' }, imageDataUrl: { type: 'string', description: 'Base64 image data URL for the complete prepared crop' }, name: { type: 'string', description: 'Optional new layer name' } }, required: ['editId', 'imageDataUrl'] }, execute: async ({ editId, imageDataUrl, name }) => response(await actionsRef.current.insertAiResult(String(editId), String(imageDataUrl), typeof name === 'string' ? name : undefined)) },
@@ -430,6 +449,34 @@ export function Duet() {
 
   const pointer = (event: React.PointerEvent<HTMLCanvasElement>) => { const rect = event.currentTarget.getBoundingClientRect(); return { x: ((event.clientX - rect.left) / rect.width) * WIDTH, y: ((event.clientY - rect.top) / rect.height) * HEIGHT }; };
   const drawStroke = (from: { x: number; y: number }, to: { x: number; y: number }) => { const ctx = layerCanvases.current.get(activeLayer)?.getContext('2d'); if (!ctx) return; ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.lineWidth = brushSize; ctx.strokeStyle = brushColor; ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over'; ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke(); ctx.restore(); render(); };
+  const transformModeAtPoint = (bounds: Selection, point: { x: number; y: number }): TransformMode => {
+    const edge = 18;
+    const left = Math.abs(point.x - bounds.x) < edge; const right = Math.abs(point.x - (bounds.x + bounds.width)) < edge;
+    const top = Math.abs(point.y - bounds.y) < edge; const bottom = Math.abs(point.y - (bounds.y + bounds.height)) < edge;
+    if (left && top) return 'tl'; if (right && top) return 'tr'; if (left && bottom) return 'bl'; if (right && bottom) return 'br';
+    return 'move';
+  };
+  const redrawTransformedLayer = (transform: ActiveTransform, point: { x: number; y: number }) => {
+    const canvas = layerCanvases.current.get(activeLayer); if (!canvas) return;
+    const source = makeCanvas(); source.getContext('2d')!.putImageData(transform.image, 0, 0);
+    const ctx = canvas.getContext('2d')!; const bounds = transform.source;
+    let next: Selection;
+    ctx.clearRect(0, 0, WIDTH, HEIGHT);
+    if (transform.mode === 'move') {
+      const dx = point.x - transform.pointer.x; const dy = point.y - transform.pointer.y;
+      next = { x: Math.max(-bounds.width + 8, Math.min(WIDTH - 8, bounds.x + dx)), y: Math.max(-bounds.height + 8, Math.min(HEIGHT - 8, bounds.y + dy)), width: bounds.width, height: bounds.height };
+      ctx.drawImage(source, next.x - bounds.x, next.y - bounds.y);
+    } else {
+      const anchorX = transform.mode.includes('l') ? bounds.x + bounds.width : bounds.x;
+      const anchorY = transform.mode.includes('t') ? bounds.y + bounds.height : bounds.y;
+      const rawX = transform.mode.includes('l') ? point.x : bounds.x;
+      const rawY = transform.mode.includes('t') ? point.y : bounds.y;
+      const width = Math.max(12, Math.abs(anchorX - rawX)); const height = Math.max(12, Math.abs(anchorY - rawY));
+      next = { x: Math.min(anchorX, rawX), y: Math.min(anchorY, rawY), width, height };
+      ctx.drawImage(source, bounds.x, bounds.y, bounds.width, bounds.height, next.x, next.y, next.width, next.height);
+    }
+    setTransformBounds(next); render();
+  };
   const startPointer = (event: React.PointerEvent<HTMLCanvasElement>) => {
     if (tool === 'pan') {
       const viewport = viewportRef.current; if (!viewport) return;
@@ -440,6 +487,14 @@ export function Duet() {
     const point = pointer(event); event.currentTarget.setPointerCapture(event.pointerId);
     if (tool === 'select') { selectionStart.current = point; setSelection({ x: point.x, y: point.y, width: 0, height: 0 }); setAgentSendState('idle'); drawing.current = true; return; }
     const ctx = layerCanvases.current.get(activeLayer)?.getContext('2d'); if (!ctx) return;
+    if (tool === 'transform') {
+      const bounds = transformBounds || contentBounds(ctx.canvas);
+      if (!bounds) { addActivity('Transform unavailable', 'The selected layer is empty'); return; }
+      undoStack.current.push({ kind: 'pixels', layerId: activeLayer, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
+      activeTransform.current = { source: bounds, image: ctx.getImageData(0, 0, WIDTH, HEIGHT), pointer: point, mode: transformModeAtPoint(bounds, point) };
+      drawing.current = true;
+      return;
+    }
     undoStack.current.push({ kind: 'pixels', layerId: activeLayer, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
     drawing.current = true; lastPoint.current = point; drawStroke(point, point);
   };
@@ -452,9 +507,10 @@ export function Duet() {
     }
     if (!drawing.current) return; const point = pointer(event);
     if (tool === 'select') { const start = selectionStart.current; setSelection({ x: Math.min(start.x, point.x), y: Math.min(start.y, point.y), width: Math.abs(point.x - start.x), height: Math.abs(point.y - start.y) }); return; }
+    if (tool === 'transform' && activeTransform.current) { redrawTransformedLayer(activeTransform.current, point); return; }
     drawStroke(lastPoint.current, point); lastPoint.current = point;
   };
-  const endPointer = () => { if (drawing.current && tool === 'select') addActivity('Region selected', `${Math.round(selection.width)} × ${Math.round(selection.height)} px`); drawing.current = false; panning.current = false; };
+  const endPointer = () => { if (drawing.current && tool === 'select') addActivity('Region selected', `${Math.round(selection.width)} × ${Math.round(selection.height)} px`); if (drawing.current && tool === 'transform') addActivity('Layer transformed', 'Move or resize · undoable'); drawing.current = false; activeTransform.current = null; panning.current = false; };
   const undo = useCallback(() => {
     const entry = undoStack.current.pop(); if (!entry) return;
     if (entry.kind === 'layers') { restoreLayerSnapshot(entry.before); redoStack.current.push(entry); return; }
@@ -572,8 +628,8 @@ export function Duet() {
         <div className="rail-spacer" /><Tooltip><TooltipTrigger aria-label="Help" className="tool-button"><CircleHelp size={18} /></TooltipTrigger><TooltipContent side="right">B brush · E erase · V select</TooltipContent></Tooltip>
       </aside>
       <div className="canvas-column">
-        <div className="context-bar"><div className="context-group"><strong>{tool === 'select' ? 'Region select' : tool[0].toUpperCase() + tool.slice(1)}</strong>{(tool === 'brush' || tool === 'eraser') && <><span className="bar-label">Size</span><Slider className="brush-slider" min={2} max={96} value={[brushSize]} onValueChange={(value) => setBrushSize(Array.isArray(value) ? value[0] : Number(value))} /><span className="size-readout">{brushSize}px</span></>}{tool === 'select' && <span className="bar-hint">Drag to focus the next AI edit</span>}</div><div className="history-controls"><Button variant="ghost" size="icon-sm" onClick={undo} aria-label="Undo"><Undo2 /></Button><Button variant="ghost" size="icon-sm" onClick={redo} aria-label="Redo"><Redo2 /></Button></div></div>
-        <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={endPointer} onPointerCancel={endPointer} />{selection.width > 3 && selection.height > 3 && <div className="selection-box" style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></div>}</div></div><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
+        <div className="context-bar"><div className="context-group"><strong>{tool === 'select' ? 'Region select' : tool === 'transform' ? 'Transform layer' : tool[0].toUpperCase() + tool.slice(1)}</strong>{(tool === 'brush' || tool === 'eraser') && <><span className="bar-label">Size</span><Slider className="brush-slider" min={2} max={96} value={[brushSize]} onValueChange={(value) => setBrushSize(Array.isArray(value) ? value[0] : Number(value))} /><span className="size-readout">{brushSize}px</span></>}{tool === 'select' && <span className="bar-hint">Drag to focus the next AI edit</span>}{tool === 'transform' && <span className="bar-hint">Drag layer to move · drag a corner to resize</span>}</div><div className="history-controls"><Button variant="ghost" size="icon-sm" onClick={undo} aria-label="Undo"><Undo2 /></Button><Button variant="ghost" size="icon-sm" onClick={redo} aria-label="Redo"><Redo2 /></Button></div></div>
+        <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={endPointer} onPointerCancel={endPointer} />{selection.width > 3 && selection.height > 3 && <div className="selection-box" style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></div>}{tool === 'transform' && transformBounds && <div className="transform-box" style={{ left: `${transformBounds.x / WIDTH * 100}%`, top: `${transformBounds.y / HEIGHT * 100}%`, width: `${transformBounds.width / WIDTH * 100}%`, height: `${transformBounds.height / HEIGHT * 100}%` }}><span className="transform-label">{layers.find((layer) => layer.id === activeLayer)?.name}</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}</div></div><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
       </div>
       <aside className="right-panel">
         <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span>{canEditWithAgent ? 'region ready' : 'select a region'}</span></div>{!canEditWithAgent ? <p className="tool-required-hint"><strong>Select an area first.</strong> Choose the Region select arrow, then drag over the part of the canvas you want your agent to read or edit.</p> : <div className="agent-ready-hint"><strong>{agentSendState === 'sent' ? 'Selection sent — prompt your agent.' : 'Region selected.'}</strong><span>{agentSendState === 'sent' ? 'Ask your connected agent in chat to edit the selected region. It can use WebMCP to fetch the crop; images are sent and received in chat.' : 'Click Send to tell your connected agent this region is ready.'}</span><Button size="sm" className="agent-send-button" onClick={requestAgentEdit} disabled={agentSendState === 'sent'}>{agentSendState === 'sent' ? <Check /> : <Send />}{agentSendState === 'sent' ? 'Sent to agent' : 'Send to agent'}</Button></div>}</section>
