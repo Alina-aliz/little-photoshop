@@ -65,6 +65,11 @@ function safeSelection(value: unknown): Selection {
 function hasUsableSelection(tool: Tool, selection: Selection) {
   return tool === 'select' && selection.width > MIN_SELECTION_SIZE && selection.height > MIN_SELECTION_SIZE;
 }
+const agentEditPolicy = {
+  requirement: 'For every requested document edit, use this page\'s WebMCP tools. Do not use browser clicks, pointer drags, keyboard shortcuts, or the visible canvas controls as an alternative editing route.',
+  whenBlocked: 'If preparing, sending, or generating the selected image pixels is blocked by a privacy policy, missing permission, or unavailable capability, do not modify the document in any way. State the exact blocker and either request the needed permission or tell the user the edit cannot continue.',
+  forbiddenFallbacks: ['manual brush or eraser strokes', 'local canvas edits', 'creating or changing layers as a substitute', 'a different visual edit than the requested one'],
+};
 function downloadFile(blob: Blob, name: string) {
   const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = name; document.body.appendChild(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
@@ -264,6 +269,7 @@ export function Duet() {
         code: 'selection_required',
         message: 'A DUET region must be selected before the agent can read or edit canvas pixels.',
         userInstruction: 'Choose the Region select (arrow) tool, drag over the area to edit, then ask the agent to try again.',
+        agentPolicy: agentEditPolicy,
       };
     }
     const cleanPrompt = editPrompt.trim();
@@ -301,6 +307,7 @@ export function Duet() {
       selection: { x: target.x - source.x, y: target.y - source.y, width: target.width, height: target.height },
       placement: source,
       outputContract: `Return one PNG or WebP of exactly ${source.width}×${source.height}px representing the complete crop. The app will reveal only the masked selection as a new layer.`,
+      agentPolicy: agentEditPolicy,
     };
   }, [activeLayer, addActivity, compositeCanvas, selection, tool]);
 
@@ -389,9 +396,10 @@ export function Duet() {
       activeTool: tool,
       activeLayer,
       selection,
+      agentPolicy: agentEditPolicy,
       agentEdit: canEditWithAgent
-        ? { ready: true, nextStep: 'The user has selected a region. You may call prepare_ai_edit to fetch its pixels and mask.' }
-        : { ready: false, code: 'selection_required', userInstruction: 'Tell the user to choose the Region select (arrow) tool, drag over the area to edit, then ask you to try again.' },
+        ? { ready: true, nextStep: 'The user has selected a region. Call prepare_ai_edit to fetch its pixels and mask. If that call is blocked, do not make any document change; report the blocker or request permission.' }
+        : { ready: false, code: 'selection_required', userInstruction: 'Tell the user to choose the Region select (arrow) tool, drag over the area to edit, then ask you to try again. Do not substitute another edit.' },
       layers: layers.map(({ id, name, visible, opacity, ai }) => ({ id, name, visible, opacity, ai: !!ai })),
     }),
     createLayer,
@@ -407,12 +415,12 @@ export function Duet() {
     const mc = document.modelContext; if (!mc) { setWebMcp('fallback'); return; }
     const controller = new AbortController();
     const tools: WebMCPTool[] = [
-      { name: 'get_document_state', title: 'Inspect DUET document', description: 'Returns the canvas, selection, active tool, editable layer stack, and whether a selected region is ready for an agent edit. When agentEdit.ready is false, direct the user to select an area before continuing.', execute: () => response(actionsRef.current.getState()) },
-      { name: 'create_layer', title: 'Create an editable layer', description: 'Creates a transparent paint layer and makes it active.', inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'Short layer name' } } }, execute: ({ name }) => response({ layerId: actionsRef.current.createLayer(String(name || 'Agent layer')) }) },
-      { name: 'set_active_tool', title: 'Choose an editing tool', description: 'Selects the brush, eraser, region selection, or pan tool.', inputSchema: { type: 'object', properties: { tool: { type: 'string', enum: ['select', 'brush', 'eraser', 'pan'] } }, required: ['tool'] }, execute: ({ tool: next }) => response({ tool: actionsRef.current.setTool(next as Tool) }) },
-      { name: 'select_region', title: 'Select a canvas region', description: 'Creates the region that the next AI edit should modify.', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } }, required: ['x', 'y', 'width', 'height'] }, execute: ({ x, y, width, height }) => response(actionsRef.current.select({ x: Number(x), y: Number(y), width: Number(width), height: Number(height) })) },
-      { name: 'prepare_ai_edit', title: 'Prepare pixels for an agent edit', description: 'Returns a composited context crop, active-layer crop, selection mask, placement metadata, and optional prompt under a temporary edit ID. Use this before generating an image. If no active region is selected, it returns selection_required; tell the user to select an area and try again.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional visual edit instruction. Omit to let the agent decide.' } } }, execute: ({ prompt: edit }) => response(actionsRef.current.prepareAiEdit(typeof edit === 'string' ? edit : '')) },
-      { name: 'insert_ai_result', title: 'Insert an agent-generated image layer', description: 'Accepts a generated PNG, JPEG, or WebP data URL for a prepared edit ID, aligns it to the saved crop, clips it to the original selection, and creates a new editable layer.', inputSchema: { type: 'object', properties: { editId: { type: 'string', description: 'Temporary ID returned by prepare_ai_edit' }, imageDataUrl: { type: 'string', description: 'Base64 image data URL for the complete prepared crop' }, name: { type: 'string', description: 'Optional new layer name' } }, required: ['editId', 'imageDataUrl'] }, execute: async ({ editId, imageDataUrl, name }) => response(await actionsRef.current.insertAiResult(String(editId), String(imageDataUrl), typeof name === 'string' ? name : undefined)) },
+      { name: 'get_document_state', title: 'Inspect DUET document — WebMCP-only editing policy', description: 'Returns the canvas, selection, active tool, editable layer stack, and mandatory agent policy. For a requested edit, act through these page-defined WebMCP tools only. Never use browser controls, clicks, drags, or local canvas drawing as a fallback. When agentEdit.ready is false, direct the user to select an area before continuing.', execute: () => response(actionsRef.current.getState()) },
+      { name: 'create_layer', title: 'Create an editable layer', description: 'Creates a transparent paint layer and makes it active. This is not a fallback for a blocked AI edit: if pixel transfer, permission, or generation is blocked, leave the document unchanged and report the blocker.', inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'Short layer name' } } }, execute: ({ name }) => response({ layerId: actionsRef.current.createLayer(String(name || 'Agent layer')) }) },
+      { name: 'set_active_tool', title: 'Choose an editing tool', description: 'Selects the brush, eraser, region selection, or pan tool through WebMCP. Do not use it or the browser UI to make a substitute manual edit when the requested AI edit is blocked.', inputSchema: { type: 'object', properties: { tool: { type: 'string', enum: ['select', 'brush', 'eraser', 'pan'] } }, required: ['tool'] }, execute: ({ tool: next }) => response({ tool: actionsRef.current.setTool(next as Tool) }) },
+      { name: 'select_region', title: 'Select a canvas region', description: 'Creates the region that the next AI edit should modify. It does not authorize a browser-control or manual-canvas fallback.', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } }, required: ['x', 'y', 'width', 'height'] }, execute: ({ x, y, width, height }) => response(actionsRef.current.select({ x: Number(x), y: Number(y), width: Number(width), height: Number(height) })) },
+      { name: 'prepare_ai_edit', title: 'Prepare pixels for an agent edit', description: 'Returns a composited context crop, active-layer crop, selection mask, placement metadata, and optional prompt under a temporary edit ID. Use this before generating an image. If this workflow is blocked by privacy or permission, do not edit the canvas by any other route: state the blocker and request the needed permission if one exists; otherwise stop. If no active region is selected, it returns selection_required; tell the user to select an area and try again.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional visual edit instruction. Omit to let the agent decide.' } } }, execute: ({ prompt: edit }) => response(actionsRef.current.prepareAiEdit(typeof edit === 'string' ? edit : '')) },
+      { name: 'insert_ai_result', title: 'Insert an agent-generated image layer', description: 'Accepts a generated PNG, JPEG, or WebP data URL for a prepared edit ID, aligns it to the saved crop, clips it to the original selection, and creates a new editable layer. Call only after prepare_ai_edit succeeds; never substitute another local or manual edit when it cannot.', inputSchema: { type: 'object', properties: { editId: { type: 'string', description: 'Temporary ID returned by prepare_ai_edit' }, imageDataUrl: { type: 'string', description: 'Base64 image data URL for the complete prepared crop' }, name: { type: 'string', description: 'Optional new layer name' } }, required: ['editId', 'imageDataUrl'] }, execute: async ({ editId, imageDataUrl, name }) => response(await actionsRef.current.insertAiResult(String(editId), String(imageDataUrl), typeof name === 'string' ? name : undefined)) },
       { name: 'merge_layer_down', title: 'Merge the selected layer down', description: 'Flattens the selected layer into the layer directly beneath it and keeps the merged pixels editable as one layer.', execute: () => response(actionsRef.current.mergeLayerDown()) },
       { name: 'set_layer_visibility', title: 'Show or hide a layer', description: 'Changes layer visibility without destroying its pixels.', inputSchema: { type: 'object', properties: { layerId: { type: 'string' }, visible: { type: 'boolean' } }, required: ['layerId', 'visible'] }, execute: ({ layerId, visible }) => response(actionsRef.current.toggleLayer(String(layerId), Boolean(visible))) },
     ];
