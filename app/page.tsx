@@ -1,5 +1,5 @@
-import { BabyPhotoshop } from './baby-photoshop';
+import { Duet } from './duet';
 
 export default function Home() {
-  return <BabyPhotoshop />;
+  return <Duet />;
 }

@@ -7,17 +7,17 @@ export const metadata: Metadata = {
       ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
       : 'http://localhost:3000',
   ),
-  title: 'Baby Photoshop — human + AI photo editor',
-  description: 'A layer-based photo editor where humans and browser agents work on the same canvas through WebMCP.',
+  title: 'DUET — Draw together',
+  description: 'A collaborative canvas where humans and browser agents draw together through WebMCP.',
   openGraph: {
-    title: 'Baby Photoshop — human + AI photo editor',
+    title: 'DUET — Draw together',
     description: 'Human hands. Agent speed. One canvas.',
     type: 'website',
-    images: [{ url: '/og.png', width: 1536, height: 1024, alt: 'Baby Photoshop collaborative editor' }],
+    images: [{ url: '/og.png', width: 1536, height: 1024, alt: 'DUET collaborative drawing editor' }],
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'Baby Photoshop — human + AI photo editor',
+    title: 'DUET — Draw together',
     description: 'Human hands. Agent speed. One canvas.',
     images: ['/og.png'],
   },

@@ -21,8 +21,8 @@ type WebMCPTool = { name: string; title?: string; description: string; inputSche
 type PendingHumanEdit = { resolve: (value: unknown) => void; reject: (reason?: unknown) => void; timeoutId: ReturnType<typeof setTimeout> | null; cleanupSignal: () => void; promptOverride?: string };
 type AgentConnection = 'new' | 'waiting' | 'processing' | 'disconnected';
 type SavedProjectLayer = Omit<Layer, 'blend'> & { blend: string; pixels: string };
-type BabyPhotoshopProject = {
-  format: 'baby-photoshop'; version: 1; exportedAt: string;
+type DuetProject = {
+  format: 'duet'; version: 1; exportedAt: string;
   canvas: { width: number; height: number; finalImage: string };
   document: { activeLayer: string; selection: Selection; prompt: string; tool: Tool; brushSize: number; brushColor: string; zoom: number };
   layers: SavedProjectLayer[];
@@ -64,7 +64,7 @@ function downloadFile(blob: Blob, name: string) {
   const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = name; document.body.append(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
 
-export function BabyPhotoshop() {
+export function Duet() {
   const displayRef = useRef<HTMLCanvasElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -350,7 +350,7 @@ export function BabyPhotoshop() {
     const mc = document.modelContext; if (!mc) { setWebMcp('fallback'); return; }
     const controller = new AbortController();
     const tools: WebMCPTool[] = [
-      { name: 'get_document_state', title: 'Inspect Baby Photoshop document', description: 'Returns the canvas, selection, active tool, and editable layer stack.', execute: () => response(actionsRef.current.getState()) },
+      { name: 'get_document_state', title: 'Inspect DUET document', description: 'Returns the canvas, selection, active tool, and editable layer stack.', execute: () => response(actionsRef.current.getState()) },
       { name: 'create_layer', title: 'Create an editable layer', description: 'Creates a transparent paint layer and makes it active.', inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'Short layer name' } } }, execute: ({ name }) => response({ layerId: actionsRef.current.createLayer(String(name || 'Agent layer')) }) },
       { name: 'set_active_tool', title: 'Choose an editing tool', description: 'Selects the brush, eraser, region selection, or pan tool.', inputSchema: { type: 'object', properties: { tool: { type: 'string', enum: ['select', 'brush', 'eraser', 'pan'] } }, required: ['tool'] }, execute: ({ tool: next }) => response({ tool: actionsRef.current.setTool(next as Tool) }) },
       { name: 'select_region', title: 'Select a canvas region', description: 'Creates the region that the next AI edit should modify.', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } }, required: ['x', 'y', 'width', 'height'] }, execute: ({ x, y, width, height }) => response(actionsRef.current.select({ x: Number(x), y: Number(y), width: Number(width), height: Number(height) })) },
@@ -409,8 +409,8 @@ export function BabyPhotoshop() {
   const importProject = async (file: File) => {
     if (file.size > MAX_PROJECT_BYTES) throw new Error('This project is larger than the 64 MB import limit.');
     let parsed: unknown;
-    try { parsed = JSON.parse(await file.text()); } catch { throw new Error('This is not a valid Baby Photoshop project file.'); }
-    if (!isRecord(parsed) || parsed.format !== 'baby-photoshop' || parsed.version !== 1 || !isRecord(parsed.canvas) || parsed.canvas.width !== WIDTH || parsed.canvas.height !== HEIGHT || typeof parsed.canvas.finalImage !== 'string' || !/^data:image\/png;base64,/i.test(parsed.canvas.finalImage) || !Array.isArray(parsed.layers) || !isRecord(parsed.document)) throw new Error('This project file is unsupported or incomplete.');
+    try { parsed = JSON.parse(await file.text()); } catch { throw new Error('This is not a valid DUET project file.'); }
+    if (!isRecord(parsed) || (parsed.format !== 'duet' && parsed.format !== 'baby-photoshop') || parsed.version !== 1 || !isRecord(parsed.canvas) || parsed.canvas.width !== WIDTH || parsed.canvas.height !== HEIGHT || typeof parsed.canvas.finalImage !== 'string' || !/^data:image\/png;base64,/i.test(parsed.canvas.finalImage) || !Array.isArray(parsed.layers) || !isRecord(parsed.document)) throw new Error('This project file is unsupported or incomplete.');
     if (!parsed.layers.length || parsed.layers.length > MAX_PROJECT_LAYERS) throw new Error(`Projects must contain between 1 and ${MAX_PROJECT_LAYERS} layers.`);
     const knownIds = new Set<string>();
     const restored = await Promise.all(parsed.layers.map(async (item, index) => {
@@ -440,16 +440,16 @@ export function BabyPhotoshop() {
   const importFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]; if (!file) return;
     try {
-      if (file.name.toLowerCase().endsWith('.babyps') || file.type === 'application/x-baby-photoshop+json') await importProject(file);
+      if (file.name.toLowerCase().endsWith('.duet') || file.name.toLowerCase().endsWith('.babyps') || file.type === 'application/x-duet-project+json' || file.type === 'application/x-baby-photoshop+json') await importProject(file);
       else await importRasterImage(file);
     } catch (error) { addActivity('Import failed', error instanceof Error ? error.message : 'Could not read that file.'); }
     finally { event.target.value = ''; }
   };
-  const exportImage = () => { render(); const dataUrl = displayRef.current?.toDataURL('image/png'); if (!dataUrl) return; const link = document.createElement('a'); link.download = 'baby-photoshop-final.png'; link.href = dataUrl; link.click(); addActivity('Final image exported', 'PNG · 960 × 640'); };
+  const exportImage = () => { render(); const dataUrl = displayRef.current?.toDataURL('image/png'); if (!dataUrl) return; const link = document.createElement('a'); link.download = 'duet-final.png'; link.href = dataUrl; link.click(); addActivity('Final image exported', 'PNG · 960 × 640'); };
   const exportProject = () => {
     try {
-      const project: BabyPhotoshopProject = {
-        format: 'baby-photoshop', version: 1, exportedAt: new Date().toISOString(),
+      const project: DuetProject = {
+        format: 'duet', version: 1, exportedAt: new Date().toISOString(),
         canvas: { width: WIDTH, height: HEIGHT, finalImage: compositeCanvas().toDataURL('image/png') },
         document: { activeLayer, selection, prompt, tool, brushSize, brushColor, zoom },
         layers: layers.map((layer) => {
@@ -457,7 +457,7 @@ export function BabyPhotoshop() {
           return { ...layer, blend: layer.blend, pixels: canvas.toDataURL('image/png') };
         }),
       };
-      downloadFile(new Blob([JSON.stringify(project)], { type: 'application/x-baby-photoshop+json' }), `baby-photoshop-${new Date().toISOString().slice(0, 10)}.babyps`);
+      downloadFile(new Blob([JSON.stringify(project)], { type: 'application/x-duet-project+json' }), `duet-${new Date().toISOString().slice(0, 10)}.duet`);
       addActivity('Project exported', `${layers.length} layers + final PNG`);
     } catch (error) { addActivity('Export failed', error instanceof Error ? error.message : 'Could not package this project.'); }
   };
@@ -467,7 +467,7 @@ export function BabyPhotoshop() {
 
   return <TooltipProvider delay={350}><main className="editor-shell">
     <header className="topbar">
-      <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>baby photoshop</span><span className="mvp-pill">MVP</span></div>
+      <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>DUET</span><span className="mvp-pill">DRAW TOGETHER</span></div>
       <div className="document-title"><span>Untitled portrait</span><ChevronDown size={13} /></div>
       <div className="header-actions"><div className="mcp-status" title={webMcp === 'ready' ? 'Native WebMCP tools are registered' : 'Tools activate in a WebMCP-compatible browser'}><span className={`status-dot ${webMcp === 'ready' && agentConnection !== 'disconnected' && agentConnection !== 'new' ? 'ready' : agentConnection === 'disconnected' ? 'disconnected' : ''}`} /><Bot size={14} /><span>{webMcp !== 'ready' ? '8 agent tools' : agentConnection === 'waiting' ? 'Agent connected' : agentConnection === 'processing' ? 'Agent processing' : agentConnection === 'disconnected' ? 'Agent disconnected' : 'WebMCP ready'}</span></div><Button variant="ghost" size="sm" onClick={exportImage}><Download />PNG</Button><Button size="sm" className="export-button" onClick={exportProject}><Download />Project</Button></div>
     </header>
@@ -475,7 +475,7 @@ export function BabyPhotoshop() {
       <aside className="tool-rail" aria-label="Editing tools">
         {toolMeta.map(({ id, label, icon: Icon, key }) => <Tooltip key={id}><TooltipTrigger aria-label={label} className={`tool-button ${tool === id ? 'active' : ''}`} onClick={() => setTool(id)}><Icon size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">{label} · {key}</TooltipContent></Tooltip>)}
         <div className="rail-divider" /><label className="color-control" title="Brush color"><input type="color" value={brushColor} onChange={(event) => setBrushColor(event.target.value)} /><span style={{ background: brushColor }} /></label>
-        <Tooltip><TooltipTrigger aria-label="Import image or project" className="tool-button" onClick={() => fileRef.current?.click()}><ImagePlus size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">Import image or .babyps project</TooltipContent></Tooltip><input ref={fileRef} className="hidden" type="file" accept="image/*,.babyps,application/x-baby-photoshop+json" onChange={importFile} />
+        <Tooltip><TooltipTrigger aria-label="Import image or project" className="tool-button" onClick={() => fileRef.current?.click()}><ImagePlus size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">Import image or .duet project</TooltipContent></Tooltip><input ref={fileRef} className="hidden" type="file" accept="image/*,.duet,.babyps,application/x-duet-project+json,application/x-baby-photoshop+json" onChange={importFile} />
         <div className="rail-spacer" /><Tooltip><TooltipTrigger aria-label="Help" className="tool-button"><CircleHelp size={18} /></TooltipTrigger><TooltipContent side="right">B brush · E erase · V select</TooltipContent></Tooltip>
       </aside>
       <div className="canvas-column">
