@@ -44,8 +44,6 @@ button,textarea,input { font: inherit; } button { color: inherit; }
 .status-dot,.live-dot { width: 6px; height: 6px; border-radius: 999px; background: #a977ff; box-shadow: 0 0 0 3px rgba(169,119,255,.1); }
 .status-dot.ready,.live-dot { background: #6be5ac; box-shadow: 0 0 0 3px rgba(107,229,172,.1); }
 .status-dot.disconnected { background: #d77c7c; box-shadow: 0 0 0 3px rgba(215,124,124,.08); }
-.header-actions .export-image-button,.header-actions .export-button { height: 30px!important; padding-inline: 9px!important; gap: 5px!important; font-family: var(--font-geist-mono)!important; font-size: 9px!important; font-weight: 560!important; letter-spacing: .08em; text-transform: uppercase; }
-.header-actions .export-image-button svg,.header-actions .export-button svg { width: 14px; height: 14px; }
 .export-button { color: white!important; background: linear-gradient(135deg,#d85fe4,#7959ff)!important; box-shadow: 0 5px 16px rgba(132,77,255,.18); }
 
 .workspace { min-height: 0; display: grid; grid-template-columns: 50px minmax(460px,1fr) 292px; }
@@ -108,4 +106,5 @@ button,textarea,input { font: inherit; } button { color: inherit; }
 .activity-icon { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 50%; color: #c985f0; background: rgba(177,104,231,.1); border: 1px solid rgba(189,123,239,.09); }
 .activity-row strong,.activity-row small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.activity-row strong { color: #a8a3ad; font-size: 8px; font-weight: 540; }.activity-row small { margin-top: 2px; color: #5f5a65; font-size: 7px; }.activity-row time { color: #55505a; font: 7px var(--font-geist-mono); }
 @media (max-width:1040px) { .workspace { grid-template-columns: 50px minmax(460px,1fr) 260px; }.stage-viewport { padding-inline: 34px; } }
+@media (max-width:1040px) { .header-actions .export-image-button,.header-actions .export-button { height: 30px!important; padding-inline: 8px!important; font-size: 11px!important; }.header-actions .export-image-button svg,.header-actions .export-button svg { width: 15px; height: 15px; } }
 @media (max-width:880px) { body { overflow: auto; }.editor-shell { min-width: 0; overflow: auto; }.topbar { grid-template-columns: 1fr auto; }.document-title,.mcp-status { display: none; }.workspace { min-width: 760px; grid-template-columns: 50px minmax(450px,1fr) 260px; } }
