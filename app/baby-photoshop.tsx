@@ -19,6 +19,7 @@ type PendingEdit = { id: string; prompt: string; source: Selection; selection: S
 type ToolExecutionOptions = { signal: AbortSignal };
 type WebMCPTool = { name: string; title?: string; description: string; inputSchema?: Record<string, unknown>; execute: (input: Record<string, unknown>, options?: ToolExecutionOptions) => Promise<unknown> | unknown };
 type PendingHumanEdit = { resolve: (value: unknown) => void; reject: (reason?: unknown) => void; timeoutId: ReturnType<typeof setTimeout> | null; cleanupSignal: () => void; promptOverride?: string };
+type AgentConnection = 'new' | 'waiting' | 'processing' | 'disconnected';
 
 declare global {
   interface Document {
@@ -74,6 +75,7 @@ export function BabyPhotoshop() {
   const [busy, setBusy] = useState(false);
   const [preparedEdit, setPreparedEdit] = useState<{ id: string; prompt: string } | null>(null);
   const [agentWaiting, setAgentWaiting] = useState(false);
+  const [agentConnection, setAgentConnection] = useState<AgentConnection>('new');
   const [webMcp, setWebMcp] = useState<'ready' | 'fallback'>('fallback');
   const [saved, setSaved] = useState(false);
   const [activities, setActivities] = useState<Activity[]>([
@@ -242,6 +244,7 @@ export function BabyPhotoshop() {
     if (Date.now() - pending.createdAt > 10 * 60 * 1000) { pendingEdits.current.delete(editId); throw new Error('Edit package expired. Call prepare_ai_edit again.'); }
     if (!/^data:image\/(png|jpeg|webp);base64,/i.test(imageDataUrl)) throw new Error('imageDataUrl must be a base64 PNG, JPEG, or WebP data URL.');
     if (imageDataUrl.length > 14_000_000) throw new Error('Generated image is larger than the 10 MB MVP limit.');
+    setAgentConnection('processing');
     setBusy(true);
     try {
       const image = new Image();
@@ -255,7 +258,7 @@ export function BabyPhotoshop() {
       setLayers((items) => [{ id, name, visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#f28d68,#9a59ee)', ai: true }, ...items]);
       setActiveLayer(id); pendingEdits.current.delete(editId); setPreparedEdit(null);
       addActivity('Agent image inserted as layer', name);
-      return { layerId: id, name, placement: pending.source, clippedToSelection: pending.selection };
+      return { layerId: id, name, placement: pending.source, clippedToSelection: pending.selection, nextStep: 'Call wait_for_human_edit again to keep the human + agent editing loop open.' };
     } finally { setBusy(false); }
   }, [addActivity]);
 
@@ -266,8 +269,13 @@ export function BabyPhotoshop() {
     if (waiting.timeoutId) clearTimeout(waiting.timeoutId);
     waiting.cleanupSignal();
     setAgentWaiting(false);
-    if (error) waiting.reject(error);
-    else waiting.resolve(value);
+    if (error) {
+      setAgentConnection('disconnected');
+      waiting.reject(error);
+    } else {
+      setAgentConnection('processing');
+      waiting.resolve(value);
+    }
     return true;
   }, []);
 
@@ -292,6 +300,7 @@ export function BabyPhotoshop() {
         promptOverride: requestedPrompt,
       };
       setAgentWaiting(true);
+      setAgentConnection('waiting');
       addActivity('Agent is waiting', requestedPrompt ? 'Edit prompt received' : timeoutMs ? `Waiting up to ${Math.round(timeoutMs / 60_000)} minutes` : 'Waiting until you send or cancel');
     });
   }, [addActivity, settleHumanEdit]);
@@ -327,8 +336,8 @@ export function BabyPhotoshop() {
       { name: 'set_active_tool', title: 'Choose an editing tool', description: 'Selects the brush, eraser, region selection, or pan tool.', inputSchema: { type: 'object', properties: { tool: { type: 'string', enum: ['select', 'brush', 'eraser', 'pan'] } }, required: ['tool'] }, execute: ({ tool: next }) => response({ tool: actionsRef.current.setTool(next as Tool) }) },
       { name: 'select_region', title: 'Select a canvas region', description: 'Creates the region that the next AI edit should modify.', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } }, required: ['x', 'y', 'width', 'height'] }, execute: ({ x, y, width, height }) => response(actionsRef.current.select({ x: Number(x), y: Number(y), width: Number(width), height: Number(height) })) },
       { name: 'prepare_ai_edit', title: 'Prepare pixels for an agent edit', description: 'Returns a composited context crop, active-layer crop, selection mask, placement metadata, and optional prompt under a temporary edit ID. Use this before generating an image.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional visual edit instruction. Omit to let the agent decide.' } } }, execute: ({ prompt: edit }) => response(actionsRef.current.prepareAiEdit(typeof edit === 'string' ? edit : '')) },
-      { name: 'insert_ai_result', title: 'Insert an agent-generated image layer', description: 'Accepts a generated PNG, JPEG, or WebP data URL for a prepared edit ID, aligns it to the saved crop, clips it to the original selection, and creates a new editable layer.', inputSchema: { type: 'object', properties: { editId: { type: 'string', description: 'Temporary ID returned by prepare_ai_edit' }, imageDataUrl: { type: 'string', description: 'Base64 image data URL for the complete prepared crop' }, name: { type: 'string', description: 'Optional new layer name' } }, required: ['editId', 'imageDataUrl'] }, execute: async ({ editId, imageDataUrl, name }) => response(await actionsRef.current.insertAiResult(String(editId), String(imageDataUrl), typeof name === 'string' ? name : undefined)) },
-      { name: 'wait_for_human_edit', title: 'Wait for the human to send an edit', description: 'Keeps this tool call pending while the human edits the canvas. When they click Send to agent, returns the current prompt plus composited pixels, active layer pixels, selection mask, and placement metadata. Waits indefinitely by default until sent, cancelled, or the editor closes. An optional timeoutMs is capped at 24 hours.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional prompt to use when the human sends the edit' }, timeoutMs: { type: 'number', description: 'Optional wait duration in milliseconds; omit or use 0 to wait indefinitely, maximum 24 hours' } } }, execute: (input, options) => actionsRef.current.waitForHumanEdit(input, options) },
+      { name: 'insert_ai_result', title: 'Insert an agent-generated image layer', description: 'Accepts a generated PNG, JPEG, or WebP data URL for a prepared edit ID, aligns it to the saved crop, clips it to the original selection, and creates a new editable layer. After insertion, call wait_for_human_edit again so the human can continue without reconnecting.', inputSchema: { type: 'object', properties: { editId: { type: 'string', description: 'Temporary ID returned by prepare_ai_edit' }, imageDataUrl: { type: 'string', description: 'Base64 image data URL for the complete prepared crop' }, name: { type: 'string', description: 'Optional new layer name' } }, required: ['editId', 'imageDataUrl'] }, execute: async ({ editId, imageDataUrl, name }) => response(await actionsRef.current.insertAiResult(String(editId), String(imageDataUrl), typeof name === 'string' ? name : undefined)) },
+      { name: 'wait_for_human_edit', title: 'Wait for the human to send an edit', description: 'Keeps this tool call pending while the human edits the canvas. When they click Send to agent, returns the current prompt plus composited pixels, active layer pixels, selection mask, and placement metadata. Call this at the start of the editing loop and again after every insert_ai_result. The human does not need to reconnect. Waits indefinitely by default until sent, cancelled, or the editor closes. An optional timeoutMs is capped at 24 hours.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional prompt to use when the human sends the edit' }, timeoutMs: { type: 'number', description: 'Optional wait duration in milliseconds; omit or use 0 to wait indefinitely, maximum 24 hours' } } }, execute: (input, options) => actionsRef.current.waitForHumanEdit(input, options) },
       { name: 'set_layer_visibility', title: 'Show or hide a layer', description: 'Changes layer visibility without destroying its pixels.', inputSchema: { type: 'object', properties: { layerId: { type: 'string' }, visible: { type: 'boolean' } }, required: ['layerId', 'visible'] }, execute: ({ layerId, visible }) => response(actionsRef.current.toggleLayer(String(layerId), Boolean(visible))) },
     ];
     Promise.all(tools.map((item) => mc.registerTool(item, { signal: controller.signal }))).then(() => setWebMcp('ready')).catch(() => setWebMcp('fallback'));
@@ -381,7 +390,7 @@ export function BabyPhotoshop() {
     <header className="topbar">
       <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>baby photoshop</span><span className="mvp-pill">MVP</span></div>
       <div className="document-title"><span>Untitled portrait</span><ChevronDown size={13} /></div>
-      <div className="header-actions"><div className="mcp-status" title={webMcp === 'ready' ? 'Native WebMCP tools are registered' : 'Tools activate in a WebMCP-compatible browser'}><span className={`status-dot ${webMcp === 'ready' ? 'ready' : ''}`} /><Bot size={14} /><span>{webMcp === 'ready' ? 'WebMCP ready' : '8 agent tools'}</span></div><Button variant="ghost" size="sm" onClick={() => { setSaved(true); setTimeout(() => setSaved(false), 1400); }}>{saved && <Check />}{saved ? 'Saved' : 'Save'}</Button><Button size="sm" className="export-button" onClick={exportImage}><Download />Export</Button></div>
+      <div className="header-actions"><div className="mcp-status" title={webMcp === 'ready' ? 'Native WebMCP tools are registered' : 'Tools activate in a WebMCP-compatible browser'}><span className={`status-dot ${webMcp === 'ready' && agentConnection !== 'disconnected' && agentConnection !== 'new' ? 'ready' : agentConnection === 'disconnected' ? 'disconnected' : ''}`} /><Bot size={14} /><span>{webMcp !== 'ready' ? '8 agent tools' : agentConnection === 'waiting' ? 'Agent connected' : agentConnection === 'processing' ? 'Agent processing' : agentConnection === 'disconnected' ? 'Agent disconnected' : 'WebMCP ready'}</span></div><Button variant="ghost" size="sm" onClick={() => { setSaved(true); setTimeout(() => setSaved(false), 1400); }}>{saved && <Check />}{saved ? 'Saved' : 'Save'}</Button><Button size="sm" className="export-button" onClick={exportImage}><Download />Export</Button></div>
     </header>
     <section className="workspace">
       <aside className="tool-rail" aria-label="Editing tools">

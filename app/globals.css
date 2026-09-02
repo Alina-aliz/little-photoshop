@@ -43,6 +43,7 @@ button,textarea,input { font: inherit; } button { color: inherit; }
 .mcp-status { gap: 6px; margin-right: 5px; padding: 5px 9px; border: 1px solid rgba(255,255,255,.07); border-radius: 999px; color: #9e99a7; font-size: 10px; background: rgba(255,255,255,.025); }
 .status-dot,.live-dot { width: 6px; height: 6px; border-radius: 999px; background: #a977ff; box-shadow: 0 0 0 3px rgba(169,119,255,.1); }
 .status-dot.ready,.live-dot { background: #6be5ac; box-shadow: 0 0 0 3px rgba(107,229,172,.1); }
+.status-dot.disconnected { background: #d77c7c; box-shadow: 0 0 0 3px rgba(215,124,124,.08); }
 .export-button { color: white!important; background: linear-gradient(135deg,#d85fe4,#7959ff)!important; box-shadow: 0 5px 16px rgba(132,77,255,.18); }
 
 .workspace { min-height: 0; display: grid; grid-template-columns: 50px minmax(460px,1fr) 292px; }
