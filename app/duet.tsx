@@ -23,6 +23,9 @@ type WebMCPTool = { name: string; title?: string; description: string; inputSche
 type ToolExecutionOptions = { signal: AbortSignal };
 type SavedProjectLayer = Omit<Layer, 'blend'> & { blend: string; pixels: string };
 type LayerSnapshot = { layers: Layer[]; activeLayer: string; pixels: Array<{ id: string; image: ImageData }> };
+type DrawingState = { snapshot: LayerSnapshot; selection: Selection; tool: Tool; brushSize: number; brushOpacity: number; brushColor: string; effectStrength: number; textFont: TextFont; textSize: number; zoom: number };
+type WorkspaceDrawing = { id: string; name: string; state?: DrawingState };
+type PhotoAsset = { id: string; name: string; dataUrl: string; width: number; height: number; createdAt: number };
 type HistoryEntry =
   | { kind: 'pixels'; layerId: string; image: ImageData }
   | { kind: 'layers'; before: LayerSnapshot; after: LayerSnapshot };
@@ -48,6 +51,9 @@ const HEIGHT = 640;
 const MIN_SELECTION_SIZE = 4;
 const MAX_PROJECT_BYTES = 64 * 1024 * 1024;
 const MAX_PROJECT_LAYERS = 64;
+const MAX_PHOTO_BYTES = 25 * 1024 * 1024;
+const PHOTO_LIBRARY_DB = 'duet-workspace';
+const PHOTO_LIBRARY_STORE = 'photos';
 const acceptedBlends = new Set<GlobalCompositeOperation>(['source-over', 'multiply', 'screen', 'overlay', 'soft-light']);
 const initialLayers: Layer[] = [
   { id: 'ai-light', name: 'AI — warm window light', visible: true, opacity: 78, blend: 'soft-light', swatch: 'linear-gradient(135deg,#ffb86b,#9159e8)', ai: true },
@@ -129,6 +135,31 @@ function downloadFile(blob: Blob, name: string) {
 function fileStem(name: string) {
   return name.trim().replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-').replace(/\s+/g, ' ').replace(/[. ]+$/g, '').slice(0, 80) || 'Untitled artwork';
 }
+function openPhotoLibrary() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(PHOTO_LIBRARY_DB, 1);
+    request.onupgradeneeded = () => { if (!request.result.objectStoreNames.contains(PHOTO_LIBRARY_STORE)) request.result.createObjectStore(PHOTO_LIBRARY_STORE, { keyPath: 'id' }); };
+    request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error || new Error('Photo library could not be opened.'));
+  });
+}
+async function readPhotoLibrary() {
+  const database = await openPhotoLibrary();
+  try {
+    return await new Promise<PhotoAsset[]>((resolve, reject) => {
+      const request = database.transaction(PHOTO_LIBRARY_STORE, 'readonly').objectStore(PHOTO_LIBRARY_STORE).getAll();
+      request.onsuccess = () => resolve((request.result as PhotoAsset[]).sort((a, b) => b.createdAt - a.createdAt)); request.onerror = () => reject(request.error);
+    });
+  } finally { database.close(); }
+}
+async function savePhotoAsset(asset: PhotoAsset) {
+  const database = await openPhotoLibrary();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const request = database.transaction(PHOTO_LIBRARY_STORE, 'readwrite').objectStore(PHOTO_LIBRARY_STORE).put(asset);
+      request.onsuccess = () => resolve(); request.onerror = () => reject(request.error);
+    });
+  } finally { database.close(); }
+}
 
 export function Duet() {
   const displayRef = useRef<HTMLCanvasElement>(null);
@@ -138,7 +169,10 @@ export function Duet() {
   const layerSelectionOverlayRef = useRef<HTMLCanvasElement>(null);
   const layerLassoPoints = useRef<Array<{ x: number; y: number }>>([]);
   const layerSelectionRef = useRef<LayerSelectionData | null>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
+  const photoFileRef = useRef<HTMLInputElement>(null);
+  const projectFileRef = useRef<HTMLInputElement>(null);
+  const importMenuRef = useRef<HTMLDivElement>(null);
+  const documentMenuRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const colorPickerRef = useRef<HTMLDivElement>(null);
@@ -193,6 +227,11 @@ export function Duet() {
   const [documentName, setDocumentName] = useState('Untitled portrait');
   const [editingDocumentName, setEditingDocumentName] = useState(false);
   const [documentNameDraft, setDocumentNameDraft] = useState('Untitled portrait');
+  const [documentMenuOpen, setDocumentMenuOpen] = useState(false);
+  const [importMenuOpen, setImportMenuOpen] = useState(false);
+  const [photoLibrary, setPhotoLibrary] = useState<PhotoAsset[]>([]);
+  const [currentDrawingId, setCurrentDrawingId] = useState('drawing-initial');
+  const [workspaceDrawings, setWorkspaceDrawings] = useState<WorkspaceDrawing[]>([{ id: 'drawing-initial', name: 'Untitled portrait' }]);
   const [leftSidebarOpen, setLeftSidebarOpen] = useState(true);
   const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
   const [showBranding, setShowBranding] = useState(true);
@@ -250,9 +289,14 @@ export function Duet() {
   useEffect(() => {
     const closePicker = (event: PointerEvent) => {
       if (colorPickerRef.current && !colorPickerRef.current.contains(event.target as Node)) setColorPickerOpen(false);
+      if (importMenuRef.current && !importMenuRef.current.contains(event.target as Node)) setImportMenuOpen(false);
+      if (documentMenuRef.current && !documentMenuRef.current.contains(event.target as Node)) setDocumentMenuOpen(false);
     };
     document.addEventListener('pointerdown', closePicker);
     return () => document.removeEventListener('pointerdown', closePicker);
+  }, []);
+  useEffect(() => {
+    readPhotoLibrary().then(setPhotoLibrary).catch(() => { /* IndexedDB can be blocked by browser privacy settings. */ });
   }, []);
 
   const zoomAt = useCallback((requestedZoom: number, clientX?: number, clientY?: number) => {
@@ -484,6 +528,31 @@ export function Duet() {
     setLayers(snapshot.layers.map((layer) => ({ ...layer })));
     setActiveLayer(snapshot.activeLayer);
   }, []);
+
+  const captureDrawingState = useCallback((): DrawingState => ({
+    snapshot: captureLayerSnapshot(layers, activeLayer), selection: { ...selection }, tool, brushSize, brushOpacity, brushColor, effectStrength, textFont, textSize, zoom,
+  }), [activeLayer, brushColor, brushOpacity, brushSize, captureLayerSnapshot, effectStrength, layers, selection, textFont, textSize, tool, zoom]);
+  const restoreDrawingState = useCallback((state: DrawingState) => {
+    restoreLayerSnapshot(state.snapshot); setBrushSize(state.brushSize); setBrushOpacity(state.brushOpacity); setColor(state.brushColor); setEffectStrength(state.effectStrength); setTextFont(state.textFont); setTextSize(state.textSize);
+    const nextZoom = clamp(state.zoom, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom); setSelectionMode('rectangle');
+    if (state.tool === 'select') { changeTool('select'); applyRectangleSelection(state.selection); } else changeTool(state.tool);
+    undoStack.current = []; redoStack.current = []; pendingEdits.current.clear(); clearLayerSelection(); setTextDraft(null);
+  }, [applyRectangleSelection, changeTool, clearLayerSelection, restoreLayerSnapshot, setColor]);
+  const createBlankDrawing = useCallback(() => {
+    const currentState = captureDrawingState(); const id = `drawing-${Date.now()}-${Math.random().toString(16).slice(2)}`; const name = `Untitled drawing ${workspaceDrawings.length + 1}`;
+    setWorkspaceDrawings((items) => [...items.map((drawing) => drawing.id === currentDrawingId ? { ...drawing, name: documentName, state: currentState } : drawing), { id, name }]);
+    const layerId = `layer-${Date.now()}-${Math.random().toString(16).slice(2)}`; layerCanvases.current = new Map([[layerId, makeCanvas()]]);
+    setLayers([{ id: layerId, name: 'Paint layer', visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#ffffff,#d5d1e8)' }]); setActiveLayer(layerId);
+    setCurrentDrawingId(id); setDocumentName(name); setDocumentNameDraft(name); setDocumentMenuOpen(false); clearSelection(); clearLayerSelection(); changeTool('brush'); setTextDraft(null);
+    undoStack.current = []; redoStack.current = []; pendingEdits.current.clear(); addActivity('New drawing created', name); requestAnimationFrame(render);
+  }, [addActivity, captureDrawingState, changeTool, clearLayerSelection, clearSelection, currentDrawingId, documentName, render, workspaceDrawings.length]);
+  const switchDrawing = useCallback((drawingId: string) => {
+    if (drawingId === currentDrawingId) { setDocumentMenuOpen(false); return; }
+    const target = workspaceDrawings.find((drawing) => drawing.id === drawingId); if (!target?.state) return;
+    const currentState = captureDrawingState();
+    setWorkspaceDrawings((items) => items.map((drawing) => drawing.id === currentDrawingId ? { ...drawing, name: documentName, state: currentState } : drawing));
+    restoreDrawingState(target.state); setCurrentDrawingId(target.id); setDocumentName(target.name); setDocumentNameDraft(target.name); setDocumentMenuOpen(false); addActivity('Drawing switched', target.name); requestAnimationFrame(render);
+  }, [addActivity, captureDrawingState, currentDrawingId, documentName, render, restoreDrawingState, workspaceDrawings]);
 
   const createLayer = useCallback((name = 'Paint layer') => {
     const id = `layer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -933,14 +1002,27 @@ export function Duet() {
   }, [changeTool, clearLayerSelection, cloneLayerSelection, deleteLayerSelection, layerSelectionBounds, mergeLayerDown, tool, undo, zoomAt]);
 
   const loadImage = (source: string) => new Promise<HTMLImageElement>((resolve, reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = () => reject(new Error('One of the project layers could not be decoded.')); image.src = source; });
+  const fileDataUrl = (file: File) => new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('The photo could not be read.')); reader.onerror = () => reject(reader.error || new Error('The photo could not be read.')); reader.readAsDataURL(file); });
+  const placePhotoAsset = async (asset: PhotoAsset) => {
+    const image = await loadImage(asset.dataUrl); const before = captureLayerSnapshot(layers, activeLayer); const id = `import-${Date.now()}-${Math.random().toString(16).slice(2)}`; const canvas = makeCanvas(); const ctx = canvas.getContext('2d')!;
+    const scale = Math.min(WIDTH / image.width, HEIGHT / image.height); const width = image.width * scale; const height = image.height * scale;
+    ctx.drawImage(image, (WIDTH - width) / 2, (HEIGHT - height) / 2, width, height); layerCanvases.current.set(id, canvas);
+    const nextLayers: Layer[] = [{ id, name: asset.name, visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#93b8cc,#e4b28d)' }, ...layers];
+    const after = captureLayerSnapshot(nextLayers, id); undoStack.current.push({ kind: 'layers', before, after }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
+    setLayers(nextLayers); setActiveLayer(id);
+    if (/^Untitled(?: portrait| drawing(?: \d+)?)?$/i.test(documentName)) {
+      const nextName = asset.name.replace(/\.[^.]+$/, '') || 'Untitled artwork'; setDocumentName(nextName); setDocumentNameDraft(nextName);
+      setWorkspaceDrawings((items) => items.map((drawing) => drawing.id === currentDrawingId ? { ...drawing, name: nextName } : drawing));
+    }
+    setImportMenuOpen(false); addActivity('Photo placed from library', asset.name);
+  };
   const importRasterImage = async (file: File) => {
-    const objectUrl = URL.createObjectURL(file);
-    try {
-      const image = await loadImage(objectUrl); const id = `import-${Date.now()}`; const canvas = makeCanvas(); const ctx = canvas.getContext('2d')!;
-      const scale = Math.min(WIDTH / image.width, HEIGHT / image.height); const width = image.width * scale; const height = image.height * scale;
-      ctx.drawImage(image, (WIDTH - width) / 2, (HEIGHT - height) / 2, width, height);
-      layerCanvases.current.set(id, canvas); setLayers((items) => [{ id, name: file.name, visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#93b8cc,#e4b28d)' }, ...items]); setActiveLayer(id); setDocumentName(file.name.replace(/\.[^.]+$/, '') || 'Untitled artwork'); addActivity('Photo imported', file.name);
-    } finally { URL.revokeObjectURL(objectUrl); }
+    if (!file.type.startsWith('image/')) throw new Error('Choose a supported image file.');
+    if (file.size > MAX_PHOTO_BYTES) throw new Error('This photo is larger than the 25 MB import limit.');
+    const dataUrl = await fileDataUrl(file); const image = await loadImage(dataUrl);
+    const asset: PhotoAsset = { id: `photo-${Date.now()}-${Math.random().toString(16).slice(2)}`, name: file.name.slice(0, 120), dataUrl, width: image.naturalWidth, height: image.naturalHeight, createdAt: Date.now() };
+    setPhotoLibrary((items) => [asset, ...items]); savePhotoAsset(asset).catch(() => addActivity('Photo saved for this session', 'Browser storage was unavailable'));
+    await placePhotoAsset(asset); addActivity('Photo imported and saved', file.name);
   };
   const importProject = async (file: File) => {
     if (file.size > MAX_PROJECT_BYTES) throw new Error('This project is larger than the 64 MB import limit.');
@@ -971,7 +1053,8 @@ export function Duet() {
     undoStack.current = []; redoStack.current = []; pendingEdits.current.clear();
     setLayers(restored.map(({ layer }) => layer)); setActiveLayer(nextActiveLayer); applyRectangleSelection(safeSelection(projectDocument.selection)); setSelectionMode('rectangle');
     changeTool(nextTool);
-    setDocumentName(typeof projectDocument.name === 'string' && projectDocument.name.trim() ? projectDocument.name.trim().slice(0, 80) : file.name.replace(/\.(duet|babyps)$/i, '') || 'Untitled artwork');
+    const importedName = typeof projectDocument.name === 'string' && projectDocument.name.trim() ? projectDocument.name.trim().slice(0, 80) : file.name.replace(/\.(duet|babyps)$/i, '') || 'Untitled artwork';
+    setDocumentName(importedName); setDocumentNameDraft(importedName); setWorkspaceDrawings((items) => items.map((drawing) => drawing.id === currentDrawingId ? { ...drawing, name: importedName } : drawing));
     setBrushSize(Math.round(boundedNumber(projectDocument.brushSize, 28, 2, 160))); setBrushOpacity(Math.round(boundedNumber(projectDocument.brushOpacity, 100, 1, 100))); setColor(typeof projectDocument.brushColor === 'string' && /^#[0-9a-f]{6}$/i.test(projectDocument.brushColor) ? projectDocument.brushColor : '#ff6b5f');
     setEffectStrength(Math.round(boundedNumber(projectDocument.effectStrength, 55, 1, 100)));
     setTextFont(typeof projectDocument.textFont === 'string' && textFonts.some((option) => option.id === projectDocument.textFont) ? projectDocument.textFont as TextFont : 'sans');
@@ -979,12 +1062,16 @@ export function Duet() {
     const nextZoom = boundedNumber(projectDocument.zoom, 82, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom);
     addActivity('Project imported', `${restored.length} editable layers`);
   };
-  const importFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+  const importPhotoFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]; if (!file) return;
-    try {
-      if (file.name.toLowerCase().endsWith('.duet') || file.name.toLowerCase().endsWith('.babyps') || file.type === 'application/x-duet-project+json' || file.type === 'application/x-baby-photoshop+json') await importProject(file);
-      else await importRasterImage(file);
-    } catch (error) { addActivity('Import failed', error instanceof Error ? error.message : 'Could not read that file.'); }
+    try { await importRasterImage(file); }
+    catch (error) { addActivity('Photo import failed', error instanceof Error ? error.message : 'Could not read that photo.'); }
+    finally { event.target.value = ''; }
+  };
+  const importProjectFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]; if (!file) return;
+    try { await importProject(file); setImportMenuOpen(false); }
+    catch (error) { addActivity('Project import failed', error instanceof Error ? error.message : 'Could not read that project.'); }
     finally { event.target.value = ''; }
   };
   const exportImage = () => { render(); const dataUrl = displayRef.current?.toDataURL('image/png'); if (!dataUrl) return; const link = document.createElement('a'); link.download = `${fileStem(documentName)}.png`; link.href = dataUrl; link.click(); addActivity('Final image exported', `${fileStem(documentName)}.png · 960 × 640`); };
@@ -1027,7 +1114,7 @@ export function Duet() {
   const finishDocumentRename = (save: boolean) => {
     if (save) {
       const nextName = documentNameDraft.trim().slice(0, 80);
-      if (nextName && nextName !== documentName) { setDocumentName(nextName); addActivity('Document renamed', nextName); }
+      if (nextName && nextName !== documentName) { setDocumentName(nextName); setWorkspaceDrawings((items) => items.map((drawing) => drawing.id === currentDrawingId ? { ...drawing, name: nextName } : drawing)); addActivity('Document renamed', nextName); }
     }
     setEditingDocumentName(false);
   };
@@ -1036,14 +1123,14 @@ export function Duet() {
   return <TooltipProvider delay={350}><main className="editor-shell">
     <header className="topbar">
       <div className="brand-area"><Tooltip><TooltipTrigger className="view-toggle" aria-label={leftSidebarOpen ? 'Collapse tools sidebar' : 'Expand tools sidebar'} onClick={() => setLeftSidebarOpen((open) => !open)}>{leftSidebarOpen ? <PanelLeftClose /> : <PanelLeftOpen />}</TooltipTrigger><TooltipContent>{leftSidebarOpen ? 'Hide tools' : 'Show tools'}</TooltipContent></Tooltip>{showBranding && <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>DUET</span><span className="mvp-pill">CREATE WITH AI</span></div>}<Tooltip><TooltipTrigger className={`view-toggle ${!showBranding ? 'active' : ''}`} aria-label={showBranding ? 'Hide branding and canvas reminders' : 'Show branding and canvas reminders'} onClick={() => setShowBranding((shown) => !shown)}>{showBranding ? <EyeOff /> : <Eye />}</TooltipTrigger><TooltipContent>{showBranding ? 'Hide DUET and canvas reminders' : 'Show DUET and canvas reminders'}</TooltipContent></Tooltip></div>
-      <div className="document-title">{editingDocumentName ? <input autoFocus aria-label="Document name" value={documentNameDraft} maxLength={80} onChange={(event) => setDocumentNameDraft(event.target.value)} onBlur={() => finishDocumentRename(true)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); finishDocumentRename(true); } if (event.key === 'Escape') { event.preventDefault(); finishDocumentRename(false); } }} /> : <button type="button" aria-label="Rename document" title="Click to rename" onClick={beginDocumentRename}><span>{documentName}</span><ChevronDown size={13} /></button>}</div>
+      <div ref={documentMenuRef} className="document-title">{editingDocumentName ? <input autoFocus aria-label="Document name" value={documentNameDraft} maxLength={80} onChange={(event) => setDocumentNameDraft(event.target.value)} onBlur={() => finishDocumentRename(true)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); finishDocumentRename(true); } if (event.key === 'Escape') { event.preventDefault(); finishDocumentRename(false); } }} /> : <><button type="button" className="document-rename" aria-label="Rename document" title="Click to rename" onClick={beginDocumentRename}><span>{documentName}</span></button><button type="button" className={`document-menu-trigger ${documentMenuOpen ? 'active' : ''}`} aria-label="Switch drawings" aria-expanded={documentMenuOpen} onClick={() => setDocumentMenuOpen((open) => !open)}><ChevronDown size={13} /></button></>}{documentMenuOpen && !editingDocumentName && <div className="document-menu"><button className="new-drawing-button" onClick={createBlankDrawing}><Plus />New blank drawing</button><span className="document-menu-label">Drawings</span>{workspaceDrawings.map((drawing) => <button key={drawing.id} className={drawing.id === currentDrawingId ? 'active' : ''} onClick={() => switchDrawing(drawing.id)}><span>{drawing.name}</span>{drawing.id === currentDrawingId && <Check />}</button>)}</div>}</div>
       <div className="header-actions"><Tooltip><TooltipTrigger className="view-toggle" aria-label={rightSidebarOpen ? 'Collapse layers sidebar' : 'Expand layers sidebar'} onClick={() => setRightSidebarOpen((open) => !open)}>{rightSidebarOpen ? <PanelRightClose /> : <PanelRightOpen />}</TooltipTrigger><TooltipContent>{rightSidebarOpen ? 'Hide panels' : 'Show panels'}</TooltipContent></Tooltip>{showBranding && <div className="mcp-status" title={webMcp === 'ready' ? 'Native WebMCP tools are registered' : 'Tools activate in a WebMCP-compatible browser'}><span className={`status-dot ${webMcp === 'ready' ? 'ready' : ''}`} /><Bot size={14} /><span>{webMcp === 'ready' ? 'WebMCP ready' : '8 agent tools'}</span></div>}<Button variant="ghost" size="sm" className="export-image-button" onClick={exportImage}><Download />Save</Button><Button size="sm" className="export-button" onClick={exportProject}><Download />Export</Button></div>
     </header>
     <section className={`workspace ${!leftSidebarOpen ? 'left-collapsed' : ''} ${!rightSidebarOpen ? 'right-collapsed' : ''}`}>
       <aside className="tool-rail" aria-label="Editing tools">
         {toolMeta.map(({ id, label, icon: Icon, key }) => <Tooltip key={id}><TooltipTrigger aria-label={label} className={`tool-button ${tool === id ? 'active' : ''}`} onClick={() => changeTool(id)}><Icon size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">{label} · {key}</TooltipContent></Tooltip>)}
         <div className="rail-divider" /><div ref={colorPickerRef} className="color-control" onPointerDown={(event) => event.stopPropagation()}><Tooltip><TooltipTrigger aria-label="Open colour picker" className="color-button" onClick={() => setColorPickerOpen((open) => !open)}><span style={{ background: brushColor }} /></TooltipTrigger><TooltipContent side="right">Colour picker</TooltipContent></Tooltip>{colorPickerOpen && <div className="colour-picker" aria-label="Colour picker"><div className="picker-heading"><strong>Select colour</strong><code>{brushColor.toUpperCase()}</code></div><div className="colour-fields"><div ref={colorSquareRef} className="colour-square" style={{ backgroundColor: hsvToHex({ h: hsv.h, s: 100, v: 100 }) }} onPointerDown={(event) => startColorField(event, 'sv')} onPointerMove={moveColorField} onPointerUp={endColorField} onPointerCancel={endColorField}><i className="sv-marker" style={{ left: `clamp(6px, ${hsv.s}%, calc(100% - 6px))`, top: `clamp(6px, ${100 - hsv.v}%, calc(100% - 6px))` }} /></div><div ref={hueSliderRef} className="hue-slider" onPointerDown={(event) => startColorField(event, 'hue')} onPointerMove={moveColorField} onPointerUp={endColorField} onPointerCancel={endColorField}><i className="hue-slider-marker" style={{ top: `clamp(2px, ${hsv.h === 0 ? 0 : (360 - hsv.h) / 360 * 100}%, calc(100% - 2px))` }} /></div></div><div className="hex-row"><span style={{ background: brushColor }} /><input aria-label="Hex colour" value={hexDraft} spellCheck={false} onChange={(event) => setHexDraft(event.target.value)} onBlur={() => { const color = hexDraft.startsWith('#') ? hexDraft : `#${hexDraft}`; if (/^#[0-9a-f]{6}$/i.test(color)) setColor(color); else setHexDraft(brushColor); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></div><div className="recent-heading"><span>Recently used</span><button type="button" onClick={() => setColorHistory([])}>Clear</button></div><div className="recent-colours">{colorHistory.length ? colorHistory.map((color) => <button key={color} aria-label={`Use ${color}`} title={color.toUpperCase()} className={color === brushColor ? 'active' : ''} style={{ background: color }} onClick={() => setColor(color)} />) : <span>Paint with a colour to save it here</span>}</div></div>}</div>
-        <Tooltip><TooltipTrigger aria-label="Import image or project" className="tool-button" onClick={() => fileRef.current?.click()}><ImagePlus size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">Import image or .duet project</TooltipContent></Tooltip><input ref={fileRef} className="hidden" type="file" accept="image/*,.duet,.babyps,application/x-duet-project+json,application/x-baby-photoshop+json" onChange={importFile} />
+        <div ref={importMenuRef} className="import-control"><Tooltip><TooltipTrigger aria-label="Import image or project" className={`tool-button ${importMenuOpen ? 'active' : ''}`} onClick={() => setImportMenuOpen((open) => !open)}><ImagePlus size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">Photos and projects</TooltipContent></Tooltip>{importMenuOpen && <div className="import-menu"><div className="import-menu-heading"><strong>Photos</strong><span>Saved on this device</span></div><button className="import-action" onClick={() => photoFileRef.current?.click()}><ImagePlus />Upload new photo</button>{photoLibrary.length ? <div className="photo-library">{photoLibrary.map((photo) => <button key={photo.id} title={`Add ${photo.name} to this drawing`} onClick={() => { void placePhotoAsset(photo).catch((error) => addActivity('Photo placement failed', error instanceof Error ? error.message : 'Could not place that photo.')); }}><img src={photo.dataUrl} alt="" /><span>{photo.name}</span></button>)}</div> : <p className="photo-library-empty">Photos you upload will stay here for your other drawings.</p>}<div className="import-menu-divider" /><button className="import-action secondary" onClick={() => projectFileRef.current?.click()}><Layers3 />Open DUET project</button></div>}<input ref={photoFileRef} className="hidden" type="file" accept="image/*" onChange={importPhotoFile} /><input ref={projectFileRef} className="hidden" type="file" accept=".duet,.babyps,application/x-duet-project+json,application/x-baby-photoshop+json" onChange={importProjectFile} /></div>
         <div className="rail-spacer" /><Tooltip><TooltipTrigger aria-label="Help" className="tool-button"><CircleHelp size={18} /></TooltipTrigger><TooltipContent side="right">B brush · S smudge · U blur · A text</TooltipContent></Tooltip>
       </aside>
       <div className="canvas-column">
