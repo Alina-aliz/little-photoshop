@@ -58,6 +58,7 @@ const toolMeta: Array<{ id: Tool; label: string; icon: typeof Brush; key: string
 ];
 
 type HsvColor = { h: number; s: number; v: number };
+type EyedropperPreview = { x: number; y: number; color: string };
 function clamp(value: number, min: number, max: number) { return Math.max(min, Math.min(max, value)); }
 function hexToRgb(hex: string) {
   const match = /^#([0-9a-f]{6})$/i.exec(hex);
@@ -120,6 +121,7 @@ export function Duet() {
   const hueSliderRef = useRef<HTMLDivElement>(null);
   const colorDrag = useRef<'hue' | 'sv' | null>(null);
   const skipInitialColorHistorySave = useRef(true);
+  const eyedropperColor = useRef<string | null>(null);
   const layerCanvases = useRef(new Map<string, HTMLCanvasElement>());
   const thumbnailRefs = useRef(new Map<string, HTMLCanvasElement>());
   const initialized = useRef(false);
@@ -145,6 +147,7 @@ export function Duet() {
   const [colorPickerOpen, setColorPickerOpen] = useState(false);
   const [hsv, setHsv] = useState<HsvColor>(() => hexToHsv('#ff6b5f'));
   const [hexDraft, setHexDraft] = useState('#ff6b5f');
+  const [eyedropperPreview, setEyedropperPreview] = useState<EyedropperPreview | null>(null);
   const [zoom, setZoom] = useState(82);
   const [selection, setSelection] = useState<Selection>({ x: 490, y: 155, width: 300, height: 330 });
   const [transformBounds, setTransformBounds] = useState<Selection | null>(null);
@@ -159,6 +162,7 @@ export function Duet() {
   const changeTool = useCallback((next: Tool) => {
     setTool(next);
     setAgentSendState('idle');
+    if (next !== 'eyedropper') { eyedropperColor.current = null; setEyedropperPreview(null); }
     if (next !== 'select') {
       setSelection({ x: 0, y: 0, width: 0, height: 0 });
     }
@@ -352,15 +356,17 @@ export function Duet() {
     return canvas;
   }, [layers]);
 
-  const sampleCanvasColor = useCallback((point: { x: number; y: number }) => {
-    const ctx = compositeCanvas().getContext('2d');
-    if (!ctx) return;
+  const readCanvasColor = useCallback((point: { x: number; y: number }) => {
+    const ctx = displayRef.current?.getContext('2d');
+    if (!ctx) return null;
     const pixel = ctx.getImageData(clamp(Math.floor(point.x), 0, WIDTH - 1), clamp(Math.floor(point.y), 0, HEIGHT - 1), 1, 1).data;
-    if (pixel[3] === 0) return;
-    const color = rgbToHex(pixel[0], pixel[1], pixel[2]);
-    setColor(color);
-    addActivity('Colour picked', color.toUpperCase());
-  }, [addActivity, compositeCanvas, setColor]);
+    return pixel[3] === 0 ? null : rgbToHex(pixel[0], pixel[1], pixel[2]);
+  }, []);
+  const previewEyedropperColor = useCallback((point: { x: number; y: number }) => {
+    const color = readCanvasColor(point); if (!color) return;
+    eyedropperColor.current = color;
+    setEyedropperPreview({ x: point.x, y: point.y, color });
+  }, [readCanvasColor]);
 
   const prepareAiEdit = useCallback((editPrompt = '') => {
     if (!hasUsableSelection(tool, selection)) {
@@ -580,7 +586,7 @@ export function Duet() {
     }
     const point = pointer(event); event.currentTarget.setPointerCapture(event.pointerId);
     if (tool === 'select') { selectionStart.current = point; setSelection({ x: point.x, y: point.y, width: 0, height: 0 }); setAgentSendState('idle'); drawing.current = true; return; }
-    if (tool === 'eyedropper') { sampleCanvasColor(point); changeTool('brush'); return; }
+    if (tool === 'eyedropper') { previewEyedropperColor(point); drawing.current = true; return; }
     const ctx = layerCanvases.current.get(activeLayer)?.getContext('2d'); if (!ctx) return;
     if (tool === 'transform') {
       const bounds = transformBounds || contentBounds(ctx.canvas);
@@ -603,10 +609,20 @@ export function Duet() {
     }
     if (!drawing.current) return; const point = pointer(event);
     if (tool === 'select') { const start = selectionStart.current; setSelection({ x: Math.min(start.x, point.x), y: Math.min(start.y, point.y), width: Math.abs(point.x - start.x), height: Math.abs(point.y - start.y) }); return; }
+    if (tool === 'eyedropper') { previewEyedropperColor(point); return; }
     if (tool === 'transform' && activeTransform.current) { redrawTransformedLayer(activeTransform.current, point); return; }
     drawStroke(lastPoint.current, point); lastPoint.current = point;
   };
-  const endPointer = () => { if (drawing.current && tool === 'select') addActivity('Region selected', `${Math.round(selection.width)} × ${Math.round(selection.height)} px`); if (drawing.current && tool === 'transform') addActivity('Layer transformed', 'Move or resize · undoable'); drawing.current = false; activeTransform.current = null; panning.current = false; };
+  const endPointer = (cancelled = false) => {
+    if (drawing.current && tool === 'select') addActivity('Region selected', `${Math.round(selection.width)} × ${Math.round(selection.height)} px`);
+    if (drawing.current && tool === 'transform') addActivity('Layer transformed', 'Move or resize · undoable');
+    if (drawing.current && tool === 'eyedropper') {
+      const color = eyedropperColor.current;
+      if (!cancelled && color) { setColor(color); addActivity('Colour picked', color.toUpperCase()); changeTool('brush'); }
+      eyedropperColor.current = null; setEyedropperPreview(null);
+    }
+    drawing.current = false; activeTransform.current = null; panning.current = false;
+  };
   const undo = useCallback(() => {
     const entry = undoStack.current.pop(); if (!entry) return;
     if (entry.kind === 'layers') { restoreLayerSnapshot(entry.before); redoStack.current.push(entry); return; }
@@ -724,8 +740,8 @@ export function Duet() {
         <div className="rail-spacer" /><Tooltip><TooltipTrigger aria-label="Help" className="tool-button"><CircleHelp size={18} /></TooltipTrigger><TooltipContent side="right">B brush · E erase · V select</TooltipContent></Tooltip>
       </aside>
       <div className="canvas-column">
-        <div className="context-bar"><div className="context-group"><strong>{tool === 'select' ? 'Region select' : tool === 'transform' ? 'Transform layer' : tool === 'eyedropper' ? 'Eyedropper' : tool[0].toUpperCase() + tool.slice(1)}</strong>{(tool === 'brush' || tool === 'eraser') && <><span className="bar-label">Size</span><Slider className="brush-slider" min={2} max={96} value={[brushSize]} onValueChange={(value) => setBrushSize(Array.isArray(value) ? value[0] : Number(value))} /><span className="size-readout">{brushSize}px</span></>}{tool === 'select' && <span className="bar-hint">Drag to focus the next AI edit</span>}{tool === 'transform' && <span className="bar-hint">Drag layer to move · drag a corner to resize</span>}{tool === 'eyedropper' && <span className="bar-hint">Click visible canvas pixels to pick a colour</span>}</div><div className="history-controls"><Button variant="ghost" size="icon-sm" onClick={undo} aria-label="Undo"><Undo2 /></Button><Button variant="ghost" size="icon-sm" onClick={redo} aria-label="Redo"><Redo2 /></Button></div></div>
-        <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={endPointer} onPointerCancel={endPointer} />{selection.width > 3 && selection.height > 3 && <div className="selection-box" style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></div>}{tool === 'transform' && transformBounds && <div className="transform-box" style={{ left: `${transformBounds.x / WIDTH * 100}%`, top: `${transformBounds.y / HEIGHT * 100}%`, width: `${transformBounds.width / WIDTH * 100}%`, height: `${transformBounds.height / HEIGHT * 100}%` }}><span className="transform-label">{layers.find((layer) => layer.id === activeLayer)?.name}</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}</div></div><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
+        <div className="context-bar"><div className="context-group"><strong>{tool === 'select' ? 'Region select' : tool === 'transform' ? 'Transform layer' : tool === 'eyedropper' ? 'Eyedropper' : tool[0].toUpperCase() + tool.slice(1)}</strong>{(tool === 'brush' || tool === 'eraser') && <><span className="bar-label">Size</span><Slider className="brush-slider" min={2} max={96} value={[brushSize]} onValueChange={(value) => setBrushSize(Array.isArray(value) ? value[0] : Number(value))} /><span className="size-readout">{brushSize}px</span></>}{tool === 'select' && <span className="bar-hint">Drag to focus the next AI edit</span>}{tool === 'transform' && <span className="bar-hint">Drag layer to move · drag a corner to resize</span>}{tool === 'eyedropper' && <span className="bar-hint">Press and drag to preview · release to choose</span>}</div><div className="history-controls"><Button variant="ghost" size="icon-sm" onClick={undo} aria-label="Undo"><Undo2 /></Button><Button variant="ghost" size="icon-sm" onClick={redo} aria-label="Redo"><Redo2 /></Button></div></div>
+        <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={() => endPointer()} onPointerCancel={() => endPointer(true)} />{eyedropperPreview && <div className="eyedropper-preview" style={{ left: `${eyedropperPreview.x / WIDTH * 100}%`, top: `${eyedropperPreview.y / HEIGHT * 100}%` }}><span className="eyedropper-colour" style={{ background: eyedropperPreview.color }}><Pipette size={15} /></span><code>{eyedropperPreview.color.toUpperCase()}</code></div>}{selection.width > 3 && selection.height > 3 && <div className="selection-box" style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></div>}{tool === 'transform' && transformBounds && <div className="transform-box" style={{ left: `${transformBounds.x / WIDTH * 100}%`, top: `${transformBounds.y / HEIGHT * 100}%`, width: `${transformBounds.width / WIDTH * 100}%`, height: `${transformBounds.height / HEIGHT * 100}%` }}><span className="transform-label">{layers.find((layer) => layer.id === activeLayer)?.name}</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}</div></div><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></div>
       </div>
       <aside className="right-panel">
         <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span>{canEditWithAgent ? 'region ready' : 'select a region'}</span></div>{!canEditWithAgent ? <p className="tool-required-hint"><strong>Select an area first.</strong> Choose the Region select arrow, then drag over the part of the canvas you want your agent to read or edit.</p> : <div className="agent-ready-hint"><strong>{agentSendState === 'sent' ? 'Selection sent — prompt your agent.' : 'Region selected.'}</strong><span>{agentSendState === 'sent' ? 'Ask your connected agent in chat to edit the selected region. It can use WebMCP to fetch the crop; images are sent and received in chat.' : 'Click Send to tell your connected agent this region is ready.'}</span><Button size="sm" className="agent-send-button" onClick={requestAgentEdit} disabled={agentSendState === 'sent'}>{agentSendState === 'sent' ? <Check /> : <Send />}{agentSendState === 'sent' ? 'Sent to agent' : 'Send to agent'}</Button></div>}</section>
