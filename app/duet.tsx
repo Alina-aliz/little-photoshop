@@ -31,7 +31,7 @@ type ActiveLayerSelectionTransform = { start: Selection; pointer: { x: number; y
 type DuetProject = {
   format: 'duet'; version: 1; exportedAt: string;
   canvas: { width: number; height: number; finalImage: string };
-  document: { activeLayer: string; selection: Selection; prompt: string; tool: Tool; brushSize: number; brushOpacity?: number; brushColor: string; zoom: number };
+  document: { name?: string; activeLayer: string; selection: Selection; prompt: string; tool: Tool; brushSize: number; brushOpacity?: number; brushColor: string; zoom: number };
   layers: SavedProjectLayer[];
 };
 
@@ -115,6 +115,9 @@ const agentEditPolicy = {
 function downloadFile(blob: Blob, name: string) {
   const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = name; document.body.appendChild(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
+function fileStem(name: string) {
+  return name.trim().replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-').replace(/\s+/g, ' ').replace(/[. ]+$/g, '').slice(0, 80) || 'Untitled artwork';
+}
 
 export function Duet() {
   const displayRef = useRef<HTMLCanvasElement>(null);
@@ -171,6 +174,9 @@ export function Duet() {
   const [editingLayerName, setEditingLayerName] = useState('');
   const [webMcp, setWebMcp] = useState<'ready' | 'fallback'>('fallback');
   const [agentSendState, setAgentSendState] = useState<'idle' | 'sent'>('idle');
+  const [documentName, setDocumentName] = useState('Untitled portrait');
+  const [editingDocumentName, setEditingDocumentName] = useState(false);
+  const [documentNameDraft, setDocumentNameDraft] = useState('Untitled portrait');
   const [leftSidebarOpen, setLeftSidebarOpen] = useState(true);
   const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
   const [showBranding, setShowBranding] = useState(true);
@@ -858,7 +864,7 @@ export function Duet() {
       const image = await loadImage(objectUrl); const id = `import-${Date.now()}`; const canvas = makeCanvas(); const ctx = canvas.getContext('2d')!;
       const scale = Math.min(WIDTH / image.width, HEIGHT / image.height); const width = image.width * scale; const height = image.height * scale;
       ctx.drawImage(image, (WIDTH - width) / 2, (HEIGHT - height) / 2, width, height);
-      layerCanvases.current.set(id, canvas); setLayers((items) => [{ id, name: file.name, visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#93b8cc,#e4b28d)' }, ...items]); setActiveLayer(id); addActivity('Photo imported', file.name);
+      layerCanvases.current.set(id, canvas); setLayers((items) => [{ id, name: file.name, visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#93b8cc,#e4b28d)' }, ...items]); setActiveLayer(id); setDocumentName(file.name.replace(/\.[^.]+$/, '') || 'Untitled artwork'); addActivity('Photo imported', file.name);
     } finally { URL.revokeObjectURL(objectUrl); }
   };
   const importProject = async (file: File) => {
@@ -890,6 +896,7 @@ export function Duet() {
     undoStack.current = []; redoStack.current = []; pendingEdits.current.clear();
     setLayers(restored.map(({ layer }) => layer)); setActiveLayer(nextActiveLayer); applyRectangleSelection(safeSelection(projectDocument.selection)); setSelectionMode('rectangle');
     changeTool(nextTool);
+    setDocumentName(typeof projectDocument.name === 'string' && projectDocument.name.trim() ? projectDocument.name.trim().slice(0, 80) : file.name.replace(/\.(duet|babyps)$/i, '') || 'Untitled artwork');
     setBrushSize(Math.round(boundedNumber(projectDocument.brushSize, 28, 2, 96))); setBrushOpacity(Math.round(boundedNumber(projectDocument.brushOpacity, 100, 1, 100))); setColor(typeof projectDocument.brushColor === 'string' && /^#[0-9a-f]{6}$/i.test(projectDocument.brushColor) ? projectDocument.brushColor : '#ff6b5f');
     const nextZoom = boundedNumber(projectDocument.zoom, 82, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom);
     addActivity('Project imported', `${restored.length} editable layers`);
@@ -902,19 +909,19 @@ export function Duet() {
     } catch (error) { addActivity('Import failed', error instanceof Error ? error.message : 'Could not read that file.'); }
     finally { event.target.value = ''; }
   };
-  const exportImage = () => { render(); const dataUrl = displayRef.current?.toDataURL('image/png'); if (!dataUrl) return; const link = document.createElement('a'); link.download = 'duet-final.png'; link.href = dataUrl; link.click(); addActivity('Final image exported', 'PNG · 960 × 640'); };
+  const exportImage = () => { render(); const dataUrl = displayRef.current?.toDataURL('image/png'); if (!dataUrl) return; const link = document.createElement('a'); link.download = `${fileStem(documentName)}.png`; link.href = dataUrl; link.click(); addActivity('Final image exported', `${fileStem(documentName)}.png · 960 × 640`); };
   const exportProject = () => {
     try {
       const project: DuetProject = {
         format: 'duet', version: 1, exportedAt: new Date().toISOString(),
         canvas: { width: WIDTH, height: HEIGHT, finalImage: compositeCanvas().toDataURL('image/png') },
-        document: { activeLayer, selection, prompt: '', tool, brushSize, brushOpacity, brushColor, zoom },
+        document: { name: documentName, activeLayer, selection, prompt: '', tool, brushSize, brushOpacity, brushColor, zoom },
         layers: layers.map((layer) => {
           const canvas = layerCanvases.current.get(layer.id); if (!canvas) throw new Error(`Layer “${layer.name}” is missing its pixels.`);
           return { ...layer, blend: layer.blend, pixels: canvas.toDataURL('image/png') };
         }),
       };
-      downloadFile(new Blob([JSON.stringify(project)], { type: 'application/x-duet-project+json' }), `duet-${new Date().toISOString().slice(0, 10)}.duet`);
+      downloadFile(new Blob([JSON.stringify(project)], { type: 'application/x-duet-project+json' }), `${fileStem(documentName)}.duet`);
       addActivity('Project exported', `${layers.length} layers + final PNG`);
     } catch (error) { addActivity('Export failed', error instanceof Error ? error.message : 'Could not package this project.'); }
   };
@@ -938,12 +945,20 @@ export function Duet() {
     setEditingLayerId(null);
     setEditingLayerName('');
   };
+  const beginDocumentRename = () => { setDocumentNameDraft(documentName); setEditingDocumentName(true); };
+  const finishDocumentRename = (save: boolean) => {
+    if (save) {
+      const nextName = documentNameDraft.trim().slice(0, 80);
+      if (nextName && nextName !== documentName) { setDocumentName(nextName); addActivity('Document renamed', nextName); }
+    }
+    setEditingDocumentName(false);
+  };
   const activeOpacity = layers.find((layer) => layer.id === activeLayer)?.opacity ?? 100;
 
   return <TooltipProvider delay={350}><main className="editor-shell">
     <header className="topbar">
       <div className="brand-area"><Tooltip><TooltipTrigger className="view-toggle" aria-label={leftSidebarOpen ? 'Collapse tools sidebar' : 'Expand tools sidebar'} onClick={() => setLeftSidebarOpen((open) => !open)}>{leftSidebarOpen ? <PanelLeftClose /> : <PanelLeftOpen />}</TooltipTrigger><TooltipContent>{leftSidebarOpen ? 'Hide tools' : 'Show tools'}</TooltipContent></Tooltip>{showBranding && <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>DUET</span><span className="mvp-pill">CREATE WITH AI</span></div>}<Tooltip><TooltipTrigger className={`view-toggle ${!showBranding ? 'active' : ''}`} aria-label={showBranding ? 'Hide branding and canvas reminders' : 'Show branding and canvas reminders'} onClick={() => setShowBranding((shown) => !shown)}>{showBranding ? <EyeOff /> : <Eye />}</TooltipTrigger><TooltipContent>{showBranding ? 'Hide DUET and canvas reminders' : 'Show DUET and canvas reminders'}</TooltipContent></Tooltip></div>
-      <div className="document-title"><span>Untitled portrait</span><ChevronDown size={13} /></div>
+      <div className="document-title">{editingDocumentName ? <input autoFocus aria-label="Document name" value={documentNameDraft} maxLength={80} onChange={(event) => setDocumentNameDraft(event.target.value)} onBlur={() => finishDocumentRename(true)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); finishDocumentRename(true); } if (event.key === 'Escape') { event.preventDefault(); finishDocumentRename(false); } }} /> : <button type="button" aria-label="Rename document" title="Click to rename" onClick={beginDocumentRename}><span>{documentName}</span><ChevronDown size={13} /></button>}</div>
       <div className="header-actions"><Tooltip><TooltipTrigger className="view-toggle" aria-label={rightSidebarOpen ? 'Collapse layers sidebar' : 'Expand layers sidebar'} onClick={() => setRightSidebarOpen((open) => !open)}>{rightSidebarOpen ? <PanelRightClose /> : <PanelRightOpen />}</TooltipTrigger><TooltipContent>{rightSidebarOpen ? 'Hide panels' : 'Show panels'}</TooltipContent></Tooltip><div className="mcp-status" title={webMcp === 'ready' ? 'Native WebMCP tools are registered' : 'Tools activate in a WebMCP-compatible browser'}><span className={`status-dot ${webMcp === 'ready' ? 'ready' : ''}`} /><Bot size={14} /><span>{webMcp === 'ready' ? 'WebMCP ready' : '8 agent tools'}</span></div><Button variant="ghost" size="sm" className="export-image-button" onClick={exportImage}><Download />Save</Button><Button size="sm" className="export-button" onClick={exportProject}><Download />Export</Button></div>
     </header>
     <section className={`workspace ${!leftSidebarOpen ? 'left-collapsed' : ''} ${!rightSidebarOpen ? 'right-collapsed' : ''}`}>
