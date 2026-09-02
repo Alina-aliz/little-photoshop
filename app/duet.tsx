@@ -3,7 +3,7 @@
 import {
   ArrowDown, ArrowUp, Bot, Brush, Check, ChevronDown, CircleHelp, Download,
   Eraser, Eye, EyeOff, Hand, ImagePlus, Layers3, MousePointer2, Plus, Redo2,
-  Sparkles, Trash2, Undo2, WandSparkles, X,
+  Merge, Sparkles, Trash2, Undo2, WandSparkles, X,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
@@ -335,6 +335,55 @@ export function Duet() {
     }
   }, [addActivity, prepareAiEdit, prompt, settleHumanEdit]);
 
+  const mergeLayerDown = useCallback(() => {
+    const index = layers.findIndex((layer) => layer.id === activeLayer);
+    if (index < 0 || index >= layers.length - 1) {
+      const error = 'Select a layer with another layer beneath it.';
+      addActivity('Merge unavailable', error);
+      return { merged: false, error };
+    }
+    const selected = layers[index];
+    const below = layers[index + 1];
+    const selectedCanvas = layerCanvases.current.get(selected.id);
+    const belowCanvas = layerCanvases.current.get(below.id);
+    if (!selectedCanvas || !belowCanvas) {
+      const error = 'One of the selected layers is missing its pixels.';
+      addActivity('Merge failed', error);
+      return { merged: false, error };
+    }
+
+    // Bake both visible layers into one transparent raster, preserving how the
+    // pair looked on the canvas while leaving the result fully editable.
+    const mergedCanvas = makeCanvas();
+    const ctx = mergedCanvas.getContext('2d')!;
+    if (below.visible) {
+      ctx.save(); ctx.globalAlpha = below.opacity / 100; ctx.globalCompositeOperation = below.blend; ctx.drawImage(belowCanvas, 0, 0); ctx.restore();
+    }
+    if (selected.visible) {
+      ctx.save(); ctx.globalAlpha = selected.opacity / 100; ctx.globalCompositeOperation = selected.blend; ctx.drawImage(selectedCanvas, 0, 0); ctx.restore();
+    }
+
+    const mergedName = `${below.name} + ${selected.name}`.slice(0, 80);
+    const mergedLayer: Layer = {
+      ...below,
+      name: mergedName,
+      visible: selected.visible || below.visible,
+      opacity: 100,
+      blend: 'source-over',
+      ai: selected.ai || below.ai,
+    };
+    layerCanvases.current.set(below.id, mergedCanvas);
+    layerCanvases.current.delete(selected.id);
+    setLayers((items) => {
+      const next = [...items];
+      next.splice(index, 2, mergedLayer);
+      return next;
+    });
+    setActiveLayer(below.id);
+    addActivity('Layers merged', `${selected.name} into ${below.name}`);
+    return { merged: true, layerId: below.id, name: mergedName, mergedLayerIds: [selected.id, below.id] };
+  }, [activeLayer, addActivity, layers]);
+
   actionsRef.current = {
     getState: () => ({ canvas: { width: WIDTH, height: HEIGHT, zoom }, activeTool: tool, activeLayer, selection, layers: layers.map(({ id, name, visible, opacity, ai }) => ({ id, name, visible, opacity, ai: !!ai })) }),
     createLayer,
@@ -343,6 +392,7 @@ export function Duet() {
     prepareAiEdit,
     insertAiResult,
     waitForHumanEdit,
+    mergeLayerDown,
     toggleLayer: (id: string, visible: boolean) => { setLayers((items) => items.map((layer) => layer.id === id ? { ...layer, visible } : layer)); addActivity('Agent updated layer', visible ? 'Shown' : 'Hidden'); return { id, visible }; },
   };
 
@@ -356,6 +406,7 @@ export function Duet() {
       { name: 'select_region', title: 'Select a canvas region', description: 'Creates the region that the next AI edit should modify.', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } }, required: ['x', 'y', 'width', 'height'] }, execute: ({ x, y, width, height }) => response(actionsRef.current.select({ x: Number(x), y: Number(y), width: Number(width), height: Number(height) })) },
       { name: 'prepare_ai_edit', title: 'Prepare pixels for an agent edit', description: 'Returns a composited context crop, active-layer crop, selection mask, placement metadata, and optional prompt under a temporary edit ID. Use this before generating an image.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional visual edit instruction. Omit to let the agent decide.' } } }, execute: ({ prompt: edit }) => response(actionsRef.current.prepareAiEdit(typeof edit === 'string' ? edit : '')) },
       { name: 'insert_ai_result', title: 'Insert an agent-generated image layer', description: 'Accepts a generated PNG, JPEG, or WebP data URL for a prepared edit ID, aligns it to the saved crop, clips it to the original selection, and creates a new editable layer. After insertion, call wait_for_human_edit again so the human can continue without reconnecting.', inputSchema: { type: 'object', properties: { editId: { type: 'string', description: 'Temporary ID returned by prepare_ai_edit' }, imageDataUrl: { type: 'string', description: 'Base64 image data URL for the complete prepared crop' }, name: { type: 'string', description: 'Optional new layer name' } }, required: ['editId', 'imageDataUrl'] }, execute: async ({ editId, imageDataUrl, name }) => response(await actionsRef.current.insertAiResult(String(editId), String(imageDataUrl), typeof name === 'string' ? name : undefined)) },
+      { name: 'merge_layer_down', title: 'Merge the selected layer down', description: 'Flattens the selected layer into the layer directly beneath it and keeps the merged pixels editable as one layer.', execute: () => response(actionsRef.current.mergeLayerDown()) },
       { name: 'wait_for_human_edit', title: 'Wait for the human to send an edit', description: 'Keeps this tool call pending while the human edits the canvas. When they click Send to agent, returns the current prompt plus composited pixels, active layer pixels, selection mask, and placement metadata. Call this at the start of the editing loop and again after every insert_ai_result. The human does not need to reconnect. Waits indefinitely by default until sent, cancelled, or the editor closes. An optional timeoutMs is capped at 24 hours.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional prompt to use when the human sends the edit' }, timeoutMs: { type: 'number', description: 'Optional wait duration in milliseconds; omit or use 0 to wait indefinitely, maximum 24 hours' } } }, execute: (input, options) => actionsRef.current.waitForHumanEdit(input, options) },
       { name: 'set_layer_visibility', title: 'Show or hide a layer', description: 'Changes layer visibility without destroying its pixels.', inputSchema: { type: 'object', properties: { layerId: { type: 'string' }, visible: { type: 'boolean' } }, required: ['layerId', 'visible'] }, execute: ({ layerId, visible }) => response(actionsRef.current.toggleLayer(String(layerId), Boolean(visible))) },
     ];
@@ -394,7 +445,7 @@ export function Duet() {
   const endPointer = () => { if (drawing.current && tool === 'select') addActivity('Region selected', `${Math.round(selection.width)} × ${Math.round(selection.height)} px`); drawing.current = false; panning.current = false; };
   const undo = useCallback(() => { const entry = undoStack.current.pop(); if (!entry) return; const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return; redoStack.current.push({ layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render(); }, [render]);
   const redo = () => { const entry = redoStack.current.pop(); if (!entry) return; const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return; undoStack.current.push({ layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render(); };
-  useEffect(() => { const keydown = (event: KeyboardEvent) => { if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return; const next = toolMeta.find((item) => item.key.toLowerCase() === event.key.toLowerCase()); if (next) setTool(next.id); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); } if ((event.metaKey || event.ctrlKey) && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomAt(zoomRef.current * 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '-') { event.preventDefault(); zoomAt(zoomRef.current / 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '0') { event.preventDefault(); zoomAt(82); } }; window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown); }, [undo, zoomAt]);
+  useEffect(() => { const keydown = (event: KeyboardEvent) => { if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return; const next = toolMeta.find((item) => item.key.toLowerCase() === event.key.toLowerCase()); if (next) setTool(next.id); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); } if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'e') { event.preventDefault(); mergeLayerDown(); } if ((event.metaKey || event.ctrlKey) && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomAt(zoomRef.current * 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '-') { event.preventDefault(); zoomAt(zoomRef.current / 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '0') { event.preventDefault(); zoomAt(82); } }; window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown); }, [mergeLayerDown, undo, zoomAt]);
 
   const loadImage = (source: string) => new Promise<HTMLImageElement>((resolve, reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = () => reject(new Error('One of the project layers could not be decoded.')); image.src = source; });
   const importRasterImage = async (file: File) => {
@@ -484,7 +535,7 @@ export function Duet() {
       </div>
       <aside className="right-panel">
         <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span className={agentWaiting ? 'agent-waiting' : ''}>{agentWaiting ? 'agent waiting' : 'no backend'}</span></div><Textarea value={prompt} onChange={(event) => { setPrompt(event.target.value); setPreparedEdit(null); }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') prepareOrSendToAgent(); }} placeholder="Optional — let the agent decide…" aria-label="Agent edit prompt" className="prompt-input" /><div className="prompt-meta"><span><MousePointer2 size={12} /> Selected region</span><span>{Math.round(selection.width)} × {Math.round(selection.height)}</span></div><Button className="ai-button" onClick={prepareOrSendToAgent} disabled={busy}>{busy ? <span className="spinner" /> : agentWaiting ? <Check /> : preparedEdit ? <Check /> : <Sparkles />}{busy ? 'Receiving agent image…' : agentWaiting ? 'Send current edit to agent' : preparedEdit ? 'Ready for your agent' : 'Prepare edit package'}{!busy && !preparedEdit && !agentWaiting && <kbd>⌘↵</kbd>}</Button><p className="demo-note">{agentWaiting ? 'Your browser agent is waiting. Take your time, then click Send current edit to agent.' : preparedEdit ? `Edit ${preparedEdit.id.split('-').slice(-1)[0]} is ready. Ask your browser agent to finish it.` : 'WebMCP sends the crop and mask to your agent; its generated image returns as a new layer.'}</p></section>
-        <section className="layers-panel"><div className="panel-heading layer-heading"><div><Layers3 size={16} /><strong>Layers</strong><span className="layer-count">{layers.length}</span></div><div className="layer-actions"><Button variant="ghost" size="icon-xs" aria-label="Move layer up" onClick={() => moveLayer(-1)}><ArrowUp /></Button><Button variant="ghost" size="icon-xs" aria-label="Move layer down" onClick={() => moveLayer(1)}><ArrowDown /></Button><Button variant="ghost" size="icon-xs" aria-label="New layer" onClick={() => createLayer()}><Plus /></Button></div></div><div className="opacity-row"><span>Opacity</span><Slider min={0} max={100} value={[activeOpacity]} onValueChange={(value) => { const opacity = Array.isArray(value) ? value[0] : Number(value); setLayers((items) => items.map((layer) => layer.id === activeLayer ? { ...layer, opacity } : layer)); }} /><span>{Math.round(activeOpacity)}%</span></div><div className="layer-list">{layers.map((layer) => <button key={layer.id} className={`layer-row ${activeLayer === layer.id ? 'active' : ''}`} onClick={() => setActiveLayer(layer.id)}><span className="visibility-toggle" role="button" tabIndex={0} aria-label={layer.visible ? 'Hide layer' : 'Show layer'} onClick={(event) => { event.stopPropagation(); setLayers((items) => items.map((item) => item.id === layer.id ? { ...item, visible: !item.visible } : item)); }}>{layer.visible ? <Eye size={14} /> : <EyeOff size={14} />}</span><span className="layer-thumb" style={{ background: layer.swatch }}>{layer.ai && <Sparkles size={10} />}</span><span className="layer-name">{layer.name}<small>{layer.ai ? 'AI result · editable' : 'Pixel layer'}</small></span>{activeLayer === layer.id && <Check size={13} className="active-check" />}</button>)}</div><div className="layer-footer"><Button variant="ghost" size="sm" onClick={() => createLayer()}><Plus />New layer</Button><Button variant="ghost" size="icon-sm" aria-label="Delete layer" onClick={removeActive} disabled={layers.length <= 1}><Trash2 /></Button></div></section>
+        <section className="layers-panel"><div className="panel-heading layer-heading"><div><Layers3 size={16} /><strong>Layers</strong><span className="layer-count">{layers.length}</span></div><div className="layer-actions"><Button variant="ghost" size="icon-xs" aria-label="Move layer up" onClick={() => moveLayer(-1)}><ArrowUp /></Button><Button variant="ghost" size="icon-xs" aria-label="Move layer down" onClick={() => moveLayer(1)}><ArrowDown /></Button><Button variant="ghost" size="icon-xs" aria-label="New layer" onClick={() => createLayer()}><Plus /></Button></div></div><div className="opacity-row"><span>Opacity</span><Slider min={0} max={100} value={[activeOpacity]} onValueChange={(value) => { const opacity = Array.isArray(value) ? value[0] : Number(value); setLayers((items) => items.map((layer) => layer.id === activeLayer ? { ...layer, opacity } : layer)); }} /><span>{Math.round(activeOpacity)}%</span></div><div className="layer-list">{layers.map((layer) => <button key={layer.id} className={`layer-row ${activeLayer === layer.id ? 'active' : ''}`} onClick={() => setActiveLayer(layer.id)}><span className="visibility-toggle" role="button" tabIndex={0} aria-label={layer.visible ? 'Hide layer' : 'Show layer'} onClick={(event) => { event.stopPropagation(); setLayers((items) => items.map((item) => item.id === layer.id ? { ...item, visible: !item.visible } : item)); }}>{layer.visible ? <Eye size={14} /> : <EyeOff size={14} />}</span><span className="layer-thumb" style={{ background: layer.swatch }}>{layer.ai && <Sparkles size={10} />}</span><span className="layer-name">{layer.name}<small>{layer.ai ? 'AI result · editable' : 'Pixel layer'}</small></span>{activeLayer === layer.id && <Check size={13} className="active-check" />}</button>)}</div><div className="layer-footer"><div className="layer-footer-main"><Button variant="ghost" size="sm" onClick={() => createLayer()}><Plus />New layer</Button><Button variant="ghost" size="sm" onClick={mergeLayerDown} disabled={layers.findIndex((layer) => layer.id === activeLayer) >= layers.length - 1} title="Merge selected layer into the layer below (⌘E / Ctrl+E)"><Merge />Merge down</Button></div><Button variant="ghost" size="icon-sm" aria-label="Delete layer" onClick={removeActive} disabled={layers.length <= 1}><Trash2 /></Button></div></section>
         <section className="activity-panel"><div className="panel-heading"><div><Bot size={15} /><strong>Shared activity</strong></div><button aria-label="Close activity"><X size={14} /></button></div><div className="activity-list">{activities.slice(0, 3).map((item) => <div className="activity-row" key={item.id}><span className="activity-icon"><Sparkles size={12} /></span><span><strong>{item.title}</strong><small>{item.detail}</small></span><time>{item.time}</time></div>)}</div></section>
       </aside>
     </section>
