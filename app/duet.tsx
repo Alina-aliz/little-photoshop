@@ -10,6 +10,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { AnimationStudio } from './animation-studio';
 
 type Tool = 'select' | 'layer-lasso' | 'transform' | 'brush' | 'eraser' | 'smudge' | 'blur' | 'text' | 'eyedropper' | 'pan';
 type SelectionMode = 'rectangle' | 'brush' | 'lasso';
@@ -256,6 +257,7 @@ export function Duet() {
   const [leftSidebarOpen, setLeftSidebarOpen] = useState(true);
   const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
   const [showBranding, setShowBranding] = useState(true);
+  const [workspaceMode, setWorkspaceMode] = useState<'illustration' | 'animation'>('illustration');
   const [activities, setActivities] = useState<Activity[]>([
     { id: 1, title: 'Agent added a layer', detail: 'Warm window light', time: 'now' },
     { id: 2, title: 'Region selected', detail: '300 × 330 px', time: '1m' },
@@ -1160,10 +1162,11 @@ export function Duet() {
     setEditingDocumentName(false);
   };
   const activeOpacity = layers.find((layer) => layer.id === activeLayer)?.opacity ?? 100;
+  const getIllustrationImage = useCallback(() => displayRef.current?.getContext('2d')?.getImageData(0, 0, WIDTH, HEIGHT) || null, []);
 
-  return <TooltipProvider delay={350}><main className="editor-shell">
+  return <TooltipProvider delay={350}><><AnimationStudio active={workspaceMode === 'animation'} documentName={documentName} onModeChange={setWorkspaceMode} getIllustrationImage={getIllustrationImage} /><main className={`editor-shell ${workspaceMode === 'illustration' ? '' : 'mode-hidden'}`} aria-hidden={workspaceMode !== 'illustration'}>
     <header className="topbar">
-      <div className="brand-area"><Tooltip><TooltipTrigger className="view-toggle" aria-label={leftSidebarOpen ? 'Collapse tools sidebar' : 'Expand tools sidebar'} onClick={() => setLeftSidebarOpen((open) => !open)}>{leftSidebarOpen ? <PanelLeftClose /> : <PanelLeftOpen />}</TooltipTrigger><TooltipContent>{leftSidebarOpen ? 'Hide tools' : 'Show tools'}</TooltipContent></Tooltip>{showBranding && <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>DUET</span><span className="mvp-pill">CREATE WITH AI</span></div>}<Tooltip><TooltipTrigger className={`view-toggle ${!showBranding ? 'active' : ''}`} aria-label={showBranding ? 'Hide branding and canvas reminders' : 'Show branding and canvas reminders'} onClick={() => setShowBranding((shown) => !shown)}>{showBranding ? <EyeOff /> : <Eye />}</TooltipTrigger><TooltipContent>{showBranding ? 'Hide DUET and canvas reminders' : 'Show DUET and canvas reminders'}</TooltipContent></Tooltip></div>
+      <div className="brand-area"><Tooltip><TooltipTrigger className="view-toggle" aria-label={leftSidebarOpen ? 'Collapse tools sidebar' : 'Expand tools sidebar'} onClick={() => setLeftSidebarOpen((open) => !open)}>{leftSidebarOpen ? <PanelLeftClose /> : <PanelLeftOpen />}</TooltipTrigger><TooltipContent>{leftSidebarOpen ? 'Hide tools' : 'Show tools'}</TooltipContent></Tooltip>{showBranding && <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>DUET</span><span className="mvp-pill">CREATE WITH AI</span></div>}<Tooltip><TooltipTrigger className={`view-toggle ${!showBranding ? 'active' : ''}`} aria-label={showBranding ? 'Hide branding and canvas reminders' : 'Show branding and canvas reminders'} onClick={() => setShowBranding((shown) => !shown)}>{showBranding ? <EyeOff /> : <Eye />}</TooltipTrigger><TooltipContent>{showBranding ? 'Hide DUET and canvas reminders' : 'Show DUET and canvas reminders'}</TooltipContent></Tooltip><div className="mode-switch" aria-label="Workspace mode"><button className="active" onClick={() => setWorkspaceMode('illustration')}>Illustrate</button><button onClick={() => setWorkspaceMode('animation')}>Animate</button></div></div>
       <div ref={documentMenuRef} className="document-title">{editingDocumentName ? <input autoFocus aria-label="Document name" value={documentNameDraft} maxLength={80} onChange={(event) => setDocumentNameDraft(event.target.value)} onBlur={() => finishDocumentRename(true)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); finishDocumentRename(true); } if (event.key === 'Escape') { event.preventDefault(); finishDocumentRename(false); } }} /> : <><button type="button" className="document-rename" aria-label="Rename document" title="Click to rename" onClick={beginDocumentRename}><span>{documentName}</span></button><button type="button" className={`document-menu-trigger ${documentMenuOpen ? 'active' : ''}`} aria-label="Switch drawings" aria-expanded={documentMenuOpen} onClick={() => setDocumentMenuOpen((open) => !open)}><ChevronDown size={13} /></button></>}{documentMenuOpen && !editingDocumentName && <div className="document-menu"><button className="new-drawing-button" onClick={createBlankDrawing}><Plus />New blank drawing</button><span className="document-menu-label">Drawings</span>{workspaceDrawings.map((drawing) => <button key={drawing.id} className={drawing.id === currentDrawingId ? 'active' : ''} onClick={() => switchDrawing(drawing.id)}><span>{drawing.name}</span>{drawing.id === currentDrawingId && <Check />}</button>)}</div>}</div>
       <div className="header-actions"><Tooltip><TooltipTrigger className="view-toggle" aria-label={rightSidebarOpen ? 'Collapse layers sidebar' : 'Expand layers sidebar'} onClick={() => setRightSidebarOpen((open) => !open)}>{rightSidebarOpen ? <PanelRightClose /> : <PanelRightOpen />}</TooltipTrigger><TooltipContent>{rightSidebarOpen ? 'Hide panels' : 'Show panels'}</TooltipContent></Tooltip>{showBranding && <div className="mcp-status" title={webMcp === 'ready' ? 'Native WebMCP tools are registered' : 'Tools activate in a WebMCP-compatible browser'}><span className={`status-dot ${webMcp === 'ready' ? 'ready' : ''}`} /><Bot size={14} /><span>{webMcp === 'ready' ? 'WebMCP ready' : '8 agent tools'}</span></div>}<Button variant="ghost" size="sm" className="export-image-button" onClick={exportImage}><Download />Save</Button><Button size="sm" className="export-button" onClick={exportProject}><Download />Export</Button></div>
     </header>
@@ -1196,5 +1199,5 @@ export function Duet() {
         <section className="activity-panel"><div className="panel-heading"><div><Bot size={15} /><strong>Shared activity</strong></div><button aria-label="Close activity"><X size={14} /></button></div><div className="activity-list">{activities.slice(0, 3).map((item) => <div className="activity-row" key={item.id}><span className="activity-icon"><Sparkles size={12} /></span><span><strong>{item.title}</strong><small>{item.detail}</small></span><time>{item.time}</time></div>)}</div></section>
       </aside>
     </section>
-  </main></TooltipProvider>;
+  </main></></TooltipProvider>;
 }
