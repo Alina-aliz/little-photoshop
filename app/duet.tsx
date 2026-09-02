@@ -21,6 +21,10 @@ type WebMCPTool = { name: string; title?: string; description: string; inputSche
 type PendingHumanEdit = { resolve: (value: unknown) => void; reject: (reason?: unknown) => void; timeoutId: ReturnType<typeof setTimeout> | null; cleanupSignal: () => void; promptOverride?: string };
 type AgentConnection = 'new' | 'waiting' | 'processing' | 'disconnected';
 type SavedProjectLayer = Omit<Layer, 'blend'> & { blend: string; pixels: string };
+type LayerSnapshot = { layers: Layer[]; activeLayer: string; pixels: Array<{ id: string; image: ImageData }> };
+type HistoryEntry =
+  | { kind: 'pixels'; layerId: string; image: ImageData }
+  | { kind: 'layers'; before: LayerSnapshot; after: LayerSnapshot };
 type DuetProject = {
   format: 'duet'; version: 1; exportedAt: string;
   canvas: { width: number; height: number; finalImage: string };
@@ -78,8 +82,8 @@ export function Duet() {
   const panning = useRef(false);
   const zoomRef = useRef(82);
   const zoomFrame = useRef<number | null>(null);
-  const undoStack = useRef<Array<{ layerId: string; image: ImageData }>>([]);
-  const redoStack = useRef<Array<{ layerId: string; image: ImageData }>>([]);
+  const undoStack = useRef<HistoryEntry[]>([]);
+  const redoStack = useRef<HistoryEntry[]>([]);
   const pendingEdits = useRef(new Map<string, PendingEdit>());
   const pendingHumanEdit = useRef<PendingHumanEdit | null>(null);
   const actionsRef = useRef<Record<string, (...args: any[]) => any>>({});
@@ -196,6 +200,26 @@ export function Duet() {
     requestAnimationFrame(render);
   }, [render]);
   useEffect(() => { render(); }, [render]);
+
+  const captureLayerSnapshot = useCallback((layerList: Layer[], selectedId: string): LayerSnapshot => ({
+    layers: layerList.map((layer) => ({ ...layer })),
+    activeLayer: selectedId,
+    pixels: layerList.map((layer) => {
+      const canvas = layerCanvases.current.get(layer.id);
+      if (!canvas) throw new Error(`Layer “${layer.name}” is missing its pixels.`);
+      return { id: layer.id, image: canvas.getContext('2d')!.getImageData(0, 0, WIDTH, HEIGHT) };
+    }),
+  }), []);
+
+  const restoreLayerSnapshot = useCallback((snapshot: LayerSnapshot) => {
+    layerCanvases.current = new Map(snapshot.pixels.map(({ id, image }) => {
+      const canvas = makeCanvas();
+      canvas.getContext('2d')!.putImageData(image, 0, 0);
+      return [id, canvas] as const;
+    }));
+    setLayers(snapshot.layers.map((layer) => ({ ...layer })));
+    setActiveLayer(snapshot.activeLayer);
+  }, []);
 
   const createLayer = useCallback((name = 'Paint layer') => {
     const id = `layer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -351,6 +375,7 @@ export function Duet() {
       addActivity('Merge failed', error);
       return { merged: false, error };
     }
+    const before = captureLayerSnapshot(layers, activeLayer);
 
     // Bake both visible layers into one transparent raster, preserving how the
     // pair looked on the canvas while leaving the result fully editable.
@@ -372,17 +397,19 @@ export function Duet() {
       blend: 'source-over',
       ai: selected.ai || below.ai,
     };
+    const nextLayers = [...layers];
+    nextLayers.splice(index, 2, mergedLayer);
     layerCanvases.current.set(below.id, mergedCanvas);
     layerCanvases.current.delete(selected.id);
-    setLayers((items) => {
-      const next = [...items];
-      next.splice(index, 2, mergedLayer);
-      return next;
-    });
+    const after = captureLayerSnapshot(nextLayers, below.id);
+    undoStack.current.push({ kind: 'layers', before, after });
+    if (undoStack.current.length > 15) undoStack.current.shift();
+    redoStack.current = [];
+    setLayers(nextLayers);
     setActiveLayer(below.id);
     addActivity('Layers merged', `${selected.name} into ${below.name}`);
     return { merged: true, layerId: below.id, name: mergedName, mergedLayerIds: [selected.id, below.id] };
-  }, [activeLayer, addActivity, layers]);
+  }, [activeLayer, addActivity, captureLayerSnapshot, layers]);
 
   actionsRef.current = {
     getState: () => ({ canvas: { width: WIDTH, height: HEIGHT, zoom }, activeTool: tool, activeLayer, selection, layers: layers.map(({ id, name, visible, opacity, ai }) => ({ id, name, visible, opacity, ai: !!ai })) }),
@@ -428,7 +455,7 @@ export function Duet() {
     const point = pointer(event); event.currentTarget.setPointerCapture(event.pointerId);
     if (tool === 'select') { selectionStart.current = point; setSelection({ x: point.x, y: point.y, width: 0, height: 0 }); drawing.current = true; return; }
     const ctx = layerCanvases.current.get(activeLayer)?.getContext('2d'); if (!ctx) return;
-    undoStack.current.push({ layerId: activeLayer, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
+    undoStack.current.push({ kind: 'pixels', layerId: activeLayer, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
     drawing.current = true; lastPoint.current = point; drawStroke(point, point);
   };
   const movePointer = (event: React.PointerEvent<HTMLCanvasElement>) => {
@@ -443,8 +470,18 @@ export function Duet() {
     drawStroke(lastPoint.current, point); lastPoint.current = point;
   };
   const endPointer = () => { if (drawing.current && tool === 'select') addActivity('Region selected', `${Math.round(selection.width)} × ${Math.round(selection.height)} px`); drawing.current = false; panning.current = false; };
-  const undo = useCallback(() => { const entry = undoStack.current.pop(); if (!entry) return; const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return; redoStack.current.push({ layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render(); }, [render]);
-  const redo = () => { const entry = redoStack.current.pop(); if (!entry) return; const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return; undoStack.current.push({ layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render(); };
+  const undo = useCallback(() => {
+    const entry = undoStack.current.pop(); if (!entry) return;
+    if (entry.kind === 'layers') { restoreLayerSnapshot(entry.before); redoStack.current.push(entry); return; }
+    const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return;
+    redoStack.current.push({ kind: 'pixels', layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render();
+  }, [render, restoreLayerSnapshot]);
+  const redo = () => {
+    const entry = redoStack.current.pop(); if (!entry) return;
+    if (entry.kind === 'layers') { restoreLayerSnapshot(entry.after); undoStack.current.push(entry); return; }
+    const ctx = layerCanvases.current.get(entry.layerId)?.getContext('2d'); if (!ctx) return;
+    undoStack.current.push({ kind: 'pixels', layerId: entry.layerId, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); ctx.putImageData(entry.image, 0, 0); render();
+  };
   useEffect(() => { const keydown = (event: KeyboardEvent) => { if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return; const next = toolMeta.find((item) => item.key.toLowerCase() === event.key.toLowerCase()); if (next) setTool(next.id); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); } if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'e') { event.preventDefault(); mergeLayerDown(); } if ((event.metaKey || event.ctrlKey) && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomAt(zoomRef.current * 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '-') { event.preventDefault(); zoomAt(zoomRef.current / 1.15); } if ((event.metaKey || event.ctrlKey) && event.key === '0') { event.preventDefault(); zoomAt(82); } }; window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown); }, [mergeLayerDown, undo, zoomAt]);
 
   const loadImage = (source: string) => new Promise<HTMLImageElement>((resolve, reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = () => reject(new Error('One of the project layers could not be decoded.')); image.src = source; });
