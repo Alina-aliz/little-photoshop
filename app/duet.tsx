@@ -58,7 +58,6 @@ const toolMeta: Array<{ id: Tool; label: string; icon: typeof Brush; key: string
 ];
 
 type HsvColor = { h: number; s: number; v: number };
-const defaultColorHistory = ['#ff6b5f', '#ffb75f', '#f7e17f', '#74d99f', '#61cbe6', '#8d7cf6', '#d475e8', '#ffffff'];
 function clamp(value: number, min: number, max: number) { return Math.max(min, Math.min(max, value)); }
 function hexToRgb(hex: string) {
   const match = /^#([0-9a-f]{6})$/i.exec(hex);
@@ -117,8 +116,10 @@ export function Duet() {
   const viewportRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const colorPickerRef = useRef<HTMLDivElement>(null);
-  const colorWheelRef = useRef<HTMLDivElement>(null);
+  const colorSquareRef = useRef<HTMLDivElement>(null);
+  const hueSliderRef = useRef<HTMLDivElement>(null);
   const colorDrag = useRef<'hue' | 'sv' | null>(null);
+  const skipInitialColorHistorySave = useRef(true);
   const layerCanvases = useRef(new Map<string, HTMLCanvasElement>());
   const thumbnailRefs = useRef(new Map<string, HTMLCanvasElement>());
   const initialized = useRef(false);
@@ -140,7 +141,7 @@ export function Duet() {
   const [tool, setTool] = useState<Tool>('select');
   const [brushSize, setBrushSize] = useState(28);
   const [brushColor, setBrushColor] = useState('#ff6b5f');
-  const [colorHistory, setColorHistory] = useState(defaultColorHistory);
+  const [colorHistory, setColorHistory] = useState<string[]>([]);
   const [colorPickerOpen, setColorPickerOpen] = useState(false);
   const [hsv, setHsv] = useState<HsvColor>(() => hexToHsv('#ff6b5f'));
   const [hexDraft, setHexDraft] = useState('#ff6b5f');
@@ -163,14 +164,16 @@ export function Duet() {
     }
   }, []);
 
-  const setColor = useCallback((next: string, remember = true) => {
+  const setColor = useCallback((next: string) => {
     if (!/^#[0-9a-f]{6}$/i.test(next)) return;
     const color = next.toLowerCase();
     setBrushColor(color);
     setHsv(hexToHsv(color));
     setHexDraft(color);
-    if (remember) setColorHistory((items) => [color, ...items.filter((item) => item !== color)].slice(0, 12));
   }, []);
+  const rememberUsedColor = useCallback(() => {
+    setColorHistory((items) => [brushColor, ...items.filter((item) => item !== brushColor)].slice(0, 12));
+  }, [brushColor]);
   const setColorFromHsv = useCallback((next: HsvColor) => {
     const safe = { h: ((next.h % 360) + 360) % 360, s: clamp(next.s, 0, 100), v: clamp(next.v, 0, 100) };
     setHsv(safe);
@@ -178,7 +181,7 @@ export function Duet() {
   }, [setColor]);
   useEffect(() => {
     try {
-      const saved = window.localStorage.getItem('duet-recent-colours');
+      const saved = window.localStorage.getItem('duet-used-colours-v2');
       if (!saved) return;
       const parsed: unknown = JSON.parse(saved);
       if (Array.isArray(parsed)) {
@@ -188,7 +191,8 @@ export function Duet() {
     } catch { /* Recent colours are optional local convenience data. */ }
   }, []);
   useEffect(() => {
-    try { window.localStorage.setItem('duet-recent-colours', JSON.stringify(colorHistory)); } catch { /* Ignore blocked storage. */ }
+    if (skipInitialColorHistorySave.current) { skipInitialColorHistorySave.current = false; return; }
+    try { window.localStorage.setItem('duet-used-colours-v2', JSON.stringify(colorHistory)); } catch { /* Ignore blocked storage. */ }
   }, [colorHistory]);
   useEffect(() => {
     const closePicker = (event: PointerEvent) => {
@@ -525,24 +529,19 @@ export function Duet() {
   }, []);
 
   const pointer = (event: React.PointerEvent<HTMLCanvasElement>) => { const rect = event.currentTarget.getBoundingClientRect(); return { x: ((event.clientX - rect.left) / rect.width) * WIDTH, y: ((event.clientY - rect.top) / rect.height) * HEIGHT }; };
-  const updateColorWheel = (event: React.PointerEvent<HTMLDivElement>, mode: 'hue' | 'sv') => {
-    const wheel = colorWheelRef.current; if (!wheel) return;
-    const rect = wheel.getBoundingClientRect(); const x = clamp((event.clientX - rect.left) / rect.width, 0, 1); const y = clamp((event.clientY - rect.top) / rect.height, 0, 1);
-    if (mode === 'hue') {
-      const angle = (Math.atan2(y - .5, x - .5) * 180 / Math.PI + 90 + 360) % 360;
-      setColorFromHsv({ ...hsv, h: angle });
-    } else {
-      setColorFromHsv({ ...hsv, s: x * 100, v: (1 - y) * 100 });
-    }
+  const updateColorField = (event: React.PointerEvent<HTMLDivElement>, mode: 'hue' | 'sv') => {
+    const target = mode === 'hue' ? hueSliderRef.current : colorSquareRef.current; if (!target) return;
+    const rect = target.getBoundingClientRect(); const x = clamp((event.clientX - rect.left) / rect.width, 0, 1); const y = clamp((event.clientY - rect.top) / rect.height, 0, 1);
+    if (mode === 'hue') setColorFromHsv({ ...hsv, h: (360 - y * 360) % 360 });
+    else setColorFromHsv({ ...hsv, s: x * 100, v: (1 - y) * 100 });
   };
-  const startColorWheel = (event: React.PointerEvent<HTMLDivElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect(); const x = (event.clientX - rect.left) / rect.width; const y = (event.clientY - rect.top) / rect.height;
-    colorDrag.current = Math.hypot(x - .5, y - .5) > .39 ? 'hue' : 'sv';
+  const startColorField = (event: React.PointerEvent<HTMLDivElement>, mode: 'hue' | 'sv') => {
+    colorDrag.current = mode;
     event.currentTarget.setPointerCapture(event.pointerId);
-    updateColorWheel(event, colorDrag.current);
+    updateColorField(event, mode);
   };
-  const moveColorWheel = (event: React.PointerEvent<HTMLDivElement>) => { if (colorDrag.current) updateColorWheel(event, colorDrag.current); };
-  const endColorWheel = () => { colorDrag.current = null; };
+  const moveColorField = (event: React.PointerEvent<HTMLDivElement>) => { if (colorDrag.current) updateColorField(event, colorDrag.current); };
+  const endColorField = () => { colorDrag.current = null; };
   const drawStroke = (from: { x: number; y: number }, to: { x: number; y: number }) => { const ctx = layerCanvases.current.get(activeLayer)?.getContext('2d'); if (!ctx) return; ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.lineWidth = brushSize; ctx.strokeStyle = brushColor; ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over'; ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke(); ctx.restore(); render(); };
   const transformModeAtPoint = (bounds: Selection, point: { x: number; y: number }): TransformMode => {
     const edge = 18;
@@ -591,6 +590,7 @@ export function Duet() {
       drawing.current = true;
       return;
     }
+    if (tool === 'brush') rememberUsedColor();
     undoStack.current.push({ kind: 'pixels', layerId: activeLayer, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
     drawing.current = true; lastPoint.current = point; drawStroke(point, point);
   };
@@ -719,7 +719,7 @@ export function Duet() {
     <section className="workspace">
       <aside className="tool-rail" aria-label="Editing tools">
         {toolMeta.map(({ id, label, icon: Icon, key }) => <Tooltip key={id}><TooltipTrigger aria-label={label} className={`tool-button ${tool === id ? 'active' : ''}`} onClick={() => changeTool(id)}><Icon size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">{label} · {key}</TooltipContent></Tooltip>)}
-        <div className="rail-divider" /><div ref={colorPickerRef} className="color-control" onPointerDown={(event) => event.stopPropagation()}><Tooltip><TooltipTrigger aria-label="Open colour picker" className="color-button" onClick={() => setColorPickerOpen((open) => !open)}><span style={{ background: brushColor }} /></TooltipTrigger><TooltipContent side="right">Colour picker</TooltipContent></Tooltip>{colorPickerOpen && <div className="colour-picker" aria-label="Colour picker"><div className="picker-heading"><strong>Colour</strong><code>{brushColor.toUpperCase()}</code></div><div ref={colorWheelRef} className="colour-wheel" onPointerDown={startColorWheel} onPointerMove={moveColorWheel} onPointerUp={endColorWheel} onPointerCancel={endColorWheel}><div className="colour-wheel-centre" style={{ backgroundColor: hsvToHex({ h: hsv.h, s: 100, v: 100 }) }}><i className="sv-marker" style={{ left: `${hsv.s}%`, top: `${100 - hsv.v}%` }} /></div><i className="hue-marker" style={{ transform: `rotate(${hsv.h}deg)` }} /></div><div className="hex-row"><span style={{ background: brushColor }} /><input aria-label="Hex colour" value={hexDraft} spellCheck={false} onChange={(event) => setHexDraft(event.target.value)} onBlur={() => { const color = hexDraft.startsWith('#') ? hexDraft : `#${hexDraft}`; if (/^#[0-9a-f]{6}$/i.test(color)) setColor(color); else setHexDraft(brushColor); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></div><div className="recent-heading"><span>Recent</span><button type="button" onClick={() => setColorHistory([])}>Clear</button></div><div className="recent-colours">{colorHistory.length ? colorHistory.map((color) => <button key={color} aria-label={`Use ${color}`} title={color.toUpperCase()} className={color === brushColor ? 'active' : ''} style={{ background: color }} onClick={() => setColor(color)} />) : <span>No recent colours yet</span>}</div></div>}</div>
+        <div className="rail-divider" /><div ref={colorPickerRef} className="color-control" onPointerDown={(event) => event.stopPropagation()}><Tooltip><TooltipTrigger aria-label="Open colour picker" className="color-button" onClick={() => setColorPickerOpen((open) => !open)}><span style={{ background: brushColor }} /></TooltipTrigger><TooltipContent side="right">Colour picker</TooltipContent></Tooltip>{colorPickerOpen && <div className="colour-picker" aria-label="Colour picker"><div className="picker-heading"><strong>Select colour</strong><code>{brushColor.toUpperCase()}</code></div><div className="colour-fields"><div ref={colorSquareRef} className="colour-square" style={{ backgroundColor: hsvToHex({ h: hsv.h, s: 100, v: 100 }) }} onPointerDown={(event) => startColorField(event, 'sv')} onPointerMove={moveColorField} onPointerUp={endColorField} onPointerCancel={endColorField}><i className="sv-marker" style={{ left: `${hsv.s}%`, top: `${100 - hsv.v}%` }} /></div><div ref={hueSliderRef} className="hue-slider" onPointerDown={(event) => startColorField(event, 'hue')} onPointerMove={moveColorField} onPointerUp={endColorField} onPointerCancel={endColorField}><i className="hue-slider-marker" style={{ top: `${hsv.h === 0 ? 0 : (360 - hsv.h) / 360 * 100}%` }} /></div></div><div className="hex-row"><span style={{ background: brushColor }} /><input aria-label="Hex colour" value={hexDraft} spellCheck={false} onChange={(event) => setHexDraft(event.target.value)} onBlur={() => { const color = hexDraft.startsWith('#') ? hexDraft : `#${hexDraft}`; if (/^#[0-9a-f]{6}$/i.test(color)) setColor(color); else setHexDraft(brushColor); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></div><div className="recent-heading"><span>Recently used</span><button type="button" onClick={() => setColorHistory([])}>Clear</button></div><div className="recent-colours">{colorHistory.length ? colorHistory.map((color) => <button key={color} aria-label={`Use ${color}`} title={color.toUpperCase()} className={color === brushColor ? 'active' : ''} style={{ background: color }} onClick={() => setColor(color)} />) : <span>Paint with a colour to save it here</span>}</div></div>}</div>
         <Tooltip><TooltipTrigger aria-label="Import image or project" className="tool-button" onClick={() => fileRef.current?.click()}><ImagePlus size={19} strokeWidth={1.8} /></TooltipTrigger><TooltipContent side="right">Import image or .duet project</TooltipContent></Tooltip><input ref={fileRef} className="hidden" type="file" accept="image/*,.duet,.babyps,application/x-duet-project+json,application/x-baby-photoshop+json" onChange={importFile} />
         <div className="rail-spacer" /><Tooltip><TooltipTrigger aria-label="Help" className="tool-button"><CircleHelp size={18} /></TooltipTrigger><TooltipContent side="right">B brush · E erase · V select</TooltipContent></Tooltip>
       </aside>
