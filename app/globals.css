@@ -747,6 +747,66 @@ button {
 .animation-canvas.playing:not(.tool-pan) {
   cursor: default;
 }
+.animation-canvas.tool-transform {
+  cursor: move;
+}
+.animation-canvas.tool-layer-lasso {
+  cursor: crosshair;
+}
+.cel-edit-overlay {
+  position: absolute;
+  z-index: 5;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.illustrate-cel-button,
+.flatten-cel-button {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+.illustrate-cel-button {
+  color: #c68aee;
+  border: 1px solid rgba(195, 123, 235, 0.18);
+  background: rgba(174, 95, 224, 0.07);
+}
+.flatten-cel-button {
+  color: #fff;
+  background: linear-gradient(135deg, #c85ade, #7658ed);
+  box-shadow: 0 4px 14px rgba(112, 73, 220, 0.22);
+}
+.cel-lasso-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.cel-lasso-actions button {
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 7px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 5px;
+  color: #99929e;
+  background: rgba(255, 255, 255, 0.025);
+  cursor: pointer;
+  font-size: 8px;
+}
+.cel-lasso-actions button:hover {
+  color: #eee7f2;
+  border-color: rgba(190, 125, 232, 0.3);
+}
+.cel-lasso-actions button.icon-only {
+  width: 24px;
+  padding: 0;
+  justify-content: center;
+}
+.cel-lasso-actions svg {
+  width: 12px;
+  height: 12px;
+}
 .frame-counter {
   position: absolute;
   z-index: 8;
@@ -991,6 +1051,171 @@ button {
   padding: 16px 14px;
   border-left: 1px solid rgba(255, 255, 255, 0.07);
   background: #1d1c21;
+}
+.cel-layers-panel {
+  display: grid;
+  gap: 10px;
+}
+.cel-layers-heading,
+.cel-layers-heading > span,
+.cel-layer-order-actions,
+.cel-layer-footer-actions {
+  display: flex;
+  align-items: center;
+}
+.cel-layers-heading {
+  justify-content: space-between;
+}
+.cel-layers-heading > span {
+  gap: 7px;
+}
+.cel-layers-heading svg {
+  width: 16px;
+  height: 16px;
+  color: #c882ed;
+}
+.cel-layers-heading strong {
+  color: #e3dce7;
+  font-size: 12px;
+}
+.cel-layers-heading small {
+  color: #77707c;
+  font: 8px var(--font-geist-mono);
+}
+.cel-layers-panel > p {
+  margin: 0;
+  padding: 8px;
+  border: 1px solid rgba(237, 184, 106, 0.16);
+  border-radius: 7px;
+  color: #a28f80;
+  background: rgba(183, 116, 49, 0.06);
+  font-size: 8px;
+  line-height: 1.45;
+}
+.cel-layer-opacity {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 7px;
+}
+.cel-layer-opacity > span,
+.cel-layer-opacity > strong {
+  color: #7f7884;
+  font-size: 8px;
+}
+.cel-layer-opacity > strong {
+  text-align: right;
+  font-family: var(--font-geist-mono);
+}
+.cel-layer-list {
+  min-height: 0;
+  display: grid;
+  gap: 4px;
+  max-height: calc(100vh - 300px);
+  overflow-y: auto;
+}
+.cel-layer-list > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 22px 40px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  padding: 6px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: #918a96;
+  background: rgba(255, 255, 255, 0.018);
+  text-align: left;
+}
+.cel-layer-list > div:hover {
+  border-color: rgba(255, 255, 255, 0.08);
+}
+.cel-layer-list > div.active {
+  border-color: rgba(194, 122, 236, 0.2);
+  background: rgba(164, 91, 215, 0.13);
+  box-shadow: inset 2px 0 #c869e4;
+}
+.cel-layer-visibility {
+  width: 22px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  color: #918a96;
+  background: transparent;
+  cursor: pointer;
+}
+.cel-layer-visibility:hover {
+  color: #e6dfea;
+  background: rgba(255, 255, 255, 0.05);
+}
+.cel-layer-visibility svg {
+  width: 13px;
+  height: 13px;
+}
+.cel-layer-select {
+  min-width: 0;
+  grid-column: 2 / -1;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.cel-layer-select canvas {
+  width: 40px;
+  height: 28px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  background: repeating-conic-gradient(#ddd 0 25%, #bdbdbd 0 50%) 50%/8px 8px;
+}
+.cel-layer-name {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cel-layer-name strong,
+.cel-layer-name small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cel-layer-name strong {
+  color: #cbc4cf;
+  font-size: 9px;
+  font-weight: 560;
+}
+.cel-layer-name small {
+  color: #6d6771;
+  font-size: 7px;
+}
+.cel-layer-order-actions,
+.cel-layer-footer-actions {
+  gap: 4px;
+}
+.cel-layer-order-actions > :last-child {
+  flex: 1;
+}
+.cel-layer-footer-actions {
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.cel-layer-footer-actions > :first-child {
+  flex: 1;
+}
+.flatten-cel-dialog {
+  border: 1px solid rgba(202, 130, 239, 0.16);
+  color: #eee8f1;
+  background: #242127;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.62);
 }
 .animation-stat {
   display: flex;
@@ -3217,6 +3442,15 @@ button {
   .animation-context-bar > [data-slot='slider'] {
     width: 62px;
   }
+  .illustrate-cel-button,
+  .flatten-cel-button {
+    width: 30px;
+    padding-inline: 0;
+  }
+  .illustrate-cel-button > span,
+  .flatten-cel-button > span {
+    display: none;
+  }
   .sequence-toolbar button {
     padding-inline: 4px;
   }
@@ -3230,6 +3464,13 @@ button {
   }
   .animation-panel {
     display: none;
+  }
+  .animator-workspace.cel-illustration-workspace {
+    grid-template-columns: 50px minmax(0, 1fr) 190px;
+  }
+  .cel-illustration-workspace .animation-panel {
+    display: block;
+    padding-inline: 10px;
   }
   .animator-brand > span {
     display: none;

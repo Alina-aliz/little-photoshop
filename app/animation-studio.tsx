@@ -18,8 +18,12 @@ import {
   GripHorizontal,
   Hand,
   ImagePlus,
+  LassoSelect,
+  Layers3,
   Lock,
+  Merge,
   MousePointer2,
+  Move,
   Music2,
   Pause,
   Pipette,
@@ -46,8 +50,19 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react';
 import { Button } from '@/components/ui/button';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -66,6 +81,8 @@ const FRAME_EDITOR_ONE_TRACK_HEIGHT = 232;
 type VideoExportFormat = 'mp4' | 'webm';
 type AnimationTool =
   | 'agent-target'
+  | 'layer-lasso'
+  | 'transform'
   | 'brush'
   | 'eraser'
   | 'smudge'
@@ -76,6 +93,32 @@ type AnimationTool =
 type TextFont = 'sans' | 'serif' | 'mono' | 'rounded';
 type TextDraft = { x: number; y: number; value: string };
 type EyedropperPreview = { x: number; y: number; color: string };
+type CanvasBounds = { x: number; y: number; width: number; height: number };
+type TransformMode = 'move' | 'tl' | 'tr' | 'bl' | 'br';
+type CelEditLayer = {
+  id: string;
+  name: string;
+  visible: boolean;
+  opacity: number;
+};
+type CelLayerSelection = {
+  layerId: string;
+  base: ImageData;
+  pixels: HTMLCanvasElement;
+  source: CanvasBounds;
+  bounds: CanvasBounds;
+};
+type ActiveCelTransform = {
+  source: CanvasBounds;
+  image: ImageData;
+  pointer: { x: number; y: number };
+  mode: TransformMode;
+};
+type ActiveCelSelectionTransform = {
+  start: CanvasBounds;
+  pointer: { x: number; y: number };
+  mode: TransformMode;
+};
 type SharedPhotoAsset = {
   id: string;
   name: string;
@@ -256,6 +299,27 @@ function makeCanvas() {
   canvas.width = WIDTH;
   canvas.height = HEIGHT;
   return canvas;
+}
+function canvasContentBounds(canvas: HTMLCanvasElement): CanvasBounds | null {
+  const { data } = canvas
+    .getContext('2d')!
+    .getImageData(0, 0, WIDTH, HEIGHT);
+  let left = WIDTH;
+  let top = HEIGHT;
+  let right = -1;
+  let bottom = -1;
+  for (let y = 0; y < HEIGHT; y += 1) {
+    for (let x = 0; x < WIDTH; x += 1) {
+      if (data[(y * WIDTH + x) * 4 + 3] < 2) continue;
+      left = Math.min(left, x);
+      top = Math.min(top, y);
+      right = Math.max(right, x);
+      bottom = Math.max(bottom, y);
+    }
+  }
+  return right < 0
+    ? null
+    : { x: left, y: top, width: right - left + 1, height: bottom - top + 1 };
 }
 function sampledImage(source: CanvasImageSource) {
   const canvas = document.createElement('canvas');
@@ -853,6 +917,21 @@ const animationToolMeta: Array<{
   { id: 'eyedropper', label: 'Eyedropper', icon: Pipette },
   { id: 'pan', label: 'Pan canvas', icon: Hand },
 ];
+const celIllustrationToolMeta: Array<{
+  id: AnimationTool;
+  label: string;
+  icon: typeof Brush;
+}> = [
+  { id: 'layer-lasso', label: 'Layer lasso', icon: LassoSelect },
+  { id: 'transform', label: 'Transform layer', icon: Move },
+  { id: 'brush', label: 'Brush', icon: Brush },
+  { id: 'eraser', label: 'Eraser', icon: Eraser },
+  { id: 'smudge', label: 'Smudge', icon: Droplets },
+  { id: 'blur', label: 'Blur', icon: Focus },
+  { id: 'text', label: 'Text', icon: TypeIcon },
+  { id: 'eyedropper', label: 'Eyedropper', icon: Pipette },
+  { id: 'pan', label: 'Pan canvas', icon: Hand },
+];
 
 const recordingMimeCandidates: Record<VideoExportFormat, string[]> = {
   mp4: [
@@ -891,6 +970,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     ref,
   ) {
     const displayRef = useRef<HTMLCanvasElement>(null);
+    const celEditOverlayRef = useRef<HTMLCanvasElement>(null);
     const stageViewportRef = useRef<HTMLDivElement>(null);
     const canvasStageRef = useRef<HTMLDivElement>(null);
     const imageInputRef = useRef<HTMLInputElement>(null);
@@ -899,11 +979,21 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     const assetMenuRef = useRef<HTMLDivElement>(null);
     const textEntryRef = useRef<HTMLTextAreaElement>(null);
     const frameCanvases = useRef(new Map<string, HTMLCanvasElement>());
+    const celEditCanvases = useRef(new Map<string, HTMLCanvasElement>());
+    const celEditFrameId = useRef('');
+    const celLassoPoints = useRef<Array<{ x: number; y: number }>>([]);
+    const celLayerSelection = useRef<CelLayerSelection | null>(null);
+    const activeCelTransform = useRef<ActiveCelTransform | null>(null);
+    const activeCelSelectionTransform =
+      useRef<ActiveCelSelectionTransform | null>(null);
     const stillCanvases = useRef(new Map<string, HTMLCanvasElement>());
     const videoElements = useRef(new Map<string, HTMLVideoElement>());
     const audioElements = useRef(new Map<string, HTMLAudioElement>());
     const assetUrls = useRef(new Set<string>());
     const thumbnailRefs = useRef(new Map<string, HTMLCanvasElement>());
+    const celLayerThumbnailRefs = useRef(
+      new Map<string, HTMLCanvasElement>(),
+    );
     const undoStacks = useRef(new Map<string, ImageData[]>());
     const redoStacks = useRef(new Map<string, ImageData[]>());
     const drawing = useRef(false);
@@ -948,7 +1038,14 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     const [fps, setFps] = useState(8);
     const [playing, setPlaying] = useState(false);
     const [exporting, setExporting] = useState(false);
-    const [mp4ExportSupported, setMp4ExportSupported] = useState(false);
+    const [celIllustrationMode, setCelIllustrationMode] = useState(false);
+    const [celEditLayers, setCelEditLayers] = useState<CelEditLayer[]>([]);
+    const [activeCelEditLayerId, setActiveCelEditLayerId] = useState('');
+    const [celTransformBounds, setCelTransformBounds] =
+      useState<CanvasBounds | null>(null);
+    const [celSelectionBounds, setCelSelectionBounds] =
+      useState<CanvasBounds | null>(null);
+    const [flattenDialogOpen, setFlattenDialogOpen] = useState(false);
     const [frameEditorHeight, setFrameEditorHeight] = useState(
       FRAME_EDITOR_DEFAULT_HEIGHT,
     );
@@ -1000,10 +1097,16 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     const agentTargetDurationFrames = targetClip
       ? Math.max(1, agentTarget.endFrame - agentTarget.startFrame)
       : 0;
-
-    useEffect(() => {
-      setMp4ExportSupported(Boolean(supportedRecordingMime('mp4')));
-    }, []);
+    const activeCelEditLayer =
+      celEditLayers.find((layer) => layer.id === activeCelEditLayerId) || null;
+    const activeCelEditLayerIndex = celEditLayers.findIndex(
+      (layer) => layer.id === activeCelEditLayerId,
+    );
+    const mp4ExportSupported = useSyncExternalStore(
+      () => () => {},
+      () => Boolean(supportedRecordingMime('mp4')),
+      () => false,
+    );
 
     const zoomAt = useCallback(
       (requestedZoom: number, clientX?: number, clientY?: number) => {
@@ -1062,6 +1165,138 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         if (zoomFrame.current !== null) cancelAnimationFrame(zoomFrame.current);
       };
     }, [zoomAt]);
+
+    const renderCelEditLayers = useCallback(
+      (ctx: CanvasRenderingContext2D) => {
+        ctx.clearRect(0, 0, WIDTH, HEIGHT);
+        [...celEditLayers].reverse().forEach((layer) => {
+          const source = celEditCanvases.current.get(layer.id);
+          if (!source) return;
+          const thumbnail = celLayerThumbnailRefs.current.get(layer.id);
+          if (thumbnail) {
+            const thumbCtx = thumbnail.getContext('2d')!;
+            thumbCtx.clearRect(0, 0, thumbnail.width, thumbnail.height);
+            thumbCtx.globalAlpha = layer.opacity / 100;
+            thumbCtx.drawImage(
+              source,
+              0,
+              0,
+              WIDTH,
+              HEIGHT,
+              0,
+              0,
+              thumbnail.width,
+              thumbnail.height,
+            );
+            thumbCtx.globalAlpha = 1;
+          }
+          if (!layer.visible) return;
+          ctx.save();
+          ctx.globalAlpha = layer.opacity / 100;
+          ctx.drawImage(source, 0, 0);
+          ctx.restore();
+        });
+      },
+      [celEditLayers],
+    );
+
+    const currentPaintCanvas = () =>
+      celIllustrationMode
+        ? celEditCanvases.current.get(activeCelEditLayerId) || null
+        : frameCanvases.current.get(activeFrameId) || null;
+
+    const transformModeAtPoint = (
+      bounds: CanvasBounds,
+      at: { x: number; y: number },
+    ): TransformMode => {
+      const edge = 18;
+      const left = Math.abs(at.x - bounds.x) < edge;
+      const right = Math.abs(at.x - (bounds.x + bounds.width)) < edge;
+      const top = Math.abs(at.y - bounds.y) < edge;
+      const bottom = Math.abs(at.y - (bounds.y + bounds.height)) < edge;
+      if (left && top) return 'tl';
+      if (right && top) return 'tr';
+      if (left && bottom) return 'bl';
+      if (right && bottom) return 'br';
+      return 'move';
+    };
+
+    const redrawCelEditOverlay = useCallback(() => {
+      const overlay = celEditOverlayRef.current;
+      if (!overlay) return;
+      const ctx = overlay.getContext('2d')!;
+      ctx.clearRect(0, 0, WIDTH, HEIGHT);
+      const selected = celLayerSelection.current;
+      const bounds = selected?.bounds ||
+        (celIllustrationMode && tool === 'transform'
+          ? celTransformBounds
+          : null);
+      if (selected) {
+        ctx.save();
+        ctx.globalAlpha = 0.28;
+        ctx.drawImage(
+          selected.pixels,
+          0,
+          0,
+          selected.pixels.width,
+          selected.pixels.height,
+          selected.bounds.x,
+          selected.bounds.y,
+          selected.bounds.width,
+          selected.bounds.height,
+        );
+        ctx.globalCompositeOperation = 'source-in';
+        ctx.fillStyle = '#65d9ff';
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+        ctx.restore();
+      }
+      if (bounds) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(0,0,0,.92)';
+        ctx.lineWidth = 4;
+        ctx.setLineDash([8, 6]);
+        ctx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height);
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.lineDashOffset = 7;
+        ctx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height);
+        (['tl', 'tr', 'bl', 'br'] as const).forEach((corner) => {
+          const x = corner.includes('l') ? bounds.x : bounds.x + bounds.width;
+          const y = corner.includes('t') ? bounds.y : bounds.y + bounds.height;
+          ctx.fillStyle = '#fff';
+          ctx.fillRect(x - 5, y - 5, 10, 10);
+          ctx.strokeStyle = '#6f4ce4';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(x - 5, y - 5, 10, 10);
+        });
+        ctx.restore();
+      }
+      if (celLassoPoints.current.length > 1) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(0,0,0,.92)';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        celLassoPoints.current.forEach((point, index) =>
+          index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y),
+        );
+        ctx.stroke();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([7, 5]);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }, [celIllustrationMode, celTransformBounds, tool]);
+
+    const clearCelLayerSelection = useCallback(() => {
+      celLayerSelection.current = null;
+      celLassoPoints.current = [];
+      activeCelSelectionTransform.current = null;
+      setCelSelectionBounds(null);
+      celEditOverlayRef.current
+        ?.getContext('2d')
+        ?.clearRect(0, 0, WIDTH, HEIGHT);
+    }, []);
 
     const clipSource = useCallback((clip: Clip, at: number) => {
       if (clip.type === 'still')
@@ -1141,12 +1376,15 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     );
     const render = useCallback(() => {
       const ctx = displayRef.current?.getContext('2d');
-      if (ctx)
-        drawAt(
-          ctx,
-          playhead,
-          onionSkin && !playing && activeClip?.type === 'cel',
-        );
+      if (ctx) {
+        if (celIllustrationMode) renderCelEditLayers(ctx);
+        else
+          drawAt(
+            ctx,
+            playhead,
+            onionSkin && !playing && activeClip?.type === 'cel',
+          );
+      }
       clips.forEach((clip) => {
         if (clip.type !== 'cel') return;
         clip.frameIds.forEach((frameId) => {
@@ -1168,7 +1406,18 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
           );
         });
       });
-    }, [activeClip?.type, clips, drawAt, onionSkin, playhead, playing]);
+      if (celIllustrationMode) requestAnimationFrame(redrawCelEditOverlay);
+    }, [
+      activeClip?.type,
+      celIllustrationMode,
+      clips,
+      drawAt,
+      onionSkin,
+      playhead,
+      playing,
+      redrawCelEditOverlay,
+      renderCelEditLayers,
+    ]);
 
     const selectClip = (clip: Clip) => {
       setPlaying(false);
@@ -1215,6 +1464,164 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         activeFrames.length - 1,
       );
       selectFrame(activeFrames[index], index);
+    };
+
+    const enterCelIllustrationMode = () => {
+      if (activeClip?.type !== 'cel' || activeTrack?.locked) {
+        setMediaNotice({
+          tone: 'error',
+          text: 'Select an unlocked cel before opening its illustration layers.',
+        });
+        return;
+      }
+      const source = frameCanvases.current.get(activeFrameId);
+      if (!source) return;
+      const baseId = uid('cel-layer');
+      const base = makeCanvas();
+      base.getContext('2d')!.drawImage(source, 0, 0);
+      celEditCanvases.current = new Map([[baseId, base]]);
+      celEditFrameId.current = activeFrameId;
+      setCelEditLayers([
+        { id: baseId, name: 'Current cel', visible: true, opacity: 100 },
+      ]);
+      setActiveCelEditLayerId(baseId);
+      setCelIllustrationMode(true);
+      setTool('brush');
+      setPlaying(false);
+      setTextDraft(null);
+      setMediaNotice(null);
+      setCelTransformBounds(canvasContentBounds(base));
+      clearCelLayerSelection();
+    };
+
+    const addCelEditLayer = (name = 'Paint layer') => {
+      const id = uid('cel-layer');
+      celEditCanvases.current.set(id, makeCanvas());
+      setCelEditLayers((items) => [
+        { id, name, visible: true, opacity: 100 },
+        ...items,
+      ]);
+      setActiveCelEditLayerId(id);
+      setCelTransformBounds(null);
+      clearCelLayerSelection();
+      return id;
+    };
+
+    const selectCelEditLayer = (layerId: string) => {
+      setActiveCelEditLayerId(layerId);
+      clearCelLayerSelection();
+      const canvas = celEditCanvases.current.get(layerId);
+      setCelTransformBounds(canvas ? canvasContentBounds(canvas) : null);
+      requestAnimationFrame(render);
+    };
+
+    const flattenCelIllustration = () => {
+      const frameId = celEditFrameId.current;
+      const target = frameCanvases.current.get(frameId);
+      if (!target) return;
+      const stack = undoStacks.current.get(frameId) || [];
+      stack.push(target.getContext('2d')!.getImageData(0, 0, WIDTH, HEIGHT));
+      undoStacks.current.set(frameId, stack.slice(-30));
+      redoStacks.current.set(frameId, []);
+      const ctx = target.getContext('2d')!;
+      ctx.clearRect(0, 0, WIDTH, HEIGHT);
+      [...celEditLayers].reverse().forEach((layer) => {
+        const source = celEditCanvases.current.get(layer.id);
+        if (!source || !layer.visible) return;
+        ctx.save();
+        ctx.globalAlpha = layer.opacity / 100;
+        ctx.drawImage(source, 0, 0);
+        ctx.restore();
+      });
+      celEditLayers.forEach((layer) => {
+        undoStacks.current.delete(layer.id);
+        redoStacks.current.delete(layer.id);
+      });
+      celEditCanvases.current.clear();
+      celEditFrameId.current = '';
+      setCelEditLayers([]);
+      setActiveCelEditLayerId('');
+      setCelIllustrationMode(false);
+      setFlattenDialogOpen(false);
+      setTool('brush');
+      setCelTransformBounds(null);
+      clearCelLayerSelection();
+      setMediaNotice({
+        tone: 'success',
+        text: 'Cel layers were flattened into one animation cel.',
+      });
+      requestAnimationFrame(render);
+    };
+
+    const moveCelEditLayer = (direction: -1 | 1) => {
+      const index = celEditLayers.findIndex(
+        (layer) => layer.id === activeCelEditLayerId,
+      );
+      const nextIndex = index + direction;
+      if (index < 0 || nextIndex < 0 || nextIndex >= celEditLayers.length)
+        return;
+      const next = [...celEditLayers];
+      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+      setCelEditLayers(next);
+    };
+
+    const deleteCelEditLayer = () => {
+      if (celEditLayers.length <= 1) {
+        const canvas = celEditCanvases.current.get(activeCelEditLayerId);
+        if (!canvas) return;
+        pushUndo();
+        canvas.getContext('2d')!.clearRect(0, 0, WIDTH, HEIGHT);
+        setCelTransformBounds(null);
+        clearCelLayerSelection();
+        render();
+        return;
+      }
+      const index = celEditLayers.findIndex(
+        (layer) => layer.id === activeCelEditLayerId,
+      );
+      if (index < 0) return;
+      celEditCanvases.current.delete(activeCelEditLayerId);
+      undoStacks.current.delete(activeCelEditLayerId);
+      redoStacks.current.delete(activeCelEditLayerId);
+      const next = celEditLayers.filter(
+        (layer) => layer.id !== activeCelEditLayerId,
+      );
+      const fallback = next[Math.min(index, next.length - 1)];
+      setCelEditLayers(next);
+      setActiveCelEditLayerId(fallback.id);
+      setCelTransformBounds(
+        canvasContentBounds(celEditCanvases.current.get(fallback.id)!),
+      );
+      clearCelLayerSelection();
+    };
+
+    const mergeCelEditLayerDown = () => {
+      const index = celEditLayers.findIndex(
+        (layer) => layer.id === activeCelEditLayerId,
+      );
+      if (index < 0 || index >= celEditLayers.length - 1) return;
+      const activeLayer = celEditLayers[index];
+      const below = celEditLayers[index + 1];
+      const source = celEditCanvases.current.get(activeLayer.id);
+      const target = celEditCanvases.current.get(below.id);
+      if (!source || !target) return;
+      const ctx = target.getContext('2d')!;
+      ctx.save();
+      ctx.globalAlpha = activeLayer.opacity / 100;
+      ctx.drawImage(source, 0, 0);
+      ctx.restore();
+      celEditCanvases.current.delete(activeLayer.id);
+      undoStacks.current.delete(activeLayer.id);
+      redoStacks.current.delete(activeLayer.id);
+      const next = celEditLayers
+        .filter((layer) => layer.id !== activeLayer.id)
+        .map((layer) =>
+          layer.id === below.id ? { ...layer, opacity: 100 } : layer,
+        );
+      setCelEditLayers(next);
+      setActiveCelEditLayerId(below.id);
+      setCelTransformBounds(canvasContentBounds(target));
+      clearCelLayerSelection();
     };
     const beginAgentTargetDrag = (
       event: React.PointerEvent<HTMLButtonElement>,
@@ -1285,35 +1692,52 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         event.currentTarget.releasePointerCapture(event.pointerId);
     };
     const pushUndo = () => {
-      const canvas = frameCanvases.current.get(activeFrameId);
+      const canvas = currentPaintCanvas();
       if (!canvas) return;
-      const stack = undoStacks.current.get(activeFrameId) || [];
+      const historyId = celIllustrationMode
+        ? activeCelEditLayerId
+        : activeFrameId;
+      const stack = undoStacks.current.get(historyId) || [];
       stack.push(canvas.getContext('2d')!.getImageData(0, 0, WIDTH, HEIGHT));
-      undoStacks.current.set(activeFrameId, stack.slice(-30));
-      redoStacks.current.set(activeFrameId, []);
+      undoStacks.current.set(historyId, stack.slice(-30));
+      redoStacks.current.set(historyId, []);
     };
     const undo = () => {
-      const canvas = frameCanvases.current.get(activeFrameId);
-      const stack = undoStacks.current.get(activeFrameId) || [];
+      const canvas = currentPaintCanvas();
+      const historyId = celIllustrationMode
+        ? activeCelEditLayerId
+        : activeFrameId;
+      const stack = undoStacks.current.get(historyId) || [];
       const image = stack.pop();
       if (!canvas || !image) return;
       const ctx = canvas.getContext('2d')!;
-      const redoStack = redoStacks.current.get(activeFrameId) || [];
+      const redoStack = redoStacks.current.get(historyId) || [];
       redoStack.push(ctx.getImageData(0, 0, WIDTH, HEIGHT));
-      redoStacks.current.set(activeFrameId, redoStack.slice(-30));
+      redoStacks.current.set(historyId, redoStack.slice(-30));
       ctx.putImageData(image, 0, 0);
+      if (celIllustrationMode) {
+        setCelTransformBounds(canvasContentBounds(canvas));
+        clearCelLayerSelection();
+      }
       render();
     };
     const redo = () => {
-      const canvas = frameCanvases.current.get(activeFrameId);
-      const stack = redoStacks.current.get(activeFrameId) || [];
+      const canvas = currentPaintCanvas();
+      const historyId = celIllustrationMode
+        ? activeCelEditLayerId
+        : activeFrameId;
+      const stack = redoStacks.current.get(historyId) || [];
       const image = stack.pop();
       if (!canvas || !image) return;
       const ctx = canvas.getContext('2d')!;
-      const undoStack = undoStacks.current.get(activeFrameId) || [];
+      const undoStack = undoStacks.current.get(historyId) || [];
       undoStack.push(ctx.getImageData(0, 0, WIDTH, HEIGHT));
-      undoStacks.current.set(activeFrameId, undoStack.slice(-30));
+      undoStacks.current.set(historyId, undoStack.slice(-30));
       ctx.putImageData(image, 0, 0);
+      if (celIllustrationMode) {
+        setCelTransformBounds(canvasContentBounds(canvas));
+        clearCelLayerSelection();
+      }
       render();
     };
     const point = (event: React.PointerEvent<HTMLCanvasElement>) => {
@@ -1327,8 +1751,12 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       from: { x: number; y: number },
       to: { x: number; y: number },
     ) => {
-      if (activeClip?.type !== 'cel' || activeTrack?.locked) return;
-      const ctx = frameCanvases.current.get(activeFrameId)?.getContext('2d');
+      if (
+        !celIllustrationMode &&
+        (activeClip?.type !== 'cel' || activeTrack?.locked)
+      )
+        return;
+      const ctx = currentPaintCanvas()?.getContext('2d');
       if (!ctx) return;
       ctx.save();
       ctx.lineCap = 'round';
@@ -1346,7 +1774,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       render();
     };
     const beginSmudge = (at: { x: number; y: number }) => {
-      const source = frameCanvases.current.get(activeFrameId);
+      const source = currentPaintCanvas();
       if (!source) return;
       const size = Math.max(8, Math.ceil(brushSize));
       const buffer = document.createElement('canvas');
@@ -1372,7 +1800,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       smudgeBufferRef.current = buffer;
     };
     const smudgeStamp = (at: { x: number; y: number }) => {
-      const canvas = frameCanvases.current.get(activeFrameId);
+      const canvas = currentPaintCanvas();
       const buffer = smudgeBufferRef.current;
       if (!canvas || !buffer) return;
       const size = buffer.width;
@@ -1399,7 +1827,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       bufferCtx.restore();
     };
     const blurStamp = (at: { x: number; y: number }) => {
-      const canvas = frameCanvases.current.get(activeFrameId);
+      const canvas = currentPaintCanvas();
       if (!canvas) return;
       const radius = Math.max(4, brushSize / 2);
       const blurRadius = 1 + (effectStrength / 100) * 15;
@@ -1473,12 +1901,24 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     const commitText = (save = true) => {
       const draft = textDraft;
       setTextDraft(null);
-      if (!save || !draft || activeClip?.type !== 'cel') return;
+      if (
+        !save ||
+        !draft ||
+        (!celIllustrationMode && activeClip?.type !== 'cel')
+      )
+        return;
       const value = draft.value.trim();
       if (!value) return;
-      const ctx = frameCanvases.current.get(activeFrameId)?.getContext('2d');
+      let target = currentPaintCanvas();
+      if (celIllustrationMode) {
+        const layerId = addCelEditLayer(
+          `Text — ${value.replace(/\s+/g, ' ').slice(0, 24)}${value.length > 24 ? '…' : ''}`,
+        );
+        target = celEditCanvases.current.get(layerId) || null;
+      }
+      const ctx = target?.getContext('2d');
       if (!ctx) return;
-      pushUndo();
+      if (!celIllustrationMode) pushUndo();
       const font =
         textFonts.find((option) => option.id === textFont) || textFonts[0];
       ctx.save();
@@ -1499,8 +1939,224 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       ctx.restore();
       render();
     };
+
+    const redrawTransformedCelLayer = (
+      transform: ActiveCelTransform,
+      at: { x: number; y: number },
+    ) => {
+      const canvas = celEditCanvases.current.get(activeCelEditLayerId);
+      if (!canvas) return;
+      const source = makeCanvas();
+      source.getContext('2d')!.putImageData(transform.image, 0, 0);
+      const ctx = canvas.getContext('2d')!;
+      const bounds = transform.source;
+      let next: CanvasBounds;
+      ctx.clearRect(0, 0, WIDTH, HEIGHT);
+      if (transform.mode === 'move') {
+        const dx = at.x - transform.pointer.x;
+        const dy = at.y - transform.pointer.y;
+        next = {
+          x: clamp(bounds.x + dx, -bounds.width + 8, WIDTH - 8),
+          y: clamp(bounds.y + dy, -bounds.height + 8, HEIGHT - 8),
+          width: bounds.width,
+          height: bounds.height,
+        };
+        ctx.drawImage(source, next.x - bounds.x, next.y - bounds.y);
+      } else {
+        const anchorX = transform.mode.includes('l')
+          ? bounds.x + bounds.width
+          : bounds.x;
+        const anchorY = transform.mode.includes('t')
+          ? bounds.y + bounds.height
+          : bounds.y;
+        const rawX = transform.mode.includes('l') ? at.x : bounds.x;
+        const rawY = transform.mode.includes('t') ? at.y : bounds.y;
+        const width = Math.max(12, Math.abs(anchorX - rawX));
+        const height = Math.max(12, Math.abs(anchorY - rawY));
+        next = {
+          x: Math.min(anchorX, rawX),
+          y: Math.min(anchorY, rawY),
+          width,
+          height,
+        };
+        ctx.drawImage(
+          source,
+          bounds.x,
+          bounds.y,
+          bounds.width,
+          bounds.height,
+          next.x,
+          next.y,
+          next.width,
+          next.height,
+        );
+      }
+      setCelTransformBounds(next);
+      render();
+    };
+
+    const finishCelLayerLasso = () => {
+      const points = celLassoPoints.current;
+      const source = celEditCanvases.current.get(activeCelEditLayerId);
+      if (!source || points.length < 3) {
+        clearCelLayerSelection();
+        return null;
+      }
+      const mask = makeCanvas();
+      const maskCtx = mask.getContext('2d')!;
+      maskCtx.fillStyle = '#fff';
+      maskCtx.beginPath();
+      points.forEach((point, index) =>
+        index ? maskCtx.lineTo(point.x, point.y) : maskCtx.moveTo(point.x, point.y),
+      );
+      maskCtx.closePath();
+      maskCtx.fill();
+      const bounds = canvasContentBounds(mask);
+      if (!bounds || bounds.width < 4 || bounds.height < 4) {
+        clearCelLayerSelection();
+        return null;
+      }
+      const pixels = document.createElement('canvas');
+      pixels.width = bounds.width;
+      pixels.height = bounds.height;
+      const pixelsCtx = pixels.getContext('2d')!;
+      pixelsCtx.drawImage(
+        source,
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+        0,
+        0,
+        bounds.width,
+        bounds.height,
+      );
+      pixelsCtx.globalCompositeOperation = 'destination-in';
+      pixelsCtx.drawImage(
+        mask,
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+        0,
+        0,
+        bounds.width,
+        bounds.height,
+      );
+      const base = makeCanvas();
+      const baseCtx = base.getContext('2d')!;
+      baseCtx.drawImage(source, 0, 0);
+      baseCtx.globalCompositeOperation = 'destination-out';
+      baseCtx.drawImage(mask, 0, 0);
+      celLayerSelection.current = {
+        layerId: activeCelEditLayerId,
+        base: baseCtx.getImageData(0, 0, WIDTH, HEIGHT),
+        pixels,
+        source: bounds,
+        bounds: { ...bounds },
+      };
+      celLassoPoints.current = [];
+      setCelSelectionBounds({ ...bounds });
+      redrawCelEditOverlay();
+      return bounds;
+    };
+
+    const redrawCelSelectionTransform = (
+      transform: ActiveCelSelectionTransform,
+      at: { x: number; y: number },
+    ) => {
+      const selected = celLayerSelection.current;
+      if (!selected) return;
+      const canvas = celEditCanvases.current.get(selected.layerId);
+      if (!canvas) return;
+      const start = transform.start;
+      let next: CanvasBounds;
+      if (transform.mode === 'move') {
+        next = {
+          x: clamp(
+            start.x + at.x - transform.pointer.x,
+            -start.width + 8,
+            WIDTH - 8,
+          ),
+          y: clamp(
+            start.y + at.y - transform.pointer.y,
+            -start.height + 8,
+            HEIGHT - 8,
+          ),
+          width: start.width,
+          height: start.height,
+        };
+      } else {
+        const anchorX = transform.mode.includes('l')
+          ? start.x + start.width
+          : start.x;
+        const anchorY = transform.mode.includes('t')
+          ? start.y + start.height
+          : start.y;
+        const rawX = transform.mode.includes('l') ? at.x : start.x;
+        const rawY = transform.mode.includes('t') ? at.y : start.y;
+        next = {
+          x: Math.min(anchorX, rawX),
+          y: Math.min(anchorY, rawY),
+          width: Math.max(12, Math.abs(anchorX - rawX)),
+          height: Math.max(12, Math.abs(anchorY - rawY)),
+        };
+      }
+      const ctx = canvas.getContext('2d')!;
+      ctx.putImageData(selected.base, 0, 0);
+      ctx.drawImage(
+        selected.pixels,
+        0,
+        0,
+        selected.pixels.width,
+        selected.pixels.height,
+        next.x,
+        next.y,
+        next.width,
+        next.height,
+      );
+      selected.bounds = next;
+      setCelSelectionBounds({ ...next });
+      render();
+    };
+
+    const cloneCelLayerSelection = () => {
+      const selected = celLayerSelection.current;
+      if (!selected) return;
+      const id = addCelEditLayer('Selection copy');
+      const canvas = celEditCanvases.current.get(id)!;
+      canvas
+        .getContext('2d')!
+        .drawImage(
+          selected.pixels,
+          0,
+          0,
+          selected.pixels.width,
+          selected.pixels.height,
+          selected.bounds.x,
+          selected.bounds.y,
+          selected.bounds.width,
+          selected.bounds.height,
+        );
+      celLayerSelection.current = null;
+      setCelSelectionBounds(null);
+      setCelTransformBounds(canvasContentBounds(canvas));
+    };
+
+    const deleteCelLayerSelection = () => {
+      const selected = celLayerSelection.current;
+      if (!selected) return;
+      const canvas = celEditCanvases.current.get(selected.layerId);
+      if (!canvas) return;
+      pushUndo();
+      canvas.getContext('2d')!.putImageData(selected.base, 0, 0);
+      setCelTransformBounds(canvasContentBounds(canvas));
+      clearCelLayerSelection();
+      render();
+    };
+
     const pointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
-      if (tool === 'agent-target') return;
+      if (tool === 'agent-target' && !celIllustrationMode) return;
       if (tool === 'pan') {
         const viewport = stageViewportRef.current;
         if (!viewport) return;
@@ -1514,7 +2170,12 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         };
         return;
       }
-      if (playing || activeClip?.type !== 'cel' || activeTrack?.locked) return;
+      if (
+        playing ||
+        (!celIllustrationMode &&
+          (activeClip?.type !== 'cel' || activeTrack?.locked))
+      )
+        return;
       const at = point(event);
       if (tool === 'text') {
         if (!textDraft) {
@@ -1528,6 +2189,57 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         return;
       }
       event.currentTarget.setPointerCapture(event.pointerId);
+      if (celIllustrationMode && tool === 'layer-lasso') {
+        const selected = celLayerSelection.current;
+        const bounds = selected?.bounds;
+        const inside =
+          !!bounds &&
+          at.x >= bounds.x - 18 &&
+          at.x <= bounds.x + bounds.width + 18 &&
+          at.y >= bounds.y - 18 &&
+          at.y <= bounds.y + bounds.height + 18;
+        if (
+          selected &&
+          selected.layerId === activeCelEditLayerId &&
+          bounds &&
+          inside
+        ) {
+          pushUndo();
+          activeCelSelectionTransform.current = {
+            start: { ...bounds },
+            pointer: at,
+            mode: transformModeAtPoint(bounds, at),
+          };
+        } else {
+          clearCelLayerSelection();
+          celLassoPoints.current = [at];
+          redrawCelEditOverlay();
+        }
+        drawing.current = true;
+        return;
+      }
+      if (celIllustrationMode && tool === 'transform') {
+        const canvas = celEditCanvases.current.get(activeCelEditLayerId);
+        const bounds = canvas
+          ? celTransformBounds || canvasContentBounds(canvas)
+          : null;
+        if (!canvas || !bounds) {
+          setMediaNotice({
+            tone: 'error',
+            text: 'The selected layer is empty, so there is nothing to transform.',
+          });
+          return;
+        }
+        pushUndo();
+        activeCelTransform.current = {
+          source: bounds,
+          image: canvas.getContext('2d')!.getImageData(0, 0, WIDTH, HEIGHT),
+          pointer: at,
+          mode: transformModeAtPoint(bounds, at),
+        };
+        drawing.current = true;
+        return;
+      }
       drawing.current = true;
       lastPoint.current = at;
       if (tool === 'eyedropper') {
@@ -1551,13 +2263,45 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       }
       if (!drawing.current) return;
       const next = point(event);
-      if (tool === 'eyedropper') previewEyedropper(next);
+      if (
+        celIllustrationMode &&
+        tool === 'layer-lasso' &&
+        activeCelSelectionTransform.current
+      ) {
+        redrawCelSelectionTransform(activeCelSelectionTransform.current, next);
+      } else if (celIllustrationMode && tool === 'layer-lasso') {
+        const points = celLassoPoints.current;
+        const previous = points[points.length - 1];
+        if (!previous || Math.hypot(next.x - previous.x, next.y - previous.y) > 2)
+          points.push(next);
+        redrawCelEditOverlay();
+      } else if (
+        celIllustrationMode &&
+        tool === 'transform' &&
+        activeCelTransform.current
+      ) {
+        redrawTransformedCelLayer(activeCelTransform.current, next);
+      } else if (tool === 'eyedropper') previewEyedropper(next);
       else if (tool === 'smudge' || tool === 'blur')
         applyEffectStroke(lastPoint.current, next);
       else drawLine(lastPoint.current, next);
       lastPoint.current = next;
     };
     const pointerUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
+      if (
+        drawing.current &&
+        celIllustrationMode &&
+        tool === 'layer-lasso'
+      ) {
+        if (!activeCelSelectionTransform.current) finishCelLayerLasso();
+        activeCelSelectionTransform.current = null;
+      }
+      if (
+        drawing.current &&
+        celIllustrationMode &&
+        tool === 'transform'
+      )
+        activeCelTransform.current = null;
       if (tool === 'eyedropper' && eyedropperColor.current) {
         setBrushColor(eyedropperColor.current);
         setTool('brush');
@@ -1565,10 +2309,20 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       drawing.current = false;
       panning.current = false;
       smudgeBufferRef.current = null;
+      activeCelTransform.current = null;
+      activeCelSelectionTransform.current = null;
       eyedropperColor.current = null;
       setEyedropperPreview(null);
       if (event.currentTarget.hasPointerCapture(event.pointerId))
         event.currentTarget.releasePointerCapture(event.pointerId);
+      if (
+        celIllustrationMode &&
+        tool !== 'layer-lasso' &&
+        tool !== 'pan'
+      ) {
+        const canvas = celEditCanvases.current.get(activeCelEditLayerId);
+        setCelTransformBounds(canvas ? canvasContentBounds(canvas) : null);
+      }
       render();
     };
 
@@ -1684,14 +2438,23 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       source: CanvasImageSource,
       sourceWidth: number,
       sourceHeight: number,
+      layerName = 'Imported image',
     ) => {
-      if (activeClip?.type !== 'cel' || activeTrack?.locked) return false;
-      const canvas = frameCanvases.current.get(activeFrameId);
+      if (
+        !celIllustrationMode &&
+        (activeClip?.type !== 'cel' || activeTrack?.locked)
+      )
+        return false;
+      let canvas = currentPaintCanvas();
+      if (celIllustrationMode) {
+        const layerId = addCelEditLayer(layerName.slice(0, 48));
+        canvas = celEditCanvases.current.get(layerId) || null;
+      }
       if (!canvas || sourceWidth <= 0 || sourceHeight <= 0) return false;
       const scale = Math.min(WIDTH / sourceWidth, HEIGHT / sourceHeight);
       const width = sourceWidth * scale;
       const height = sourceHeight * scale;
-      pushUndo();
+      if (!celIllustrationMode) pushUndo();
       canvas
         .getContext('2d')!
         .drawImage(
@@ -1714,6 +2477,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
               image,
               image.naturalWidth,
               image.naturalHeight,
+              asset.name,
             )
           )
             resolve();
@@ -1742,7 +2506,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       if (!image) return;
       const canvas = makeCanvas();
       canvas.getContext('2d')!.putImageData(image, 0, 0);
-      insertImageIntoActiveCel(canvas, WIDTH, HEIGHT);
+      insertImageIntoActiveCel(canvas, WIDTH, HEIGHT, drawing.name);
     };
     const importAudio = (event: React.ChangeEvent<HTMLInputElement>) => {
       const file = event.target.files?.[0];
@@ -2294,6 +3058,13 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     };
     const exportAnimation = async (format: VideoExportFormat = 'webm') => {
       if (exporting) return;
+      if (celIllustrationMode) {
+        setMediaNotice({
+          tone: 'error',
+          text: 'Flatten the temporary cel layers before exporting the animation.',
+        });
+        return;
+      }
       const requestedMime = supportedRecordingMime(format);
       if (format === 'mp4' && !requestedMime) {
         setMediaNotice({
@@ -2469,7 +3240,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       }
     };
     const exportWorkspace = async () => {
-      if (exporting) return;
+      if (exporting || celIllustrationMode) return;
       exportProject();
       await exportAnimation('webm');
     };
@@ -2922,9 +3693,12 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       return () => document.removeEventListener('pointerdown', closeAssetMenu);
     }, []);
     useEffect(() => {
-      if (activeClip?.type !== 'cel' || activeTrack?.locked)
-        setAssetMenuOpen(false);
-    }, [activeClip?.type, activeTrack?.locked]);
+      if (
+        !celIllustrationMode &&
+        (activeClip?.type !== 'cel' || activeTrack?.locked)
+      )
+        requestAnimationFrame(() => setAssetMenuOpen(false));
+    }, [activeClip?.type, activeTrack?.locked, celIllustrationMode]);
     useEffect(() => {
       requestAnimationFrame(render);
     }, [render]);
@@ -3071,7 +3845,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
               <Sparkles size={15} />
             </div>
             <strong>DUET</strong>
-            <span>ANIMATOR</span>
+            <span>{celIllustrationMode ? 'CEL ILLUSTRATION' : 'ANIMATOR'}</span>
           </div>
           <div className="header-center">
             <div className="mode-switch" aria-label="Workspace mode">
@@ -3092,8 +3866,13 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
               size="sm"
               className="header-save-button"
               onClick={saveFrame}
+              disabled={celIllustrationMode}
               aria-label="Save animation frame"
-              title="Save frame"
+              title={
+                celIllustrationMode
+                  ? 'Flatten the cel layers before saving'
+                  : 'Save frame'
+              }
             >
               <Download />
               <span className="header-action-full">Save frame</span>
@@ -3109,7 +3888,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
                     className="header-export-button"
                   />
                 }
-                disabled={exporting}
+                disabled={exporting || celIllustrationMode}
                 aria-label="Export animation video"
                 title="Export video"
               >
@@ -3161,8 +3940,12 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
               size="sm"
               className="export-button export-workspace-button"
               onClick={() => void exportWorkspace()}
-              disabled={exporting}
-              title="Download the animation and editable DUET project"
+              disabled={exporting || celIllustrationMode}
+              title={
+                celIllustrationMode
+                  ? 'Flatten the cel layers before exporting'
+                  : 'Download the animation and editable DUET project'
+              }
               aria-label="Export workspace"
             >
               <Download />
@@ -3171,12 +3954,21 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
             </Button>
           </div>
         </header>
-        <section className="animator-workspace">
+        <section
+          className={`animator-workspace ${celIllustrationMode ? 'cel-illustration-workspace' : ''}`}
+        >
           <aside
             className="animation-tool-rail"
-            aria-label="Animation drawing tools"
+            aria-label={
+              celIllustrationMode
+                ? 'Cel illustration tools'
+                : 'Animation drawing tools'
+            }
           >
-            {animationToolMeta.map(({ id, label, icon: Icon }) => (
+            {(celIllustrationMode
+              ? celIllustrationToolMeta
+              : animationToolMeta
+            ).map(({ id, label, icon: Icon }) => (
               <button
                 key={id}
                 className={tool === id ? 'active' : ''}
@@ -3185,8 +3977,25 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
                   setTextDraft(null);
                   setEyedropperPreview(null);
                   setMediaNotice(null);
+                  if (id !== 'layer-lasso') clearCelLayerSelection();
+                  if (celIllustrationMode && id === 'transform') {
+                    const canvas = celEditCanvases.current.get(
+                      activeCelEditLayerId,
+                    );
+                    setCelTransformBounds(
+                      canvas ? canvasContentBounds(canvas) : null,
+                    );
+                  } else if (id !== 'layer-lasso') {
+                    celEditOverlayRef.current
+                      ?.getContext('2d')
+                      ?.clearRect(0, 0, WIDTH, HEIGHT);
+                  }
                 }}
-                aria-label={`Animation ${label.toLowerCase()}`}
+                aria-label={
+                  celIllustrationMode
+                    ? label
+                    : `Animation ${label.toLowerCase()}`
+                }
                 title={label}
               >
                 <Icon />
@@ -3211,11 +4020,15 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
                 onClick={() => setAssetMenuOpen((open) => !open)}
                 aria-label="Open shared image library"
                 title={
-                  activeClip?.type === 'cel' && !activeTrack?.locked
+                  celIllustrationMode ||
+                  (activeClip?.type === 'cel' && !activeTrack?.locked)
                     ? 'Insert a photo or illustration into this cel'
                     : 'Select an unlocked cel first'
                 }
-                disabled={activeClip?.type !== 'cel' || activeTrack?.locked}
+                disabled={
+                  !celIllustrationMode &&
+                  (activeClip?.type !== 'cel' || activeTrack?.locked)
+                }
               >
                 <ImagePlus />
               </button>
@@ -3223,7 +4036,11 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
                 <div className="animation-asset-menu">
                   <div className="import-menu-heading">
                     <strong>Images</strong>
-                    <span>Insert into selected cel</span>
+                    <span>
+                      {celIllustrationMode
+                        ? 'Add as a new cel layer'
+                        : 'Insert into selected cel'}
+                    </span>
                   </div>
                   <button
                     className="import-action"
@@ -3277,18 +4094,24 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
             </div>
           </aside>
           <div
-            className="animation-main hybrid"
+            className={`animation-main hybrid ${celIllustrationMode ? 'cel-illustration-main' : ''}`}
             style={{
-              gridTemplateRows: `40px minmax(160px, 1fr) ${bottomDrawerCollapsed ? 22 : frameEditorHeight}px`,
+              gridTemplateRows: celIllustrationMode
+                ? '40px minmax(0, 1fr)'
+                : `40px minmax(160px, 1fr) ${bottomDrawerCollapsed ? 22 : frameEditorHeight}px`,
             }}
           >
             <div className="animation-context-bar">
               <strong>
                 {tool === 'agent-target'
                   ? 'Agent target'
+                  : tool === 'layer-lasso'
+                    ? 'Layer lasso'
+                    : tool === 'transform'
+                      ? 'Transform layer'
                   : tool === 'pan'
-                  ? 'Hand'
-                  : tool[0].toUpperCase() + tool.slice(1)}
+                    ? 'Hand'
+                    : tool[0].toUpperCase() + tool.slice(1)}
               </strong>
               {(
                 ['brush', 'eraser', 'smudge', 'blur'] as AnimationTool[]
@@ -3393,6 +4216,32 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
               {tool === 'agent-target' && (
                 <em>Click a cel clip in the timeline to target it</em>
               )}
+              {tool === 'layer-lasso' && celIllustrationMode && (
+                <>
+                  {celSelectionBounds ? (
+                    <span className="cel-lasso-actions">
+                      <button onClick={cloneCelLayerSelection}>
+                        <Copy /> Clone
+                      </button>
+                      <button onClick={deleteCelLayerSelection}>
+                        <Trash2 /> Delete
+                      </button>
+                      <button
+                        className="icon-only"
+                        onClick={clearCelLayerSelection}
+                        aria-label="Clear layer selection"
+                      >
+                        <X />
+                      </button>
+                    </span>
+                  ) : (
+                    <em>Draw around pixels, then drag or resize the selection</em>
+                  )}
+                </>
+              )}
+              {tool === 'transform' && celIllustrationMode && (
+                <em>Drag the layer to move · drag a corner to resize</em>
+              )}
               {tool === 'pan' && <em>Drag the canvas to move around</em>}
               <span className="animation-context-spacer" />
               <Button
@@ -3411,6 +4260,32 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
               >
                 <Redo2 />
               </Button>
+              {celIllustrationMode ? (
+                <Button
+                  size="sm"
+                  className="flatten-cel-button"
+                  onClick={() => setFlattenDialogOpen(true)}
+                >
+                  <Merge />
+                  <span>Flatten &amp; return</span>
+                </Button>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="illustrate-cel-button"
+                  onClick={enterCelIllustrationMode}
+                  disabled={activeClip?.type !== 'cel' || activeTrack?.locked}
+                  title={
+                    activeClip?.type === 'cel' && !activeTrack?.locked
+                      ? 'Edit this cel using temporary illustration layers'
+                      : 'Select an unlocked cel first'
+                  }
+                >
+                  <Layers3 />
+                  <span>Illustrate cel</span>
+                </Button>
+              )}
             </div>
             <div ref={stageViewportRef} className="animation-stage">
               <div
@@ -3429,6 +4304,15 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
                     onPointerUp={pointerUp}
                     onPointerCancel={pointerUp}
                   />
+                  {celIllustrationMode && (
+                    <canvas
+                      ref={celEditOverlayRef}
+                      width={WIDTH}
+                      height={HEIGHT}
+                      className="cel-edit-overlay"
+                      aria-hidden="true"
+                    />
+                  )}
                   {textDraft && (
                     <textarea
                       ref={textEntryRef}
@@ -3489,13 +4373,23 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
                 </div>
               </div>
               <div className="frame-counter">
-                {Math.floor(playhead / fps)}:
-                {String(playhead % fps).padStart(2, '0')} · frame {playhead + 1}
+                {celIllustrationMode ? (
+                  <>
+                    {activeClip?.name || 'Cel'} · cel {activeFrameIndex + 1}
+                  </>
+                ) : (
+                  <>
+                    {Math.floor(playhead / fps)}:
+                    {String(playhead % fps).padStart(2, '0')} · frame{' '}
+                    {playhead + 1}
+                  </>
+                )}
               </div>
             </div>
-            <div
-              className={`animation-bottom-drawer ${bottomDrawerCollapsed ? 'collapsed' : ''}`}
-            >
+            {!celIllustrationMode && (
+              <div
+                className={`animation-bottom-drawer ${bottomDrawerCollapsed ? 'collapsed' : ''}`}
+              >
               {bottomDrawerCollapsed ? (
                 <button
                   className="drawer-expand-button"
@@ -3995,10 +4889,157 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
                   </div>
                 </>
               )}
-            </div>
+              </div>
+            )}
           </div>
           <aside className="animation-panel">
-            <section className="animation-ai-panel">
+            {celIllustrationMode ? (
+              <div className="cel-layers-panel">
+                <div className="cel-layers-heading">
+                  <span>
+                    <Layers3 />
+                    <strong>Cel layers</strong>
+                  </span>
+                  <small>{celEditLayers.length}</small>
+                </div>
+                <p>
+                  These layers belong only to this editing session. Returning
+                  to Animate permanently flattens them into one cel.
+                </p>
+                {mediaNotice && (
+                  <output
+                    className={`animation-media-notice ${mediaNotice.tone}`}
+                  >
+                    {mediaNotice.text}
+                  </output>
+                )}
+                {activeCelEditLayer && (
+                  <label className="cel-layer-opacity">
+                    <span>Opacity</span>
+                    <Slider
+                      min={0}
+                      max={100}
+                      value={[activeCelEditLayer.opacity]}
+                      onValueChange={(value) => {
+                        const opacity = Math.round(
+                          Array.isArray(value) ? value[0] : Number(value),
+                        );
+                        setCelEditLayers((items) =>
+                          items.map((layer) =>
+                            layer.id === activeCelEditLayer.id
+                              ? { ...layer, opacity }
+                              : layer,
+                          ),
+                        );
+                      }}
+                    />
+                    <strong>{activeCelEditLayer.opacity}%</strong>
+                  </label>
+                )}
+                <div className="cel-layer-list">
+                  {celEditLayers.map((layer) => (
+                    <div
+                      key={layer.id}
+                      className={
+                        layer.id === activeCelEditLayerId ? 'active' : ''
+                      }
+                    >
+                      <button
+                        type="button"
+                        className="cel-layer-visibility"
+                        aria-label={`${layer.visible ? 'Hide' : 'Show'} ${layer.name}`}
+                        onClick={() => {
+                          setCelEditLayers((items) =>
+                            items.map((item) =>
+                              item.id === layer.id
+                                ? { ...item, visible: !item.visible }
+                                : item,
+                            ),
+                          );
+                        }}
+                      >
+                        {layer.visible ? <Eye /> : <EyeOff />}
+                      </button>
+                      <button
+                        type="button"
+                        className="cel-layer-select"
+                        aria-label={`Select layer ${layer.name}`}
+                        aria-pressed={layer.id === activeCelEditLayerId}
+                        onClick={() => selectCelEditLayer(layer.id)}
+                      >
+                        <canvas
+                          ref={(node) => {
+                            if (node)
+                              celLayerThumbnailRefs.current.set(layer.id, node);
+                            else
+                              celLayerThumbnailRefs.current.delete(layer.id);
+                          }}
+                          width={48}
+                          height={32}
+                        />
+                        <span className="cel-layer-name">
+                          <strong>{layer.name}</strong>
+                          <small>Illustration layer</small>
+                        </span>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <div className="cel-layer-order-actions">
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    onClick={() => moveCelEditLayer(-1)}
+                    disabled={activeCelEditLayerIndex <= 0}
+                    aria-label="Move layer up"
+                  >
+                    <ChevronUp />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    onClick={() => moveCelEditLayer(1)}
+                    disabled={
+                      activeCelEditLayerIndex < 0 ||
+                      activeCelEditLayerIndex >= celEditLayers.length - 1
+                    }
+                    aria-label="Move layer down"
+                  >
+                    <ChevronDown />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => addCelEditLayer()}
+                  >
+                    <Plus /> New layer
+                  </Button>
+                </div>
+                <div className="cel-layer-footer-actions">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={mergeCelEditLayerDown}
+                    disabled={
+                      activeCelEditLayerIndex < 0 ||
+                      activeCelEditLayerIndex >= celEditLayers.length - 1
+                    }
+                  >
+                    <Merge /> Merge down
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    onClick={deleteCelEditLayer}
+                    aria-label="Delete layer"
+                  >
+                    <Trash2 />
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <section className="animation-ai-panel">
               <div className="animation-ai-heading">
                 <span>
                   <Sparkles />
@@ -4110,16 +5151,15 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
                   )}
                 </>
               )}
-            </section>
-            {mediaNotice && (
-              <div
-                className={`animation-media-notice ${mediaNotice.tone}`}
-                role="status"
-              >
-                {mediaNotice.text}
-              </div>
-            )}
-            <div className="animation-stat">
+                </section>
+                {mediaNotice && (
+                  <output
+                    className={`animation-media-notice ${mediaNotice.tone}`}
+                  >
+                    {mediaNotice.text}
+                  </output>
+                )}
+                <div className="animation-stat">
               <span>Playhead</span>
               <strong>{(playhead / fps).toFixed(2)}s</strong>
             </div>
@@ -4245,12 +5285,14 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
                 <strong>{activeClip.volume}%</strong>
               </label>
             )}
-            <div className="animation-shortcuts">
+                <div className="animation-shortcuts">
               <strong>Shortcuts</strong>
               <span>Space · Play / pause</span>
               <span>← → · Move playhead</span>
               <span>⌘Z · Undo cel stroke</span>
-            </div>
+                </div>
+              </>
+            )}
           </aside>
           <input
             ref={imageInputRef}
@@ -4274,6 +5316,27 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
             onChange={importAudio}
           />
         </section>
+        <AlertDialog
+          open={flattenDialogOpen}
+          onOpenChange={setFlattenDialogOpen}
+        >
+          <AlertDialogContent className="flatten-cel-dialog">
+            <AlertDialogHeader>
+              <AlertDialogTitle>Flatten cel layers?</AlertDialogTitle>
+              <AlertDialogDescription>
+                All visible layers will be compressed into one image for this
+                cel. You can undo the resulting pixel change, but the individual
+                layers cannot be recovered.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Keep editing</AlertDialogCancel>
+              <AlertDialogAction onClick={flattenCelIllustration}>
+                <Merge /> Flatten &amp; return
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </main>
     );
   },
