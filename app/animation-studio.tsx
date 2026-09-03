@@ -359,7 +359,6 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
   const resizeFrameEditorWithKeyboard = (event: React.KeyboardEvent<HTMLButtonElement>) => { if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return; event.preventDefault(); const delta = event.key === 'ArrowUp' ? 18 : -18; setFrameEditorHeight((height) => clamp(height + delta, FRAME_EDITOR_MIN_HEIGHT, getMaxFrameEditorHeight())); };
   const toggleTimeline = () => { if (frameEditorHeight < FRAME_EDITOR_ONE_TRACK_HEIGHT) { setFrameEditorHeight(Math.min(FRAME_EDITOR_DEFAULT_HEIGHT, getMaxFrameEditorHeight())); setTimelineManuallyCollapsed(false); return; } setTimelineManuallyCollapsed((collapsed) => !collapsed); };
   const setPlayheadFromLane = (event: React.PointerEvent<HTMLDivElement>, trackId: string) => { if (event.target !== event.currentTarget) return; const rect = event.currentTarget.getBoundingClientRect(); setPlaying(false); setActiveTrackId(trackId); setActiveClipId(''); setPlayhead(clamp(Math.floor((event.clientX - rect.left) / PX), 0, timelineFrames - 1)); };
-  const useIllustration = () => { if (activeClip?.type !== 'cel') return; const image = getIllustrationImage(); const canvas = frameCanvases.current.get(activeFrameId); if (!image || !canvas) return; pushUndo(); canvas.getContext('2d')!.putImageData(image, 0, 0); render(); };
   const saveFrame = () => { const canvas = makeCanvas(); drawAt(canvas.getContext('2d')!, playhead); canvas.toBlob((blob) => { if (blob) download(blob, `${safeName(documentName)}-frame-${playhead + 1}.png`); }, 'image/png'); };
   const exportAnimation = async () => {
     if (exporting) return;
@@ -581,10 +580,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
           {agentClipRequest && <output className="animation-ai-ready"><button onClick={() => setAgentClipRequest(null)} aria-label="Cancel AI clip request" title="Cancel request"><X /></button><strong>Ready for your prompt</strong><span>Now ask your agent to generate a short clip. This request contains no images.</span><small>Starts at frame {agentClipRequest.startFrame + 1}{agentClipRequest.insertAboveTrackName ? ` · above ${agentClipRequest.insertAboveTrackName}` : ''}</small></output>}
           {agentClipResult && <output className="animation-ai-result"><strong><Sparkles />{agentClipResult.name} inserted</strong><span>{agentClipResult.frameCount} editable cels on a new track.</span><div><button onClick={removeAgentGeneratedTrack}><Undo2 />Undo insert</button><button onClick={armAgentClipRequest}><Plus />New request</button></div></output>}
         </section>
-        <div className="animation-panel-heading"><Film /><div><strong>Hybrid timeline</strong><span>{documentName}</span></div></div>
-        <p>Arrange cels, video, and audio in tracks. Higher tracks draw on top. Clips on one track snap apart instead of overlapping. Photos and illustrations are inserted into the selected cel.</p>
         {mediaNotice && <div className={`animation-media-notice ${mediaNotice.tone}`} role="status">{mediaNotice.text}</div>}
-        {activeClip?.type === 'cel' && <button className="illustration-frame-button" onClick={useIllustration}><ImagePlus />Use illustration as cel</button>}
         <div className="animation-stat"><span>Playhead</span><strong>{(playhead / fps).toFixed(2)}s</strong></div>
         <div className="animation-stat"><span>Track</span><strong>{selectedTrack?.name || 'None'}</strong></div>
         <div className="animation-stat"><span>Clip</span><strong>{activeClip?.name || 'None'}</strong></div>
