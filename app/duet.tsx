@@ -220,6 +220,8 @@ export function Duet() {
   const documentMenuRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
+  const textEntryRef = useRef<HTMLTextAreaElement>(null);
+  const textDraftRef = useRef<TextDraft | null>(null);
   const colorPickerRef = useRef<HTMLDivElement>(null);
   const colorSquareRef = useRef<HTMLDivElement>(null);
   const hueSliderRef = useRef<HTMLDivElement>(null);
@@ -257,6 +259,10 @@ export function Duet() {
   const [textFont, setTextFont] = useState<TextFont>('sans');
   const [textSize, setTextSize] = useState(48);
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
+  const updateTextDraft = useCallback((next: TextDraft | null) => {
+    textDraftRef.current = next;
+    setTextDraft(next);
+  }, []);
   const [colorHistory, setColorHistory] = useState<string[]>([]);
   const [colorPickerOpen, setColorPickerOpen] = useState(false);
   const [hsv, setHsv] = useState<HsvColor>(() => hexToHsv('#ff6b5f'));
@@ -648,19 +654,19 @@ export function Duet() {
     const nextZoom = clamp(state.zoom, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom); setLeftSidebarOpen(state.chrome.leftSidebarOpen); setRightSidebarOpen(state.chrome.rightSidebarOpen); setShowBranding(state.chrome.showBranding);
     setActivities(state.activities.map((activity) => ({ ...activity }))); undoStack.current = [...state.undo]; redoStack.current = [...state.redo]; pendingEdits.current.clear();
     setAgentSelections(state.agentBundle.items.map((item) => ({ ...item, source: { ...item.source }, selection: { ...item.selection } })));
-    setAgentTargetId(state.agentBundle.targetId); setAgentBundleStatus(state.agentBundle.status); setAgentBundleId(state.agentBundle.bundleId); setAgentBundleSentAt(state.agentBundle.sentAt); setDraggingAgentItemId(null); setAgentDropZone(null); setTextDraft(null);
+    setAgentTargetId(state.agentBundle.targetId); setAgentBundleStatus(state.agentBundle.status); setAgentBundleId(state.agentBundle.bundleId); setAgentBundleSentAt(state.agentBundle.sentAt); setDraggingAgentItemId(null); setAgentDropZone(null); updateTextDraft(null);
     renderLayerList(state.snapshot.layers);
     requestAnimationFrame(() => { redrawSelectionOverlay(); redrawLayerSelectionOverlay(); renderLayerList(state.snapshot.layers); requestAnimationFrame(() => { const viewport = viewportRef.current; if (viewport) { viewport.scrollLeft = state.viewport.scrollLeft; viewport.scrollTop = state.viewport.scrollTop; } }); });
-  }, [changeTool, clearLayerSelection, redrawLayerSelectionOverlay, redrawSelectionOverlay, renderLayerList, restoreLayerSnapshot, setColor]);
+  }, [changeTool, clearLayerSelection, redrawLayerSelectionOverlay, redrawSelectionOverlay, renderLayerList, restoreLayerSnapshot, setColor, updateTextDraft]);
   const createBlankDrawing = useCallback(() => {
     const currentState = captureDrawingState(); const id = `drawing-${Date.now()}-${Math.random().toString(16).slice(2)}`; const name = `Untitled drawing ${workspaceDrawings.length + 1}`;
     setWorkspaceDrawings((items) => [...items.map((drawing) => drawing.id === currentDrawingId ? { ...drawing, name: documentName, state: currentState } : drawing), { id, name }]);
     const layerId = `layer-${Date.now()}-${Math.random().toString(16).slice(2)}`; layerCanvases.current = new Map([[layerId, makeCanvas()]]);
     setLayers([{ id: layerId, name: 'Paint layer', visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#ffffff,#d5d1e8)' }]); setActiveLayer(layerId);
-    setCurrentDrawingId(id); setDocumentName(name); setDocumentNameDraft(name); setDocumentMenuOpen(false); clearSelection(); clearLayerSelection(); changeTool('brush'); setTextDraft(null);
+    setCurrentDrawingId(id); setDocumentName(name); setDocumentNameDraft(name); setDocumentMenuOpen(false); clearSelection(); clearLayerSelection(); changeTool('brush'); updateTextDraft(null);
     const defaultZoom = 82; zoomRef.current = defaultZoom; setZoom(defaultZoom); undoStack.current = []; redoStack.current = []; pendingEdits.current.clear(); setAgentSelections([]); setAgentTargetId(null); setAgentBundleStatus('draft'); setAgentBundleId(null); setAgentBundleSentAt(null); setActivities([{ id: Date.now(), title: 'New drawing created', detail: name, time: 'now' }]);
     requestAnimationFrame(() => { render(); const viewport = viewportRef.current; if (viewport) { viewport.scrollLeft = 0; viewport.scrollTop = 0; } });
-  }, [captureDrawingState, changeTool, clearLayerSelection, clearSelection, currentDrawingId, documentName, render, workspaceDrawings.length]);
+  }, [captureDrawingState, changeTool, clearLayerSelection, clearSelection, currentDrawingId, documentName, render, updateTextDraft, workspaceDrawings.length]);
   const switchDrawing = useCallback((drawingId: string) => {
     if (drawingId === currentDrawingId) { setDocumentMenuOpen(false); return; }
     const target = workspaceDrawings.find((drawing) => drawing.id === drawingId); if (!target?.state) return;
@@ -1038,7 +1044,7 @@ export function Duet() {
     render();
   };
   const commitText = (save = true) => {
-    const draft = textDraft; setTextDraft(null); if (!save || !draft) return;
+    const draft = textDraftRef.current; updateTextDraft(null); if (!save || !draft) return;
     const value = draft.value.trim(); if (!value) return;
     const before = captureLayerSnapshot(layers, activeLayer); const id = `text-${Date.now()}-${Math.random().toString(16).slice(2)}`; const canvas = makeCanvas(); const ctx = canvas.getContext('2d')!;
     const font = textFonts.find((option) => option.id === textFont) || textFonts[0]; const lines = value.split(/\r?\n/); const lineHeight = textSize * 1.18;
@@ -1050,6 +1056,16 @@ export function Duet() {
     const after = captureLayerSnapshot(nextLayers, id); undoStack.current.push({ kind: 'layers', before, after }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
     setLayers(nextLayers); setActiveLayer(id); rememberUsedColor(); addActivity('Text layer created', layerName); render();
   };
+  useEffect(() => {
+    if (!textDraft) return;
+    const commitOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && textEntryRef.current?.contains(target)) return;
+      commitText(true);
+    };
+    document.addEventListener('pointerdown', commitOnOutsidePointer, true);
+    return () => document.removeEventListener('pointerdown', commitOnOutsidePointer, true);
+  }, [textDraft]);
   const transformModeAtPoint = (bounds: Selection, point: { x: number; y: number }): TransformMode => {
     const edge = 18;
     const left = Math.abs(point.x - bounds.x) < edge; const right = Math.abs(point.x - (bounds.x + bounds.width)) < edge;
@@ -1087,7 +1103,10 @@ export function Duet() {
     }
     const point = pointer(event);
     if (tool === 'text') {
-      if (!textDraft) setTextDraft({ x: clamp(point.x, 0, WIDTH - 12), y: clamp(point.y, 0, HEIGHT - textSize), value: '' });
+      if (!textDraft) {
+        updateTextDraft({ x: clamp(point.x, 0, WIDTH - 12), y: clamp(point.y, 0, HEIGHT - textSize), value: '' });
+        requestAnimationFrame(() => textEntryRef.current?.focus());
+      }
       return;
     }
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -1405,7 +1424,7 @@ export function Duet() {
           </div>
           <div className="history-controls"><Button variant="ghost" size="icon-sm" onClick={undo} aria-label="Undo"><Undo2 /></Button><Button variant="ghost" size="icon-sm" onClick={redo} aria-label="Redo"><Redo2 /></Button></div>
         </div>
-        <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={() => endPointer()} onPointerCancel={() => endPointer(true)} /><canvas ref={selectionOverlayRef} width={WIDTH} height={HEIGHT} className="selection-overlay" aria-hidden="true" /><canvas ref={layerSelectionOverlayRef} width={WIDTH} height={HEIGHT} className="layer-selection-overlay" aria-hidden="true" />{textDraft && <textarea autoFocus className="text-entry" aria-label="Text to add on a new layer" placeholder="Type here…" spellCheck value={textDraft.value} style={{ left: `${textDraft.x / WIDTH * 100}%`, top: `${textDraft.y / HEIGHT * 100}%`, color: brushColor, fontFamily: (textFonts.find((font) => font.id === textFont) || textFonts[0]).family, fontSize: `${textSize / WIDTH * 100}cqw` }} onPointerDown={(event) => event.stopPropagation()} onChange={(event) => setTextDraft({ ...textDraft, value: event.target.value })} onBlur={() => commitText(true)} onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); commitText(false); } if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur(); } }} />}{eyedropperPreview && <div className="eyedropper-preview" style={{ left: `${eyedropperPreview.x / WIDTH * 100}%`, top: `${eyedropperPreview.y / HEIGHT * 100}%` }}><span className="eyedropper-colour" style={{ background: eyedropperPreview.color }}><Pipette size={15} /></span></div>}{selection.width > 3 && selection.height > 3 && <div className={`selection-box ${selectionMode !== 'rectangle' ? 'freeform' : ''}`} style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">Current selection</span>{selectionMode === 'rectangle' && <><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></>}</div>}{tool === 'layer-lasso' && layerSelectionBounds && <div className="layer-selection-box" style={{ left: `${layerSelectionBounds.x / WIDTH * 100}%`, top: `${layerSelectionBounds.y / HEIGHT * 100}%`, width: `${layerSelectionBounds.width / WIDTH * 100}%`, height: `${layerSelectionBounds.height / HEIGHT * 100}%` }}><span className="transform-label">Selected pixels</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}{tool === 'transform' && transformBounds && <div className="transform-box" style={{ left: `${transformBounds.x / WIDTH * 100}%`, top: `${transformBounds.y / HEIGHT * 100}%`, width: `${transformBounds.width / WIDTH * 100}%`, height: `${transformBounds.height / HEIGHT * 100}%` }}><span className="transform-label">{layers.find((layer) => layer.id === activeLayer)?.name}</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}</div></div>{showBranding && <><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></>}</div>
+        <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={() => endPointer()} onPointerCancel={() => endPointer(true)} /><canvas ref={selectionOverlayRef} width={WIDTH} height={HEIGHT} className="selection-overlay" aria-hidden="true" /><canvas ref={layerSelectionOverlayRef} width={WIDTH} height={HEIGHT} className="layer-selection-overlay" aria-hidden="true" />{textDraft && <textarea ref={textEntryRef} className="text-entry" aria-label="Text to add on a new layer" placeholder="Type here…" spellCheck value={textDraft.value} style={{ left: `${textDraft.x / WIDTH * 100}%`, top: `${textDraft.y / HEIGHT * 100}%`, color: brushColor, fontFamily: (textFonts.find((font) => font.id === textFont) || textFonts[0]).family, fontSize: `${textSize / WIDTH * 100}cqw` }} onPointerDown={(event) => event.stopPropagation()} onChange={(event) => updateTextDraft({ ...textDraft, value: event.target.value })} onBlur={() => commitText(true)} onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); commitText(false); } if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur(); } }} />}{eyedropperPreview && <div className="eyedropper-preview" style={{ left: `${eyedropperPreview.x / WIDTH * 100}%`, top: `${eyedropperPreview.y / HEIGHT * 100}%` }}><span className="eyedropper-colour" style={{ background: eyedropperPreview.color }}><Pipette size={15} /></span></div>}{selection.width > 3 && selection.height > 3 && <div className={`selection-box ${selectionMode !== 'rectangle' ? 'freeform' : ''}`} style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">Current selection</span>{selectionMode === 'rectangle' && <><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></>}</div>}{tool === 'layer-lasso' && layerSelectionBounds && <div className="layer-selection-box" style={{ left: `${layerSelectionBounds.x / WIDTH * 100}%`, top: `${layerSelectionBounds.y / HEIGHT * 100}%`, width: `${layerSelectionBounds.width / WIDTH * 100}%`, height: `${layerSelectionBounds.height / HEIGHT * 100}%` }}><span className="transform-label">Selected pixels</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}{tool === 'transform' && transformBounds && <div className="transform-box" style={{ left: `${transformBounds.x / WIDTH * 100}%`, top: `${transformBounds.y / HEIGHT * 100}%`, width: `${transformBounds.width / WIDTH * 100}%`, height: `${transformBounds.height / HEIGHT * 100}%` }}><span className="transform-label">{layers.find((layer) => layer.id === activeLayer)?.name}</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}</div></div>{showBranding && <><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></>}</div>
       </div>
       <aside className="right-panel">
         <section className="ai-panel agent-bundle-panel">
