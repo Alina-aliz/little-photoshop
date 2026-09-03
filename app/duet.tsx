@@ -431,10 +431,10 @@ export function Duet() {
     if (!overlay || !mask) return;
     const ctx = overlay.getContext('2d')!; ctx.clearRect(0, 0, WIDTH, HEIGHT);
     if (selectionHasMaskRef.current) {
-      // Match common image editors: rectangles use a clean border-only
-      // treatment, while irregular masks also dim everything outside them.
-      // The black-and-white moving edge stays visible on any artwork.
-      if (selectionMode !== 'rectangle') {
+      // Rectangle and lasso selections use a clean border-only treatment.
+      // Brush masks keep the outside dim because their soft, painted shape
+      // otherwise has no clear boundary while it is being built.
+      if (selectionMode === 'brush') {
         ctx.save(); ctx.fillStyle = 'rgba(7, 6, 10, .48)'; ctx.fillRect(0, 0, WIDTH, HEIGHT); ctx.globalCompositeOperation = 'destination-out'; ctx.drawImage(mask, 0, 0); ctx.restore();
       }
 
