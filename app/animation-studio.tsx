@@ -25,14 +25,18 @@ type VideoClip = { id: string; type: 'video'; trackId: string; name: string; sta
 type AudioClip = { id: string; type: 'audio'; trackId: string; name: string; start: number; duration: number; volume: number; url: string };
 type Clip = CelClip | StillClip | VideoClip | AudioClip;
 type ClipDrag = { id: string; mode: 'move' | 'start' | 'end'; clientX: number; start: number; duration: number; sourceOffset: number };
+type AgentTarget = { clipId: string; trackId: string; startFrame: number; endFrame: number };
+type AgentTargetDrag = { mode: 'move' | 'start' | 'end'; pointerId: number; clientX: number; startFrame: number; endFrame: number };
 type FrameEditorResize = { pointerId: number; startY: number; startHeight: number };
 type AgentShapeType = 'line' | 'path' | 'rectangle' | 'circle' | 'polygon';
 type AgentEasing = 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out';
 type AgentPoint = { x: number; y: number };
 type AgentKeyframe = { frame: number; translateX: number; translateY: number; scale: number; rotation: number; opacity: number; easing: AgentEasing };
 type AgentShape = { id: string; type: AgentShapeType; x: number; y: number; width: number; height: number; radius: number; points: AgentPoint[]; closed: boolean; fillColor: string | null; strokeColor: string | null; strokeWidth: number; opacity: number; keyframes: AgentKeyframe[] };
-type AgentClipRecipe = { requestId: string; name: string; durationSeconds: number; requestedCelFps: number; actualCelFps: number; exposure: number; frameCount: number; objects: AgentShape[] };
-type AgentClipRequest = { id: string; startFrame: number; insertAboveTrackId: string | null; insertAboveTrackName: string | null };
+type AgentClipRecipe = { requestId: string; name: string; durationSeconds: number; durationFrames: number; requestedCelFps: number; actualCelFps: number; exposure: number; finalHold: number; frameCount: number; objects: AgentShape[] };
+type AgentCelTiming = { cel: number; startsAtFrame: number; endsAtFrame: number; holdFrames: number };
+type AgentFrameSample = { timelineFrame: number; timeSeconds: number; cel: number; targetImage: string; contextImage?: string };
+type AgentClipRequest = { id: string; target: AgentTarget & { clipName: string; durationFrames: number; durationSeconds: number; celTiming: AgentCelTiming[]; sourceRecipe: AgentClipRecipe | null }; samples: AgentFrameSample[]; insertAboveTrackId: string; insertAboveTrackName: string };
 type AgentClipResult = { trackId: string; clipId: string; name: string; frameCount: number };
 type Props = {
   active: boolean;
@@ -47,9 +51,19 @@ type Props = {
 export type AnimationStudioHandle = {
   exportWorkspace: () => Promise<void>;
   getAgentAnimationState: () => unknown;
+  prepareAgentAnimationEdit: (input: Record<string, unknown>) => unknown;
   insertAgentCelClip: (input: Record<string, unknown>) => unknown;
 };
 function makeCanvas() { const canvas = document.createElement('canvas'); canvas.width = WIDTH; canvas.height = HEIGHT; return canvas; }
+function sampledImage(source: CanvasImageSource) { const canvas = document.createElement('canvas'); canvas.width = 480; canvas.height = 320; canvas.getContext('2d')!.drawImage(source, 0, 0, WIDTH, HEIGHT, 0, 0, canvas.width, canvas.height); return canvas.toDataURL('image/webp', .78); }
+function visualDifference(a: CanvasImageSource | null, b: CanvasImageSource | null) {
+  if (!a || !b) return 1;
+  const canvas = document.createElement('canvas'); canvas.width = 40; canvas.height = 27; const context = canvas.getContext('2d', { willReadFrequently: true })!;
+  context.clearRect(0, 0, canvas.width, canvas.height); context.drawImage(a, 0, 0, WIDTH, HEIGHT, 0, 0, canvas.width, canvas.height); const first = context.getImageData(0, 0, canvas.width, canvas.height).data;
+  context.clearRect(0, 0, canvas.width, canvas.height); context.drawImage(b, 0, 0, WIDTH, HEIGHT, 0, 0, canvas.width, canvas.height); const second = context.getImageData(0, 0, canvas.width, canvas.height).data;
+  let total = 0; for (let index = 0; index < first.length; index += 4) total += Math.abs(first[index] - second[index]) + Math.abs(first[index + 1] - second[index + 1]) + Math.abs(first[index + 2] - second[index + 2]) + Math.abs(first[index + 3] - second[index + 3]);
+  return total / ((first.length / 4) * 4 * 255);
+}
 function clamp(value: number, min: number, max: number) { return Math.max(min, Math.min(max, value)); }
 function getMaxFrameEditorHeight() { return typeof window === 'undefined' ? FRAME_EDITOR_DEFAULT_HEIGHT : Math.max(FRAME_EDITOR_MIN_HEIGHT, Math.min(560, window.innerHeight - 250)); }
 function rgbToHex(r: number, g: number, b: number) { return `#${[r, g, b].map((value) => clamp(Math.round(value), 0, 255).toString(16).padStart(2, '0')).join('')}`; }
@@ -109,17 +123,20 @@ function parseAgentShape(value: unknown, index: number, frameCount: number): Age
   if (!keyed.has(0)) keyed.set(0, { frame: 0, translateX: 0, translateY: 0, scale: 1, rotation: 0, opacity: 1, easing: 'linear' });
   return { id: (typeof value.id === 'string' ? value.id : `shape-${index + 1}`).slice(0, 80), type: shapeType, x, y, width, height, radius, points, closed: Boolean(value.closed), fillColor, strokeColor, strokeWidth: readNumber(value.strokeWidth, 4, 0, 96, `Object ${index + 1} strokeWidth`), opacity: readNumber(value.opacity, 1, 0, 1, `Object ${index + 1} opacity`), keyframes: [...keyed.values()].sort((a, b) => a.frame - b.frame) };
 }
-function parseAgentClipRecipe(input: Record<string, unknown>, projectFps: number): AgentClipRecipe {
+function parseAgentClipRecipe(input: Record<string, unknown>, request: AgentClipRequest, projectFps: number): AgentClipRecipe {
   const requestId = typeof input.requestId === 'string' ? input.requestId.trim() : '';
   if (!requestId) throw new Error('requestId is required. Ask the user to press Send to agent in Animate first.');
-  const durationSeconds = readNumber(input.durationSeconds, 1, .25, 3, 'durationSeconds');
+  const durationFrames = request.target.durationFrames;
+  const durationSeconds = durationFrames / projectFps;
   const requestedCelFps = readNumber(input.celFps, Math.min(8, projectFps), 1, 24, 'celFps');
-  const exposure = clamp(Math.round(projectFps / Math.min(requestedCelFps, projectFps)), 1, 12);
-  const actualCelFps = projectFps / exposure;
-  const frameCount = Math.round(clamp(durationSeconds * actualCelFps, 1, 24));
+  const minimumExposure = Math.max(1, Math.ceil(durationFrames / 48));
+  const exposure = clamp(Math.max(minimumExposure, Math.round(projectFps / Math.min(requestedCelFps, projectFps))), 1, durationFrames);
+  const frameCount = Math.max(1, Math.floor(durationFrames / exposure));
+  const finalHold = Math.max(0, durationFrames - frameCount * exposure);
+  const actualCelFps = frameCount / durationSeconds;
   if (!Array.isArray(input.objects) || !input.objects.length) throw new Error('At least one coloured shape is required.');
   if (input.objects.length > 48) throw new Error('This first version supports up to 48 shapes per clip.');
-  return { requestId, name: safeName(typeof input.name === 'string' ? input.name : 'AI clip'), durationSeconds, requestedCelFps, actualCelFps, exposure, frameCount, objects: input.objects.map((object, index) => parseAgentShape(object, index, frameCount)) };
+  return { requestId, name: safeName(typeof input.name === 'string' ? input.name : 'AI clip'), durationSeconds, durationFrames, requestedCelFps, actualCelFps, exposure, finalHold, frameCount, objects: input.objects.map((object, index) => parseAgentShape(object, index, frameCount)) };
 }
 function shapeCentre(shape: AgentShape) { if (shape.type === 'rectangle' || shape.type === 'circle') return { x: shape.x, y: shape.y }; const xs = shape.points.map((point) => point.x); const ys = shape.points.map((point) => point.y); return { x: (Math.min(...xs) + Math.max(...xs)) / 2, y: (Math.min(...ys) + Math.max(...ys)) / 2 }; }
 function transformAt(shape: AgentShape, frame: number) {
@@ -196,6 +213,8 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
   const smudgeBufferRef = useRef<HTMLCanvasElement | null>(null);
   const eyedropperColor = useRef<string | null>(null);
   const drag = useRef<ClipDrag | null>(null);
+  const agentTargetDrag = useRef<AgentTargetDrag | null>(null);
+  const preparedAgentRequestIds = useRef(new Set<string>());
   const frameEditorResize = useRef<FrameEditorResize | null>(null);
   const initialized = useRef(false);
   const playbackFrame = useRef<number | null>(null);
@@ -226,6 +245,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
   const [frameEditorHeight, setFrameEditorHeight] = useState(FRAME_EDITOR_DEFAULT_HEIGHT);
   const [timelineManuallyCollapsed, setTimelineManuallyCollapsed] = useState(false);
   const [bottomDrawerCollapsed, setBottomDrawerCollapsed] = useState(false);
+  const [agentTarget, setAgentTarget] = useState<AgentTarget>({ clipId: 'clip-main', trackId: 'track-character', startFrame: 0, endFrame: 2 });
   const [agentClipRequest, setAgentClipRequest] = useState<AgentClipRequest | null>(null);
   const [agentClipResult, setAgentClipResult] = useState<AgentClipResult | null>(null);
 
@@ -239,6 +259,8 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
   const timelineFrames = Math.max(MIN_TIMELINE, ...clips.map((clip) => clip.start + clip.duration + fps));
   const seconds = useMemo(() => Array.from({ length: Math.ceil(timelineFrames / fps) + 1 }, (_, index) => index), [fps, timelineFrames]);
   const timelineCollapsed = timelineManuallyCollapsed || frameEditorHeight < FRAME_EDITOR_ONE_TRACK_HEIGHT;
+  const targetClip = clips.find((clip): clip is CelClip => clip.id === agentTarget.clipId && clip.type === 'cel') || null;
+  const agentTargetDurationFrames = targetClip ? Math.max(1, agentTarget.endFrame - agentTarget.startFrame) : 0;
 
   const zoomAt = useCallback((requestedZoom: number, clientX?: number, clientY?: number) => {
     const viewport = stageViewportRef.current;
@@ -312,10 +334,13 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
     clips.forEach((clip) => { if (clip.type !== 'cel') return; clip.frameIds.forEach((frameId) => { const thumbnail = thumbnailRefs.current.get(frameId); const source = frameCanvases.current.get(frameId); if (!thumbnail || !source) return; const thumbCtx = thumbnail.getContext('2d')!; thumbCtx.clearRect(0, 0, thumbnail.width, thumbnail.height); thumbCtx.drawImage(source, 0, 0, WIDTH, HEIGHT, 0, 0, thumbnail.width, thumbnail.height); }); });
   }, [activeClip?.type, clips, drawAt, onionSkin, playhead, playing]);
 
-  const selectClip = (clip: Clip) => { setPlaying(false); setActiveTrackId(clip.trackId); setActiveClipId(clip.id); setPlayhead(clip.start); if (clip.type === 'cel') setActiveFrameId(clip.frameIds[0]); };
-  const selectTrack = (trackId: string) => { setPlaying(false); setActiveTrackId(trackId); setActiveClipId(''); };
+  const selectClip = (clip: Clip) => { setPlaying(false); setActiveTrackId(clip.trackId); setActiveClipId(clip.id); setPlayhead(clip.start); if (clip.type === 'cel') { setActiveFrameId(clip.frameIds[0]); setAgentTarget({ clipId: clip.id, trackId: clip.trackId, startFrame: clip.start, endFrame: Math.min(clip.start + clip.duration, clip.start + fps * 12) }); } else setAgentTarget({ clipId: '', trackId: clip.trackId, startFrame: clip.start, endFrame: clip.start + 1 }); setAgentClipRequest(null); };
+  const selectTrack = (trackId: string) => { setPlaying(false); setActiveTrackId(trackId); setActiveClipId(''); setAgentClipRequest(null); };
   const selectFrame = (frameId: string, index: number) => { if (activeClip?.type !== 'cel') return; setPlaying(false); setActiveFrameId(frameId); setPlayhead(activeClip.start + index * activeClip.exposure); };
   const selectOffset = (offset: number) => { if (!activeFrames.length) return; const index = clamp(activeFrameIndex + offset, 0, activeFrames.length - 1); selectFrame(activeFrames[index], index); };
+  const beginAgentTargetDrag = (event: React.PointerEvent<HTMLButtonElement>, mode: AgentTargetDrag['mode']) => { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); agentTargetDrag.current = { mode, pointerId: event.pointerId, clientX: event.clientX, startFrame: agentTarget.startFrame, endFrame: agentTarget.endFrame }; setPlaying(false); };
+  const moveAgentTargetDrag = (event: React.PointerEvent<HTMLButtonElement>) => { const current = agentTargetDrag.current; if (!current || current.pointerId !== event.pointerId || !targetClip) return; const delta = Math.round((event.clientX - current.clientX) / PX); const clipStart = targetClip.start; const clipEnd = targetClip.start + targetClip.duration; const maxDuration = Math.max(1, fps * 12); let startFrame = current.startFrame; let endFrame = current.endFrame; if (current.mode === 'start') startFrame = clamp(current.startFrame + delta, clipStart, endFrame - 1); else if (current.mode === 'end') endFrame = clamp(current.endFrame + delta, startFrame + 1, Math.min(clipEnd, startFrame + maxDuration)); else { const duration = current.endFrame - current.startFrame; startFrame = clamp(current.startFrame + delta, clipStart, clipEnd - duration); endFrame = startFrame + duration; } setAgentTarget({ clipId: targetClip.id, trackId: targetClip.trackId, startFrame, endFrame }); setAgentClipRequest(null); setPlayhead(startFrame); };
+  const endAgentTargetDrag = (event: React.PointerEvent<HTMLButtonElement>) => { if (agentTargetDrag.current?.pointerId !== event.pointerId) return; agentTargetDrag.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); };
   const pushUndo = () => { const canvas = frameCanvases.current.get(activeFrameId); if (!canvas) return; const stack = undoStacks.current.get(activeFrameId) || []; stack.push(canvas.getContext('2d')!.getImageData(0, 0, WIDTH, HEIGHT)); undoStacks.current.set(activeFrameId, stack.slice(-30)); redoStacks.current.set(activeFrameId, []); };
   const undo = () => { const canvas = frameCanvases.current.get(activeFrameId); const stack = undoStacks.current.get(activeFrameId) || []; const image = stack.pop(); if (!canvas || !image) return; const ctx = canvas.getContext('2d')!; const redoStack = redoStacks.current.get(activeFrameId) || []; redoStack.push(ctx.getImageData(0, 0, WIDTH, HEIGHT)); redoStacks.current.set(activeFrameId, redoStack.slice(-30)); ctx.putImageData(image, 0, 0); render(); };
   const redo = () => { const canvas = frameCanvases.current.get(activeFrameId); const stack = redoStacks.current.get(activeFrameId) || []; const image = stack.pop(); if (!canvas || !image) return; const ctx = canvas.getContext('2d')!; const undoStack = undoStacks.current.get(activeFrameId) || []; undoStack.push(ctx.getImageData(0, 0, WIDTH, HEIGHT)); undoStacks.current.set(activeFrameId, undoStack.slice(-30)); ctx.putImageData(image, 0, 0); render(); };
@@ -352,7 +377,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
   const toggleTrack = (id: string, field: 'visible' | 'locked') => setTracks((items) => items.map((track) => track.id === id ? { ...track, [field]: !track[field] } : track));
   const beginDrag = (event: React.PointerEvent<HTMLElement>, clip: Clip, mode: ClipDrag['mode']) => { if (tracks.find((track) => track.id === clip.trackId)?.locked) return; event.stopPropagation(); const host = event.currentTarget.closest('button'); host?.setPointerCapture(event.pointerId); drag.current = { id: clip.id, mode, clientX: event.clientX, start: clip.start, duration: clip.duration, sourceOffset: clip.type === 'video' ? clip.sourceOffset : 0 }; selectClip(clip); };
   const moveDrag = (event: React.PointerEvent<HTMLButtonElement>) => { const current = drag.current; if (!current) return; const delta = Math.round((event.clientX - current.clientX) / PX); setClips((items) => items.map((clip) => { if (clip.id !== current.id) return clip; const blockers = trackBlockers(items, clip.trackId, clip.id); if (current.mode === 'move') { const preferred = Math.max(0, current.start + delta); const start = delta < 0 ? findBackwardSlot(items, clip.trackId, preferred, clip.duration, clip.id) : findForwardSlot(items, clip.trackId, preferred, clip.duration, clip.id); return { ...clip, start }; } if (current.mode === 'start') { const fixedEnd = current.start + current.duration; const previousEnd = Math.max(0, ...blockers.filter((other) => other.start < current.start).map((other) => other.start + other.duration)); const start = clamp(Math.max(previousEnd, current.start + delta), 0, fixedEnd - 1); const resized = { ...clip, start, duration: fixedEnd - start }; return clip.type === 'video' ? { ...resized, sourceOffset: Math.max(0, current.sourceOffset + (start - current.start) / fps) } : resized; } const nextStart = Math.min(...blockers.filter((other) => other.start >= current.start + current.duration).map((other) => other.start), Number.POSITIVE_INFINITY); return { ...clip, duration: Math.max(1, Math.min(current.duration + delta, nextStart - current.start)) }; })); };
-  const endDrag = (event: React.PointerEvent<HTMLButtonElement>) => { drag.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); };
+  const endDrag = (event: React.PointerEvent<HTMLButtonElement>) => { const moved = drag.current; drag.current = null; if (moved?.id === agentTarget.clipId) { setAgentTarget({ clipId: '', trackId: '', startFrame: 0, endFrame: 1 }); setAgentClipRequest(null); } if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); };
   const beginFrameEditorResize = (event: React.PointerEvent<HTMLButtonElement>) => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); frameEditorResize.current = { pointerId: event.pointerId, startY: event.clientY, startHeight: frameEditorHeight }; };
   const resizeFrameEditor = (event: React.PointerEvent<HTMLButtonElement>) => { const current = frameEditorResize.current; if (!current || current.pointerId !== event.pointerId) return; const nextHeight = current.startHeight + current.startY - event.clientY; setFrameEditorHeight(clamp(nextHeight, FRAME_EDITOR_MIN_HEIGHT, getMaxFrameEditorHeight())); };
   const endFrameEditorResize = (event: React.PointerEvent<HTMLButtonElement>) => { if (frameEditorResize.current?.pointerId !== event.pointerId) return; frameEditorResize.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); };
@@ -471,11 +496,26 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
     exportProject();
     await exportAnimation();
   };
+  const buildAgentSamples = (clip: CelClip, target: AgentTarget) => {
+    const cadence = Math.max(1, Math.floor(fps * .5));
+    const mandatory = new Set<number>([target.startFrame, target.endFrame - 1]);
+    for (let frame = target.startFrame; frame < target.endFrame; frame += cadence) mandatory.add(frame);
+    const changeCandidates = clip.frameIds.flatMap((_, index) => { const frame = Math.max(target.startFrame, clip.start + index * clip.exposure); if (frame >= target.endFrame) return []; const previous = index ? Math.max(target.startFrame, clip.start + (index - 1) * clip.exposure) : frame; return visualDifference(clipSource(clip, frame), clipSource(clip, previous)) >= .035 ? [{ frame, score: visualDifference(clipSource(clip, frame), clipSource(clip, previous)) }] : []; });
+    const selected = new Set(mandatory);
+    changeCandidates.sort((a, b) => b.score - a.score).some(({ frame }) => { if (selected.size >= 32) return true; selected.add(frame); return false; });
+    const frames = [...selected].sort((a, b) => a - b).slice(0, 32);
+    const contextFrames = new Set([frames[0], frames[Math.floor((frames.length - 1) / 2)], frames[frames.length - 1]]);
+    return frames.flatMap((timelineFrame): AgentFrameSample[] => { const source = clipSource(clip, timelineFrame); if (!source) return []; let contextImage: string | undefined; if (contextFrames.has(timelineFrame)) { const composite = makeCanvas(); drawAt(composite.getContext('2d')!, timelineFrame); contextImage = sampledImage(composite); } return [{ timelineFrame, timeSeconds: timelineFrame / fps, cel: clamp(Math.floor((timelineFrame - clip.start) / clip.exposure), 0, clip.frameIds.length - 1) + 1, targetImage: sampledImage(source), contextImage }]; });
+  };
   const armAgentClipRequest = () => {
-    const insertionTrack = selectedTrack?.kind === 'visual' ? selectedTrack : tracks.find((track) => track.kind === 'visual') || null;
-    setPlaying(false);
-    setAgentClipResult(null);
-    setAgentClipRequest({ id: uid('animation-request'), startFrame: playhead, insertAboveTrackId: insertionTrack?.id || null, insertAboveTrackName: insertionTrack?.name || null });
+    const clip = targetClip;
+    if (!clip) { setMediaNotice({ tone: 'error', text: 'Select a cel clip in the timeline before sending an AI target.' }); return; }
+    const startFrame = clamp(agentTarget.startFrame, clip.start, clip.start + clip.duration - 1);
+    const endFrame = clamp(agentTarget.endFrame, startFrame + 1, Math.min(clip.start + clip.duration, startFrame + fps * 12));
+    const normalized = { ...agentTarget, clipId: clip.id, trackId: clip.trackId, startFrame, endFrame };
+    const celTiming = clip.frameIds.flatMap((_, index): AgentCelTiming[] => { const startsAtFrame = Math.max(startFrame, clip.start + index * clip.exposure); const naturalEnd = index === clip.frameIds.length - 1 ? clip.start + clip.duration : clip.start + (index + 1) * clip.exposure; const endsAtFrame = Math.min(endFrame, naturalEnd); return endsAtFrame > startsAtFrame ? [{ cel: index + 1, startsAtFrame, endsAtFrame, holdFrames: endsAtFrame - startsAtFrame }] : []; });
+    const request: AgentClipRequest = { id: uid('animation-request'), target: { ...normalized, clipName: clip.name, durationFrames: endFrame - startFrame, durationSeconds: (endFrame - startFrame) / fps, celTiming, sourceRecipe: clip.agentRecipe || null }, samples: buildAgentSamples(clip, normalized), insertAboveTrackId: clip.trackId, insertAboveTrackName: tracks.find((track) => track.id === clip.trackId)?.name || 'target track' };
+    setPlaying(false); setAgentTarget(normalized); setAgentClipResult(null); setAgentClipRequest(request); setMediaNotice({ tone: 'success', text: `${request.samples.length} sampled frames are ready for the agent.` });
   };
   const getAgentAnimationState = () => ({
     mode: 'animation',
@@ -486,10 +526,12 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
     aiClipRequest: agentClipRequest ? {
       ready: true,
       requestId: agentClipRequest.id,
-      attachments: [],
-      startFrame: agentClipRequest.startFrame,
+      prepared: preparedAgentRequestIds.current.has(agentClipRequest.id),
+      target: agentClipRequest.target,
+      sampledFrames: agentClipRequest.samples.map(({ timelineFrame, timeSeconds, cel, contextImage }) => ({ timelineFrame, timeSeconds, cel, hasCompositeContext: Boolean(contextImage) })),
+      sampling: { method: 'First and last frames, a mandatory sample at least every 0.5 seconds, plus visually changed cels; held and near-identical frames are skipped.', maxFrames: 32, isolatedTargetFrames: true, compositeContextFrames: agentClipRequest.samples.filter((sample) => sample.contextImage).length },
       insertAboveTrack: agentClipRequest.insertAboveTrackId ? { id: agentClipRequest.insertAboveTrackId, name: agentClipRequest.insertAboveTrackName } : null,
-      constraints: { durationSeconds: { min: .25, max: 3 }, celFps: { min: 1, max: 24 }, maxGeneratedCels: 24, maxObjects: 48, canvasCoordinates: { width: WIDTH, height: HEIGHT }, colours: 'Use #RRGGBB or "none" for fillColor and strokeColor.' },
+      constraints: { outputDuration: 'Locked to the selected target range.', durationSeconds: agentClipRequest.target.durationSeconds, durationFrames: agentClipRequest.target.durationFrames, celFps: { min: 1, max: 24 }, maxGeneratedCels: 48, maxTargetSeconds: 12, maxObjects: 48, canvasCoordinates: { width: WIDTH, height: HEIGHT }, colours: 'Use #RRGGBB or "none" for fillColor and strokeColor.' },
       supportedShapes: {
         line: 'Exactly two canvas-coordinate points; strokeColor is required unless a default is acceptable.',
         path: 'Two or more canvas-coordinate points; set closed=true when a filled closed path is wanted.',
@@ -498,18 +540,26 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
         polygon: 'Three or more canvas-coordinate points.',
       },
       motion: 'Each keyframe uses a cel frame index plus optional translateX, translateY, scale, rotation in degrees, opacity 0–1, and easing: linear, ease-in, ease-out, or ease-in-out.',
-      nextStep: 'Use the user\'s chat prompt as creative context, then call insert_ai_cel_clip with this requestId and a constrained coloured-shape recipe.',
+      nextStep: 'Call prepare_animation_edit with this requestId to receive the frozen isolated target frames and composite context frames. Then use the user\'s prompt as creative context and call insert_ai_cel_clip with the same requestId.',
     } : {
       ready: false,
-      attachments: [],
-      userInstruction: 'Tell the user to open Animate and press Send to agent in the AI clip panel. Do not insert a clip until they do.',
+      target: targetClip ? { clipId: targetClip.id, clipName: targetClip.name, startFrame: agentTarget.startFrame, endFrame: agentTarget.endFrame, durationSeconds: (agentTarget.endFrame - agentTarget.startFrame) / fps } : null,
+      userInstruction: 'Tell the user to select a cel clip, adjust the purple AI target range, and press Send sampled frames. Do not insert a clip until they do.',
       lastGeneratedClip: agentClipResult,
     },
   });
+  const prepareAgentAnimationEdit = (input: Record<string, unknown>) => {
+    if (!agentClipRequest) throw new Error('No animation target is ready. Ask the user to select a cel range and press Send sampled frames.');
+    const requestId = typeof input.requestId === 'string' ? input.requestId.trim() : '';
+    if (requestId !== agentClipRequest.id) throw new Error('This animation target is stale. Inspect get_animation_state and use its exact requestId.');
+    preparedAgentRequestIds.current.add(requestId);
+    return { prepared: true, requestId, target: agentClipRequest.target, frames: agentClipRequest.samples, sampling: { guaranteedMaximumGapSeconds: .5, adaptiveVisualChanges: true, maximumReferenceFrames: 32 }, output: { placement: 'A new visual track directly above the target track.', durationFrames: agentClipRequest.target.durationFrames, durationSeconds: agentClipRequest.target.durationSeconds, maximumGeneratedCels: 48, originalClipIsPreserved: true } };
+  };
   const insertAgentCelClip = (input: Record<string, unknown>) => {
     if (!agentClipRequest) throw new Error('No animation request is ready. Ask the user to press Send to agent in Animate first.');
-    const recipe = parseAgentClipRecipe(input, fps);
+    const recipe = parseAgentClipRecipe(input, agentClipRequest, fps);
     if (recipe.requestId !== agentClipRequest.id) throw new Error('This animation request is stale or belongs to a different request. Ask the user to press Send to agent again.');
+    if (!preparedAgentRequestIds.current.has(recipe.requestId)) throw new Error('Call prepare_animation_edit with this requestId before inserting an AI cel clip.');
 
     const trackId = uid('track-ai');
     const clipId = uid('cel-ai');
@@ -522,19 +572,20 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
       return frameId;
     });
     const track: Track = { id: trackId, name: `AI — ${recipe.name}`, kind: 'visual', visible: true, locked: false };
-    const clip: CelClip = { id: clipId, type: 'cel', trackId, name: recipe.name, start: agentClipRequest.startFrame, duration: celDuration(frameIds.length, recipe.exposure), opacity: 100, exposure: recipe.exposure, finalHold: 0, frameIds, agentRecipe: recipe };
+    const clip: CelClip = { id: clipId, type: 'cel', trackId, name: recipe.name, start: agentClipRequest.target.startFrame, duration: recipe.durationFrames, opacity: 100, exposure: recipe.exposure, finalHold: recipe.finalHold, frameIds, agentRecipe: recipe };
     setTracks((items) => { const targetIndex = agentClipRequest.insertAboveTrackId ? items.findIndex((item) => item.id === agentClipRequest.insertAboveTrackId) : -1; if (targetIndex < 0) return [track, ...items]; return [...items.slice(0, targetIndex), track, ...items.slice(targetIndex)]; });
     setClips((items) => [...items, clip]);
     setActiveTrackId(trackId);
     setActiveClipId(clipId);
     setActiveFrameId(frameIds[0]);
-    setPlayhead(agentClipRequest.startFrame);
+    setPlayhead(agentClipRequest.target.startFrame);
     setTimelineManuallyCollapsed(false);
     setBottomDrawerCollapsed(false);
-    setAgentClipRequest(null);
+    preparedAgentRequestIds.current.delete(recipe.requestId); setAgentClipRequest(null);
+    setAgentTarget({ clipId, trackId, startFrame: clip.start, endFrame: clip.start + clip.duration });
     setAgentClipResult({ trackId, clipId, name: recipe.name, frameCount: recipe.frameCount });
     setMediaNotice({ tone: 'success', text: `${recipe.name} was rendered into ${recipe.frameCount} editable cels on a new track.` });
-    return { inserted: true, trackId, clipId, name: recipe.name, startFrame: clip.start, generatedCels: recipe.frameCount, exposure: recipe.exposure, actualCelFps: recipe.actualCelFps, coloursPreserved: true };
+    return { inserted: true, trackId, clipId, name: recipe.name, startFrame: clip.start, endFrame: clip.start + clip.duration, durationFrames: clip.duration, generatedCels: recipe.frameCount, exposure: recipe.exposure, finalHold: recipe.finalHold, actualCelFps: recipe.actualCelFps, originalClipPreserved: true, coloursPreserved: true };
   };
   const removeAgentGeneratedTrack = () => {
     if (!agentClipResult) return;
@@ -544,11 +595,11 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
     const nextClips = clips.filter((clip) => clip.trackId !== agentClipResult.trackId);
     const fallbackTrack = nextTracks.find((track) => track.kind === 'visual') || nextTracks[0] || null;
     const fallbackClip = fallbackTrack ? nextClips.find((clip) => clip.trackId === fallbackTrack.id) || null : null;
-    setTracks(nextTracks); setClips(nextClips); setActiveTrackId(fallbackTrack?.id || ''); setActiveClipId(fallbackClip?.id || ''); if (fallbackClip?.type === 'cel') setActiveFrameId(fallbackClip.frameIds[0]);
+    setTracks(nextTracks); setClips(nextClips); setActiveTrackId(fallbackTrack?.id || ''); setActiveClipId(fallbackClip?.id || ''); if (fallbackClip?.type === 'cel') { setActiveFrameId(fallbackClip.frameIds[0]); setAgentTarget({ clipId: fallbackClip.id, trackId: fallbackClip.trackId, startFrame: fallbackClip.start, endFrame: Math.min(fallbackClip.start + fallbackClip.duration, fallbackClip.start + fps * 12) }); } else setAgentTarget({ clipId: '', trackId: '', startFrame: 0, endFrame: 1 });
     setAgentClipResult(null);
     setMediaNotice({ tone: 'success', text: 'The generated AI track was removed.' });
   };
-  useImperativeHandle(ref, () => ({ exportWorkspace, getAgentAnimationState, insertAgentCelClip }));
+  useImperativeHandle(ref, () => ({ exportWorkspace, getAgentAnimationState, prepareAgentAnimationEdit, insertAgentCelClip }));
 
   useEffect(() => { if (initialized.current) return; initialized.current = true; frameCanvases.current.set('animation-frame-1', makeCanvas()); }, []);
   useEffect(() => { const fitFrameEditor = () => setFrameEditorHeight((height) => clamp(height, FRAME_EDITOR_MIN_HEIGHT, getMaxFrameEditorHeight())); fitFrameEditor(); window.addEventListener('resize', fitFrameEditor); return () => window.removeEventListener('resize', fitFrameEditor); }, []);
@@ -570,14 +621,15 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
         <div className={`animation-bottom-drawer ${bottomDrawerCollapsed ? 'collapsed' : ''}`}>{bottomDrawerCollapsed ? <button className="drawer-expand-button" onClick={() => setBottomDrawerCollapsed(false)} aria-label="Expand playback and frame editor"><ChevronUp />Show playback and frames</button> : <><button type="button" className="frame-editor-resizer" aria-label="Resize playback and frame editor. Drag or use the arrow keys." title="Drag to resize · Double-click to reset" onPointerDown={beginFrameEditorResize} onPointerMove={resizeFrameEditor} onPointerUp={endFrameEditorResize} onPointerCancel={endFrameEditorResize} onKeyDown={resizeFrameEditorWithKeyboard} onDoubleClick={() => setFrameEditorHeight(Math.min(FRAME_EDITOR_DEFAULT_HEIGHT, getMaxFrameEditorHeight()))}><GripHorizontal /></button><div className="playback-bar"><button className="drawer-collapse-button" onClick={() => { setPlaying(false); setBottomDrawerCollapsed(true); }} aria-label="Collapse playback and frame editor"><ChevronDown /></button><button onClick={() => { setPlaying(false); setPlayhead(0); }} aria-label="Timeline start"><SkipBack /></button><button onClick={() => { setPlaying(false); setPlayhead((value) => Math.max(0, value - 1)); }} aria-label="Previous timeline frame"><ChevronLeft /></button><button className="play-button" onClick={() => setPlaying((value) => !value)} aria-label={playing ? 'Pause' : 'Play'}>{playing ? <Pause /> : <Play />}</button><button onClick={() => { setPlaying(false); setPlayhead((value) => Math.min(timelineFrames - 1, value + 1)); }} aria-label="Next timeline frame"><ChevronRight /></button><button onClick={() => { setPlaying(false); setPlayhead(timelineFrames - 1); }} aria-label="Timeline end"><SkipForward /></button><span className="playback-separator" /><label>FPS <input type="number" min={1} max={24} value={fps} onChange={(event) => setFps(clamp(Number(event.target.value) || 1, 1, 24))} /></label><button className={onionSkin ? 'active' : ''} onClick={() => setOnionSkin((value) => !value)}><Ghost />Onion skin</button></div>
         <div className={`hybrid-timeline ${timelineCollapsed ? 'timeline-collapsed' : ''}`}>
           <div className="flipbook-strip"><div className="flipbook-heading"><span><Brush /><strong>{activeClip?.type === 'cel' ? activeClip.name : 'Select a cel clip'}</strong></span>{activeClip?.type === 'cel' && <span><button onClick={() => selectOffset(-1)} disabled={activeFrameIndex === 0}><ChevronLeft /></button><button onClick={() => addFrame(true)}><Copy />Duplicate cel</button><button onClick={deleteFrame}><Trash2 /></button><button onClick={() => addFrame(false)}><Plus />New cel</button></span>}</div>{activeClip?.type === 'cel' ? <div className="cel-track">{activeClip.frameIds.map((frameId, index) => <button key={frameId} className={frameId === activeFrameId ? 'active' : ''} onClick={() => selectFrame(frameId, index)}><canvas ref={(node) => { if (node) thumbnailRefs.current.set(frameId, node); else thumbnailRefs.current.delete(frameId); }} width={96} height={64} /><span>{index + 1}</span></button>)}</div> : <p>Select a cel clip below to draw its individual frames.</p>}</div>
-          <div className={`sequence-timeline ${timelineCollapsed ? 'collapsed' : ''}`}><div className="sequence-toolbar"><span><button className="timeline-collapse-button" onClick={toggleTimeline} aria-label={timelineCollapsed ? 'Expand timeline' : 'Collapse timeline'} aria-expanded={!timelineCollapsed}>{timelineCollapsed ? <ChevronUp /> : <ChevronDown />}</button><Film /><strong>Timeline</strong><small>{(timelineFrames / fps).toFixed(1)}s</small></span><span><button onClick={addVisualTrack} title="Add visual track"><Plus />Track</button><button onClick={deleteTrack} disabled={!selectedTrack} title="Delete selected track"><Trash2 />Track</button><button onClick={() => moveTrack(-1)} disabled={selectedTrackIndex <= 0} title="Move selected track up" aria-label="Move selected track up"><ChevronUp /></button><button onClick={() => moveTrack(1)} disabled={selectedTrackIndex < 0 || selectedTrackIndex >= tracks.length - 1} title="Move selected track down" aria-label="Move selected track down"><ChevronDown /></button><button onClick={addCelClip} disabled={!selectedTrack || selectedTrack.kind !== 'visual' || selectedTrack.locked} title={!selectedTrack ? 'Select a visual track first' : selectedTrack.kind !== 'visual' ? 'Cel clips need a visual track' : selectedTrack.locked ? 'Unlock this track to add a cel clip' : `Add cel clip to ${selectedTrack.name}`}><Plus />Cel clip</button><button onClick={() => videoInputRef.current?.click()} disabled={!selectedTrack || selectedTrack.kind !== 'visual' || selectedTrack.locked} title={!selectedTrack ? 'Select a visual track first' : selectedTrack.kind !== 'visual' ? 'Videos need a visual track' : selectedTrack.locked ? 'Unlock this track to import video' : `Import MOV or WebM to ${selectedTrack.name}`}><Video />Video</button><button onClick={() => audioInputRef.current?.click()}><Music2 />Audio</button><button onClick={splitClip} disabled={!activeClip || activeClip.type === 'audio' || (activeClip.type === 'cel' && activeClip.frameIds.length < 2)}><Scissors />Split</button><button onClick={duplicateClip} disabled={!activeClip}><Copy /></button><button onClick={deleteClip} disabled={!activeClip} title="Delete selected clip"><Trash2 /></button></span></div><div className="sequence-scroll"><div className="sequence-grid" style={{ width: timelineFrames * PX + 132 }}><div className="time-ruler" style={{ marginLeft: 132, width: timelineFrames * PX }}>{seconds.map((second) => <span key={second} style={{ left: second * fps * PX }}>{second}s</span>)}</div>{tracks.map((track) => <div className={`track-row ${track.id === activeTrackId ? 'active' : ''}`} key={track.id}><div className="track-label"><button onClick={() => toggleTrack(track.id, 'visible')} aria-label={track.visible ? `Hide ${track.name}` : `Show ${track.name}`}>{track.visible ? <Eye /> : <EyeOff />}</button><button onClick={() => toggleTrack(track.id, 'locked')} aria-label={track.locked ? `Unlock ${track.name}` : `Lock ${track.name}`}>{track.locked ? <Lock /> : <Unlock />}</button><button className="track-name" onClick={() => selectTrack(track.id)} aria-pressed={track.id === activeTrackId} title={`Select ${track.name} track`}>{track.kind === 'audio' ? <Music2 /> : <Film />}<span>{track.name}</span></button></div><div className="track-lane" style={{ width: timelineFrames * PX }} onPointerDown={(event) => setPlayheadFromLane(event, track.id)}>{clips.filter((clip) => clip.trackId === track.id).map((clip) => <button key={clip.id} className={`sequence-clip ${clip.type} ${clip.id === activeClipId ? 'active' : ''}`} style={{ left: clip.start * PX, width: Math.max(clip.duration * PX, 20) }} onPointerDown={(event) => beginDrag(event, clip, 'move')} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={endDrag} title={clip.type === 'cel' ? `${clip.frameIds.length} cels · length follows cel timing` : clip.type === 'video' ? `${clip.name} · MOV/WebM video` : undefined}>{clip.type !== 'cel' && <i className="clip-handle start" onPointerDown={(event) => beginDrag(event, clip, 'start')} />}<span>{clip.type === 'audio' ? <Music2 /> : clip.type === 'video' ? <Video /> : clip.type === 'cel' ? <Brush /> : <ImagePlus />}{clip.name}</span>{clip.type === 'audio' && <b className="audio-wave">▂▅▃▇▄▆▂▅▃▆▂▇</b>}{clip.type !== 'cel' && <i className="clip-handle end" onPointerDown={(event) => beginDrag(event, clip, 'end')} />}</button>)}</div></div>)}<i className="timeline-playhead" style={{ left: 132 + playhead * PX }} /></div></div></div>
+          <div className={`sequence-timeline ${timelineCollapsed ? 'collapsed' : ''}`}><div className="sequence-toolbar"><span><button className="timeline-collapse-button" onClick={toggleTimeline} aria-label={timelineCollapsed ? 'Expand timeline' : 'Collapse timeline'} aria-expanded={!timelineCollapsed}>{timelineCollapsed ? <ChevronUp /> : <ChevronDown />}</button><Film /><strong>Timeline</strong><small>{(timelineFrames / fps).toFixed(1)}s</small></span><span><button onClick={addVisualTrack} title="Add visual track"><Plus />Track</button><button onClick={deleteTrack} disabled={!selectedTrack} title="Delete selected track"><Trash2 />Track</button><button onClick={() => moveTrack(-1)} disabled={selectedTrackIndex <= 0} title="Move selected track up" aria-label="Move selected track up"><ChevronUp /></button><button onClick={() => moveTrack(1)} disabled={selectedTrackIndex < 0 || selectedTrackIndex >= tracks.length - 1} title="Move selected track down" aria-label="Move selected track down"><ChevronDown /></button><button onClick={addCelClip} disabled={!selectedTrack || selectedTrack.kind !== 'visual' || selectedTrack.locked} title={!selectedTrack ? 'Select a visual track first' : selectedTrack.kind !== 'visual' ? 'Cel clips need a visual track' : selectedTrack.locked ? 'Unlock this track to add a cel clip' : `Add cel clip to ${selectedTrack.name}`}><Plus />Cel clip</button><button onClick={() => videoInputRef.current?.click()} disabled={!selectedTrack || selectedTrack.kind !== 'visual' || selectedTrack.locked} title={!selectedTrack ? 'Select a visual track first' : selectedTrack.kind !== 'visual' ? 'Videos need a visual track' : selectedTrack.locked ? 'Unlock this track to import video' : `Import MOV or WebM to ${selectedTrack.name}`}><Video />Video</button><button onClick={() => audioInputRef.current?.click()}><Music2 />Audio</button><button onClick={splitClip} disabled={!activeClip || activeClip.type === 'audio' || (activeClip.type === 'cel' && activeClip.frameIds.length < 2)}><Scissors />Split</button><button onClick={duplicateClip} disabled={!activeClip}><Copy /></button><button onClick={deleteClip} disabled={!activeClip} title="Delete selected clip"><Trash2 /></button></span></div><div className="sequence-scroll"><div className="sequence-grid" style={{ width: timelineFrames * PX + 132 }}><div className="time-ruler" style={{ marginLeft: 132, width: timelineFrames * PX }}>{seconds.map((second) => <span key={second} style={{ left: second * fps * PX }}>{second}s</span>)}</div>{tracks.map((track) => <div className={`track-row ${track.id === activeTrackId ? 'active' : ''}`} key={track.id}><div className="track-label"><button onClick={() => toggleTrack(track.id, 'visible')} aria-label={track.visible ? `Hide ${track.name}` : `Show ${track.name}`}>{track.visible ? <Eye /> : <EyeOff />}</button><button onClick={() => toggleTrack(track.id, 'locked')} aria-label={track.locked ? `Unlock ${track.name}` : `Lock ${track.name}`}>{track.locked ? <Lock /> : <Unlock />}</button><button className="track-name" onClick={() => selectTrack(track.id)} aria-pressed={track.id === activeTrackId} title={`Select ${track.name} track`}>{track.kind === 'audio' ? <Music2 /> : <Film />}<span>{track.name}</span></button></div><div className="track-lane" style={{ width: timelineFrames * PX }} onPointerDown={(event) => setPlayheadFromLane(event, track.id)}>{clips.filter((clip) => clip.trackId === track.id).map((clip) => <button key={clip.id} className={`sequence-clip ${clip.type} ${clip.id === activeClipId ? 'active' : ''}`} style={{ left: clip.start * PX, width: Math.max(clip.duration * PX, 20) }} onPointerDown={(event) => beginDrag(event, clip, 'move')} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={endDrag} title={clip.type === 'cel' ? `${clip.frameIds.length} cels · length follows cel timing` : clip.type === 'video' ? `${clip.name} · MOV/WebM video` : undefined}>{clip.type !== 'cel' && <i className="clip-handle start" onPointerDown={(event) => beginDrag(event, clip, 'start')} />}<span>{clip.type === 'audio' ? <Music2 /> : clip.type === 'video' ? <Video /> : clip.type === 'cel' ? <Brush /> : <ImagePlus />}{clip.name}</span>{clip.type === 'audio' && <b className="audio-wave">▂▅▃▇▄▆▂▅▃▆▂▇</b>}{clip.type !== 'cel' && <i className="clip-handle end" onPointerDown={(event) => beginDrag(event, clip, 'end')} />}</button>)}{track.id === agentTarget.trackId && targetClip && <div className="agent-target-range" style={{ left: agentTarget.startFrame * PX, width: Math.max((agentTarget.endFrame - agentTarget.startFrame) * PX, 18) }}><button className="agent-target-handle start" onPointerDown={(event) => beginAgentTargetDrag(event, 'start')} onPointerMove={moveAgentTargetDrag} onPointerUp={endAgentTargetDrag} onPointerCancel={endAgentTargetDrag} aria-label="Adjust AI target start" /><button className="agent-target-body" onPointerDown={(event) => beginAgentTargetDrag(event, 'move')} onPointerMove={moveAgentTargetDrag} onPointerUp={endAgentTargetDrag} onPointerCancel={endAgentTargetDrag} aria-label="Move AI target range"><span>AI target</span></button><button className="agent-target-handle end" onPointerDown={(event) => beginAgentTargetDrag(event, 'end')} onPointerMove={moveAgentTargetDrag} onPointerUp={endAgentTargetDrag} onPointerCancel={endAgentTargetDrag} aria-label="Adjust AI target end" /></div>}</div></div>)}<i className="timeline-playhead" style={{ left: 132 + playhead * PX }} /></div></div></div>
         </div></>}</div>
       </div>
       <aside className="animation-panel">
         <section className="animation-ai-panel">
           <div className="animation-ai-heading"><span><Sparkles /><strong>AI clip</strong></span><small>SHAPES + MOTION</small></div>
-          {!agentClipRequest && !agentClipResult && <><p>Create a short cel clip from coloured lines, paths and shapes. No images are attached in this first version.</p><Button size="sm" className="animation-ai-send" onClick={armAgentClipRequest}><Send />Send to agent</Button></>}
-          {agentClipRequest && <output className="animation-ai-ready"><button onClick={() => setAgentClipRequest(null)} aria-label="Cancel AI clip request" title="Cancel request"><X /></button><strong>Ready for your prompt</strong><span>Now ask your agent to generate a short clip. This request contains no images.</span><small>Starts at frame {agentClipRequest.startFrame + 1}{agentClipRequest.insertAboveTrackName ? ` · above ${agentClipRequest.insertAboveTrackName}` : ''}</small></output>}
+          {targetClip ? <div className="animation-ai-target"><strong>{targetClip.name}</strong><span>Frames {agentTarget.startFrame + 1}–{agentTarget.endFrame} · {(agentTargetDurationFrames / fps).toFixed(2)}s</span><small>Drag the purple range and handles in the timeline. Maximum 12 seconds.</small></div> : <p>Select a cel clip in the timeline to create an AI target range.</p>}
+          {!agentClipRequest && !agentClipResult && targetClip && <><p>DUET will sample changed cels plus a frame at least every 0.5 seconds. Your original clip stays untouched.</p><Button size="sm" className="animation-ai-send targeted" onClick={armAgentClipRequest}><Send />Send sampled frames</Button></>}
+          {agentClipRequest && <output className="animation-ai-ready"><button onClick={() => setAgentClipRequest(null)} aria-label="Cancel AI clip request" title="Cancel request"><X /></button><strong>{agentClipRequest.samples.length} sampled frames ready</strong><span>Ask your agent for a vector animation. It can inspect isolated target frames plus {agentClipRequest.samples.filter((sample) => sample.contextImage).length} composite context frames.</span><small>{agentClipRequest.target.durationFrames} frames · output goes above {agentClipRequest.insertAboveTrackName}</small></output>}
           {agentClipResult && <output className="animation-ai-result"><strong><Sparkles />{agentClipResult.name} inserted</strong><span>{agentClipResult.frameCount} editable cels on a new track.</span><div><button onClick={removeAgentGeneratedTrack}><Undo2 />Undo insert</button><button onClick={armAgentClipRequest}><Plus />New request</button></div></output>}
         </section>
         {mediaNotice && <div className={`animation-media-notice ${mediaNotice.tone}`} role="status">{mediaNotice.text}</div>}
