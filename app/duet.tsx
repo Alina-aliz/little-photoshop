@@ -19,7 +19,25 @@ type TextDraft = { x: number; y: number; value: string };
 type Layer = { id: string; name: string; visible: boolean; opacity: number; blend: GlobalCompositeOperation; swatch: string; ai?: boolean };
 type Selection = { x: number; y: number; width: number; height: number };
 type Activity = { id: number; title: string; detail: string; time: string };
-type PendingEdit = { id: string; prompt: string; source: Selection; selection: Selection; mask: ImageData; createdAt: number };
+type AgentBundleStatus = 'draft' | 'sent';
+type AgentSelectionItem = {
+  id: string;
+  name: string;
+  drawingId: string;
+  layerId: string;
+  layerName: string;
+  source: Selection;
+  selection: Selection;
+  mask: ImageData;
+  compositeCrop: string;
+  activeLayerCrop: string;
+  maskDataUrl: string;
+  contextImage: string;
+  previewDataUrl: string;
+  createdAt: number;
+};
+type AgentBundleSnapshot = { items: AgentSelectionItem[]; targetId: string | null; status: AgentBundleStatus; bundleId: string | null; sentAt: number | null };
+type PendingEdit = { id: string; bundleId: string; drawingId: string; prompt: string; source: Selection; selection: Selection; mask: ImageData; contextCount: number; createdAt: number };
 type WebMCPTool = { name: string; title?: string; description: string; inputSchema?: Record<string, unknown>; execute: (input: Record<string, unknown>, options?: ToolExecutionOptions) => Promise<unknown> | unknown };
 type ToolExecutionOptions = { signal: AbortSignal };
 type SavedProjectLayer = Omit<Layer, 'blend'> & { blend: string; pixels: string };
@@ -42,6 +60,7 @@ type DrawingState = {
   zoom: number;
   viewport: { scrollLeft: number; scrollTop: number };
   chrome: { leftSidebarOpen: boolean; rightSidebarOpen: boolean; showBranding: boolean };
+  agentBundle: AgentBundleSnapshot;
   activities: Activity[];
   undo: HistoryEntry[];
   redo: HistoryEntry[];
@@ -148,7 +167,7 @@ function contentBounds(canvas: HTMLCanvasElement): Selection | null {
 }
 const agentEditPolicy = {
   requirement: 'For every requested document edit, use this page\'s WebMCP tools. Do not use browser clicks, pointer drags, keyboard shortcuts, or the visible canvas controls as an alternative editing route.',
-  whenBlocked: 'If preparing, sending, or generating the selected image pixels is blocked by a privacy policy, missing permission, or unavailable capability, do not modify the document in any way. State the exact blocker and either request the needed permission or tell the user the edit cannot continue.',
+  whenBlocked: 'If preparing, sending, or generating the frozen edit target and context pixels is blocked by a privacy policy, missing permission, or unavailable capability, do not modify the document in any way. State the exact blocker and either request the needed permission or tell the user the edit cannot continue.',
   forbiddenFallbacks: ['manual brush or eraser strokes', 'local canvas edits', 'creating or changing layers as a substitute', 'a different visual edit than the requested one'],
 };
 function downloadFile(blob: Blob, name: string) {
@@ -246,7 +265,13 @@ export function Duet() {
   const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
   const [editingLayerName, setEditingLayerName] = useState('');
   const [webMcp, setWebMcp] = useState<'ready' | 'fallback'>('fallback');
-  const [agentSendState, setAgentSendState] = useState<'idle' | 'sent'>('idle');
+  const [agentSelections, setAgentSelections] = useState<AgentSelectionItem[]>([]);
+  const [agentTargetId, setAgentTargetId] = useState<string | null>(null);
+  const [agentBundleStatus, setAgentBundleStatus] = useState<AgentBundleStatus>('draft');
+  const [agentBundleId, setAgentBundleId] = useState<string | null>(null);
+  const [agentBundleSentAt, setAgentBundleSentAt] = useState<number | null>(null);
+  const [draggingAgentItemId, setDraggingAgentItemId] = useState<string | null>(null);
+  const [agentDropZone, setAgentDropZone] = useState<string | null>(null);
   const [documentName, setDocumentName] = useState('Untitled portrait');
   const [editingDocumentName, setEditingDocumentName] = useState(false);
   const [documentNameDraft, setDocumentNameDraft] = useState('Untitled portrait');
@@ -265,7 +290,6 @@ export function Duet() {
   ]);
   const changeTool = useCallback((next: Tool) => {
     setTool(next);
-    setAgentSendState('idle');
     if (next !== 'smudge') smudgeBufferRef.current = null;
     if (next !== 'eyedropper') { eyedropperColor.current = null; setEyedropperPreview(null); }
     if (next !== 'select') {
@@ -459,16 +483,16 @@ export function Duet() {
   }, [redrawLayerSelectionOverlay, render]);
   const clearSelection = useCallback(() => {
     const mask = selectionMaskRef.current; if (mask) mask.getContext('2d')!.clearRect(0, 0, WIDTH, HEIGHT);
-    lassoPoints.current = []; setSelection({ x: 0, y: 0, width: 0, height: 0 }); setAgentSendState('idle'); redrawSelectionOverlay();
+    lassoPoints.current = []; setSelection({ x: 0, y: 0, width: 0, height: 0 }); redrawSelectionOverlay();
   }, [redrawSelectionOverlay]);
   const applyRectangleSelection = useCallback((rect: Selection) => {
     const mask = selectionMaskRef.current; if (!mask) return;
     const safe = safeSelection(rect); const ctx = mask.getContext('2d')!; ctx.clearRect(0, 0, WIDTH, HEIGHT); ctx.fillStyle = '#fff'; ctx.fillRect(safe.x, safe.y, safe.width, safe.height);
-    setSelection(safe); setAgentSendState('idle'); redrawSelectionOverlay();
+    setSelection(safe); redrawSelectionOverlay();
   }, [redrawSelectionOverlay]);
   const updateSelectionFromMask = useCallback(() => {
     const mask = selectionMaskRef.current; const bounds = mask ? contentBounds(mask) : null;
-    const next = bounds || { x: 0, y: 0, width: 0, height: 0 }; setSelection(next); setAgentSendState('idle'); redrawSelectionOverlay(); return next;
+    const next = bounds || { x: 0, y: 0, width: 0, height: 0 }; setSelection(next); redrawSelectionOverlay(); return next;
   }, [redrawSelectionOverlay]);
   const paintSelectionStroke = useCallback((from: { x: number; y: number }, to: { x: number; y: number }) => {
     const mask = selectionMaskRef.current; if (!mask) return;
@@ -476,7 +500,7 @@ export function Duet() {
     ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke(); ctx.beginPath(); ctx.arc(to.x, to.y, selectionBrushSize / 2, 0, Math.PI * 2); ctx.fill(); ctx.restore();
     const radius = selectionBrushSize / 2; const strokeLeft = Math.max(0, Math.min(from.x, to.x) - radius); const strokeTop = Math.max(0, Math.min(from.y, to.y) - radius); const strokeRight = Math.min(WIDTH, Math.max(from.x, to.x) + radius); const strokeBottom = Math.min(HEIGHT, Math.max(from.y, to.y) + radius);
     setSelection((current) => current.width > 0 && current.height > 0 ? { x: Math.min(current.x, strokeLeft), y: Math.min(current.y, strokeTop), width: Math.max(current.x + current.width, strokeRight) - Math.min(current.x, strokeLeft), height: Math.max(current.y + current.height, strokeBottom) - Math.min(current.y, strokeTop) } : { x: strokeLeft, y: strokeTop, width: strokeRight - strokeLeft, height: strokeBottom - strokeTop });
-    setAgentSendState('idle'); redrawSelectionOverlay();
+    redrawSelectionOverlay();
   }, [redrawSelectionOverlay, selectionBrushSize]);
   const finishLassoSelection = useCallback(() => {
     const mask = selectionMaskRef.current; const points = lassoPoints.current; if (!mask || points.length < 3) { clearSelection(); return { x: 0, y: 0, width: 0, height: 0 }; }
@@ -564,9 +588,10 @@ export function Duet() {
       snapshot: captureLayerSnapshot(layers, activeLayer), selection: { ...selection }, selectionMask: mask.getContext('2d')!.getImageData(0, 0, WIDTH, HEIGHT), selectionMode, selectionBrushSize, layerSelection,
       tool, brushSize, brushOpacity, brushColor, effectStrength, textFont, textSize, zoom,
       viewport: { scrollLeft: viewport?.scrollLeft || 0, scrollTop: viewport?.scrollTop || 0 }, chrome: { leftSidebarOpen, rightSidebarOpen, showBranding },
+      agentBundle: { items: agentSelections.map((item) => ({ ...item, source: { ...item.source }, selection: { ...item.selection } })), targetId: agentTargetId, status: agentBundleStatus, bundleId: agentBundleId, sentAt: agentBundleSentAt },
       activities: activities.map((activity) => ({ ...activity })), undo: [...undoStack.current], redo: [...redoStack.current],
     };
-  }, [activeLayer, activities, brushColor, brushOpacity, brushSize, captureLayerSnapshot, effectStrength, layers, leftSidebarOpen, rightSidebarOpen, selection, selectionBrushSize, selectionMode, showBranding, textFont, textSize, tool, zoom]);
+  }, [activeLayer, activities, agentBundleId, agentBundleSentAt, agentBundleStatus, agentSelections, agentTargetId, brushColor, brushOpacity, brushSize, captureLayerSnapshot, effectStrength, layers, leftSidebarOpen, rightSidebarOpen, selection, selectionBrushSize, selectionMode, showBranding, textFont, textSize, tool, zoom]);
   const restoreDrawingState = useCallback((state: DrawingState) => {
     restoreLayerSnapshot(state.snapshot); clearLayerSelection(); changeTool(state.tool); setBrushSize(state.brushSize); setBrushOpacity(state.brushOpacity); setColor(state.brushColor); setEffectStrength(state.effectStrength); setTextFont(state.textFont); setTextSize(state.textSize);
     setSelectionMode(state.selectionMode); setSelectionBrushSize(state.selectionBrushSize); setSelection({ ...state.selection });
@@ -577,7 +602,9 @@ export function Duet() {
       setLayerSelectionBounds({ ...state.layerSelection.bounds });
     }
     const nextZoom = clamp(state.zoom, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom); setLeftSidebarOpen(state.chrome.leftSidebarOpen); setRightSidebarOpen(state.chrome.rightSidebarOpen); setShowBranding(state.chrome.showBranding);
-    setActivities(state.activities.map((activity) => ({ ...activity }))); undoStack.current = [...state.undo]; redoStack.current = [...state.redo]; pendingEdits.current.clear(); setAgentSendState('idle'); setTextDraft(null);
+    setActivities(state.activities.map((activity) => ({ ...activity }))); undoStack.current = [...state.undo]; redoStack.current = [...state.redo]; pendingEdits.current.clear();
+    setAgentSelections(state.agentBundle.items.map((item) => ({ ...item, source: { ...item.source }, selection: { ...item.selection } })));
+    setAgentTargetId(state.agentBundle.targetId); setAgentBundleStatus(state.agentBundle.status); setAgentBundleId(state.agentBundle.bundleId); setAgentBundleSentAt(state.agentBundle.sentAt); setDraggingAgentItemId(null); setAgentDropZone(null); setTextDraft(null);
     renderLayerList(state.snapshot.layers);
     requestAnimationFrame(() => { redrawSelectionOverlay(); redrawLayerSelectionOverlay(); renderLayerList(state.snapshot.layers); requestAnimationFrame(() => { const viewport = viewportRef.current; if (viewport) { viewport.scrollLeft = state.viewport.scrollLeft; viewport.scrollTop = state.viewport.scrollTop; } }); });
   }, [changeTool, clearLayerSelection, redrawLayerSelectionOverlay, redrawSelectionOverlay, renderLayerList, restoreLayerSnapshot, setColor]);
@@ -587,7 +614,7 @@ export function Duet() {
     const layerId = `layer-${Date.now()}-${Math.random().toString(16).slice(2)}`; layerCanvases.current = new Map([[layerId, makeCanvas()]]);
     setLayers([{ id: layerId, name: 'Paint layer', visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#ffffff,#d5d1e8)' }]); setActiveLayer(layerId);
     setCurrentDrawingId(id); setDocumentName(name); setDocumentNameDraft(name); setDocumentMenuOpen(false); clearSelection(); clearLayerSelection(); changeTool('brush'); setTextDraft(null);
-    const defaultZoom = 82; zoomRef.current = defaultZoom; setZoom(defaultZoom); undoStack.current = []; redoStack.current = []; pendingEdits.current.clear(); setActivities([{ id: Date.now(), title: 'New drawing created', detail: name, time: 'now' }]);
+    const defaultZoom = 82; zoomRef.current = defaultZoom; setZoom(defaultZoom); undoStack.current = []; redoStack.current = []; pendingEdits.current.clear(); setAgentSelections([]); setAgentTargetId(null); setAgentBundleStatus('draft'); setAgentBundleId(null); setAgentBundleSentAt(null); setActivities([{ id: Date.now(), title: 'New drawing created', detail: name, time: 'now' }]);
     requestAnimationFrame(() => { render(); const viewport = viewportRef.current; if (viewport) { viewport.scrollLeft = 0; viewport.scrollTop = 0; } });
   }, [captureDrawingState, changeTool, clearLayerSelection, clearSelection, currentDrawingId, documentName, render, workspaceDrawings.length]);
   const switchDrawing = useCallback((drawingId: string) => {
@@ -650,28 +677,13 @@ export function Duet() {
     setEyedropperPreview({ x: point.x, y: point.y, color });
   }, [readCanvasColor]);
 
-  const prepareAiEdit = useCallback((editPrompt = '') => {
-    if (!hasUsableSelection(tool, selection)) {
-      return {
-        ready: false,
-        code: 'selection_required',
-        message: 'A DUET region must be selected before the agent can read or edit canvas pixels.',
-        userInstruction: 'Choose the Region select (arrow) tool, drag over the area to edit, then ask the agent to try again.',
-        agentPolicy: agentEditPolicy,
-      };
-    }
-    const cleanPrompt = editPrompt.trim();
-    const target = selection;
+  const captureAgentSelection = useCallback((): AgentSelectionItem | null => {
+    if (!hasUsableSelection(tool, selection)) return null;
+    const target = { ...selection };
     const padding = Math.min(96, Math.max(36, Math.round(Math.min(target.width, target.height) * .18)));
-    const source: Selection = {
-      x: Math.max(0, Math.floor(target.x - padding)),
-      y: Math.max(0, Math.floor(target.y - padding)),
-      width: 0,
-      height: 0,
-    };
+    const source: Selection = { x: Math.max(0, Math.floor(target.x - padding)), y: Math.max(0, Math.floor(target.y - padding)), width: 0, height: 0 };
     source.width = Math.min(WIDTH - source.x, Math.ceil(target.x + target.width + padding) - source.x);
     source.height = Math.min(HEIGHT - source.y, Math.ceil(target.y + target.height + padding) - source.y);
-
     const crop = (input: HTMLCanvasElement, mimeType: 'image/png' | 'image/jpeg', quality?: number) => {
       const output = document.createElement('canvas'); output.width = source.width; output.height = source.height;
       output.getContext('2d')!.drawImage(input, source.x, source.y, source.width, source.height, 0, 0, source.width, source.height);
@@ -682,31 +694,132 @@ export function Duet() {
     if (selectionMask) selectionCrop.getContext('2d')!.drawImage(selectionMask, source.x, source.y, source.width, source.height, 0, 0, source.width, source.height);
     else { const fallback = selectionCrop.getContext('2d')!; fallback.fillStyle = '#fff'; fallback.fillRect(target.x - source.x, target.y - source.y, target.width, target.height); }
     const mask = document.createElement('canvas'); mask.width = source.width; mask.height = source.height;
-    const maskCtx = mask.getContext('2d')!; maskCtx.fillStyle = '#000'; maskCtx.fillRect(0, 0, mask.width, mask.height);
-    maskCtx.drawImage(selectionCrop, 0, 0);
-    const active = layerCanvases.current.get(activeLayer) || makeCanvas();
+    const maskCtx = mask.getContext('2d')!; maskCtx.fillStyle = '#000'; maskCtx.fillRect(0, 0, mask.width, mask.height); maskCtx.drawImage(selectionCrop, 0, 0);
+    const composite = compositeCanvas();
+    const context = document.createElement('canvas'); context.width = source.width; context.height = source.height;
+    const contextCtx = context.getContext('2d')!; contextCtx.drawImage(composite, source.x, source.y, source.width, source.height, 0, 0, source.width, source.height); contextCtx.globalCompositeOperation = 'destination-in'; contextCtx.drawImage(selectionCrop, 0, 0);
+    const preview = document.createElement('canvas'); preview.width = 144; preview.height = 92;
+    const previewScale = Math.min(preview.width / source.width, preview.height / source.height);
+    const previewWidth = source.width * previewScale; const previewHeight = source.height * previewScale;
+    preview.getContext('2d')!.drawImage(context, (preview.width - previewWidth) / 2, (preview.height - previewHeight) / 2, previewWidth, previewHeight);
+    const layerName = layers.find((layer) => layer.id === activeLayer)?.name || 'Active layer';
+    return {
+      id: `selection-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+      name: `Region ${agentSelections.length + 1}`,
+      drawingId: currentDrawingId,
+      layerId: activeLayer,
+      layerName,
+      source,
+      selection: target,
+      mask: selectionCrop.getContext('2d')!.getImageData(0, 0, source.width, source.height),
+      compositeCrop: crop(composite, 'image/jpeg', .9),
+      activeLayerCrop: crop(layerCanvases.current.get(activeLayer) || makeCanvas(), 'image/png'),
+      maskDataUrl: mask.toDataURL('image/png'),
+      contextImage: context.toDataURL('image/png'),
+      previewDataUrl: preview.toDataURL('image/png'),
+      createdAt: Date.now(),
+    };
+  }, [activeLayer, agentSelections.length, compositeCanvas, currentDrawingId, layers, selection, tool]);
+
+  const markAgentBundleDraft = useCallback(() => {
+    setAgentBundleStatus('draft'); setAgentBundleId(null); setAgentBundleSentAt(null); pendingEdits.current.clear();
+  }, []);
+  const addSelectionToAgentBundle = useCallback(() => {
+    if (agentBundleStatus === 'sent') return;
+    if (agentSelections.length >= 12) { addActivity('Agent bundle is full', 'Remove a region before adding another'); return; }
+    const item = captureAgentSelection(); if (!item) return;
+    setAgentSelections((items) => [...items, item]);
+    if (!agentTargetId) setAgentTargetId(item.id);
+    markAgentBundleDraft(); clearSelection();
+    addActivity(agentTargetId ? 'Context region added' : 'Edit target added', `${Math.round(item.selection.width)} × ${Math.round(item.selection.height)} px`);
+  }, [addActivity, agentBundleStatus, agentSelections.length, agentTargetId, captureAgentSelection, clearSelection, markAgentBundleDraft]);
+  const removeAgentSelection = useCallback((itemId: string) => {
+    setAgentSelections((items) => {
+      const remaining = items.filter((item) => item.id !== itemId);
+      if (agentTargetId === itemId) setAgentTargetId(remaining[0]?.id || null);
+      return remaining;
+    });
+    markAgentBundleDraft();
+  }, [agentTargetId, markAgentBundleDraft]);
+  const dropAgentSelection = useCallback((itemId: string, zone: string | null) => {
+    if (!zone || agentBundleStatus === 'sent') return;
+    if (zone === `context:${itemId}`) return;
+    if (zone === 'target') {
+      if (itemId !== agentTargetId) { setAgentTargetId(itemId); markAgentBundleDraft(); addActivity('Edit target changed', 'Previous target moved to context'); }
+      return;
+    }
+    if (itemId === agentTargetId) return;
+    setAgentSelections((items) => {
+      const targetItem = items.find((item) => item.id === agentTargetId);
+      const contexts = items.filter((item) => item.id !== agentTargetId && item.id !== itemId);
+      const moved = items.find((item) => item.id === itemId); if (!moved) return items;
+      const beforeId = zone.startsWith('context:') ? zone.slice('context:'.length) : null;
+      const index = beforeId ? contexts.findIndex((item) => item.id === beforeId) : contexts.length;
+      contexts.splice(index < 0 ? contexts.length : index, 0, moved);
+      return targetItem ? [targetItem, ...contexts] : contexts;
+    });
+    markAgentBundleDraft();
+  }, [addActivity, agentBundleStatus, agentTargetId, markAgentBundleDraft]);
+  const sendAgentBundle = useCallback(() => {
+    const target = agentSelections.find((item) => item.id === agentTargetId); if (!target) return;
+    const id = `bundle-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    setAgentBundleId(id); setAgentBundleSentAt(Date.now()); setAgentBundleStatus('sent'); pendingEdits.current.clear();
+    addActivity('Edit bundle sent to agent', `1 target + ${agentSelections.length - 1} context`);
+  }, [addActivity, agentSelections, agentTargetId]);
+
+  const prepareAiEdit = useCallback((editPrompt = '') => {
+    const target = agentSelections.find((item) => item.id === agentTargetId);
+    if (agentBundleStatus !== 'sent' || !agentBundleId || !target) {
+      return {
+        ready: false,
+        code: 'bundle_required',
+        message: 'Add at least one region to the Agent edit panel and press Send to agent before requesting pixels.',
+        userInstruction: 'Ask the user to add a selection as the edit target, optionally add context regions, then press Send to agent.',
+        agentPolicy: agentEditPolicy,
+      };
+    }
+    if (target.drawingId !== currentDrawingId) {
+      return { ready: false, code: 'drawing_mismatch', message: 'The sent edit target belongs to another drawing.', userInstruction: 'Ask the user to switch back to the drawing that contains the sent edit bundle.', agentPolicy: agentEditPolicy };
+    }
+    const cleanPrompt = editPrompt.trim();
+    const contexts = agentSelections.filter((item) => item.id !== target.id);
     const id = `edit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-    const pending: PendingEdit = { id, prompt: cleanPrompt, source, selection: { ...target }, mask: selectionCrop.getContext('2d')!.getImageData(0, 0, source.width, source.height), createdAt: Date.now() };
+    const pending: PendingEdit = { id, bundleId: agentBundleId, drawingId: target.drawingId, prompt: cleanPrompt, source: { ...target.source }, selection: { ...target.selection }, mask: target.mask, contextCount: contexts.length, createdAt: Date.now() };
     pendingEdits.current.set(id, pending);
     while (pendingEdits.current.size > 6) pendingEdits.current.delete(pendingEdits.current.keys().next().value!);
-    addActivity('Edit package ready for agent', cleanPrompt || 'No prompt — visual judgment');
+    addActivity('Edit package ready for agent', `${contexts.length} context reference${contexts.length === 1 ? '' : 's'}`);
+    const relativeSelection = { x: target.selection.x - target.source.x, y: target.selection.y - target.source.y, width: target.selection.width, height: target.selection.height };
+    const targetPayload = {
+      id: target.id,
+      name: target.name,
+      layer: { id: target.layerId, name: target.layerName },
+      compositeCrop: { dataUrl: target.compositeCrop, mimeType: 'image/jpeg', width: target.source.width, height: target.source.height },
+      activeLayerCrop: { dataUrl: target.activeLayerCrop, mimeType: 'image/png', width: target.source.width, height: target.source.height },
+      mask: { dataUrl: target.maskDataUrl, mimeType: 'image/png', width: target.source.width, height: target.source.height, whiteMeans: 'editable' },
+      selection: relativeSelection,
+      placement: target.source,
+    };
     return {
       editId: id,
+      bundleId: agentBundleId,
       prompt: cleanPrompt || null,
-      compositeCrop: { dataUrl: crop(compositeCanvas(), 'image/jpeg', .9), mimeType: 'image/jpeg', width: source.width, height: source.height },
-      activeLayerCrop: { dataUrl: crop(active, 'image/png'), mimeType: 'image/png', width: source.width, height: source.height },
-      mask: { dataUrl: mask.toDataURL('image/png'), mimeType: 'image/png', width: source.width, height: source.height, whiteMeans: 'editable' },
-      selection: { x: target.x - source.x, y: target.y - source.y, width: target.width, height: target.height },
-      placement: source,
-      outputContract: `Return one PNG or WebP of exactly ${source.width}×${source.height}px representing the complete crop. The app will reveal only the masked selection as a new layer.`,
+      target: targetPayload,
+      context: contexts.map((item, index) => ({ id: item.id, order: index, name: item.name, role: 'context', image: { dataUrl: item.contextImage, mimeType: 'image/png', width: item.source.width, height: item.source.height }, selection: item.selection, placement: item.source })),
+      compositeCrop: targetPayload.compositeCrop,
+      activeLayerCrop: targetPayload.activeLayerCrop,
+      mask: targetPayload.mask,
+      selection: relativeSelection,
+      placement: target.source,
+      outputContract: `Return one PNG or WebP of exactly ${target.source.width}×${target.source.height}px representing the complete target crop. Context images are references only. The app will reveal only the target mask as a new layer.`,
       agentPolicy: agentEditPolicy,
     };
-  }, [activeLayer, addActivity, compositeCanvas, selection, tool]);
+  }, [addActivity, agentBundleId, agentBundleStatus, agentSelections, agentTargetId, currentDrawingId]);
 
   const insertAiResult = useCallback(async (editId: string, imageDataUrl: string, requestedName?: string) => {
     const pending = pendingEdits.current.get(editId);
     if (!pending) throw new Error('Unknown or expired editId. Call prepare_ai_edit again.');
     if (Date.now() - pending.createdAt > 10 * 60 * 1000) { pendingEdits.current.delete(editId); throw new Error('Edit package expired. Call prepare_ai_edit again.'); }
+    if (pending.drawingId !== currentDrawingId) throw new Error('Switch back to the drawing that contains this edit target before inserting the result.');
     if (!/^data:image\/(png|jpeg|webp);base64,/i.test(imageDataUrl)) throw new Error('imageDataUrl must be a base64 PNG, JPEG, or WebP data URL.');
     if (imageDataUrl.length > 14_000_000) throw new Error('Generated image is larger than the 10 MB MVP limit.');
     const image = new Image();
@@ -721,8 +834,8 @@ export function Duet() {
     setLayers((items) => [{ id, name, visible: true, opacity: 100, blend: 'source-over', swatch: 'linear-gradient(135deg,#f28d68,#9a59ee)', ai: true }, ...items]);
     setActiveLayer(id); pendingEdits.current.delete(editId);
     addActivity('Agent image inserted as layer', name);
-    return { layerId: id, name, placement: pending.source, clippedToSelection: pending.selection, nextStep: 'Ask the user in chat what they want to edit next.' };
-  }, [addActivity]);
+    return { layerId: id, name, bundleId: pending.bundleId, placement: pending.source, clippedToSelection: pending.selection, contextReferencesUsed: pending.contextCount, nextStep: 'Ask the user in chat what they want to edit next.' };
+  }, [addActivity, currentDrawingId]);
 
   const mergeLayerDown = useCallback(() => {
     const index = layers.findIndex((layer) => layer.id === activeLayer);
@@ -777,11 +890,9 @@ export function Duet() {
   }, [activeLayer, addActivity, captureLayerSnapshot, layers]);
 
   const canEditWithAgent = hasUsableSelection(tool, selection);
-  const requestAgentEdit = () => {
-    if (!canEditWithAgent) return;
-    setAgentSendState('sent');
-    addActivity('Selection sent to agent', 'Ready for your edit prompt');
-  };
+  const agentTarget = agentSelections.find((item) => item.id === agentTargetId) || null;
+  const agentContexts = agentSelections.filter((item) => item.id !== agentTargetId);
+  const agentBundleReady = agentBundleStatus === 'sent' && !!agentBundleId && !!agentTarget;
 
   actionsRef.current = {
     getState: () => ({
@@ -791,9 +902,9 @@ export function Duet() {
       toolSettings: { brushSize, brushOpacity, brushColor, effectStrength, textFont, textSize },
       selection,
       agentPolicy: agentEditPolicy,
-      agentEdit: canEditWithAgent
-        ? { ready: true, nextStep: 'The user has selected a region. Call prepare_ai_edit to fetch its pixels and mask. If that call is blocked, do not make any document change; report the blocker or request permission.' }
-        : { ready: false, code: 'selection_required', userInstruction: 'Tell the user to choose the Region select (arrow) tool, drag over the area to edit, then ask you to try again. Do not substitute another edit.' },
+      agentEdit: agentBundleReady
+        ? { ready: true, bundleId: agentBundleId, target: { id: agentTarget.id, name: agentTarget.name, selection: agentTarget.selection, layerId: agentTarget.layerId }, context: agentContexts.map((item, index) => ({ id: item.id, name: item.name, order: index, selection: item.selection })), nextStep: 'Call prepare_ai_edit to fetch the frozen target pixels, mask, and ordered context references. Insert the result only through insert_ai_result.' }
+        : { ready: false, code: agentSelections.length ? 'bundle_not_sent' : 'bundle_required', draft: { targetId: agentTargetId, contextCount: agentContexts.length, currentSelectionReady: canEditWithAgent }, userInstruction: agentSelections.length ? 'Tell the user to review the Agent edit bundle and press Send to agent.' : 'Tell the user to select an area, add it to the Agent edit panel, then press Send to agent. Do not substitute another edit.' },
       layers: layers.map(({ id, name, visible, opacity, ai }) => ({ id, name, visible, opacity, ai: !!ai })),
     }),
     createLayer,
@@ -809,12 +920,12 @@ export function Duet() {
     const mc = document.modelContext; if (!mc) { setWebMcp('fallback'); return; }
     const controller = new AbortController();
     const tools: WebMCPTool[] = [
-      { name: 'get_document_state', title: 'Inspect DUET document — WebMCP-only editing policy', description: 'Returns the canvas, selection, active tool, editable layer stack, and mandatory agent policy. For a requested edit, act through these page-defined WebMCP tools only. Never use browser controls, clicks, drags, or local canvas drawing as a fallback. When agentEdit.ready is false, direct the user to select an area before continuing.', execute: () => response(actionsRef.current.getState()) },
+      { name: 'get_document_state', title: 'Inspect DUET document — WebMCP-only editing policy', description: 'Returns the canvas, current selection, editable layers, and the sent Agent edit bundle. When agentEdit.ready is true, call prepare_ai_edit to receive its one edit target and ordered context references. Never use browser controls, clicks, drags, or local canvas drawing as a fallback.', execute: () => response(actionsRef.current.getState()) },
       { name: 'create_layer', title: 'Create an editable layer', description: 'Creates a transparent paint layer and makes it active. This is not a fallback for a blocked AI edit: if pixel transfer, permission, or generation is blocked, leave the document unchanged and report the blocker.', inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'Short layer name' } } }, execute: ({ name }) => response({ layerId: actionsRef.current.createLayer(String(name || 'Agent layer')) }) },
       { name: 'set_active_tool', title: 'Choose an editing tool', description: 'Selects the transform, layer lasso, brush, eraser, smudge, blur, text, eyedropper, region selection, or pan tool through WebMCP. Do not use it or the browser UI to make a substitute manual edit when the requested AI edit is blocked.', inputSchema: { type: 'object', properties: { tool: { type: 'string', enum: ['select', 'layer-lasso', 'transform', 'brush', 'eraser', 'smudge', 'blur', 'text', 'eyedropper', 'pan'] } }, required: ['tool'] }, execute: ({ tool: next }) => response({ tool: actionsRef.current.setTool(next as Tool) }) },
       { name: 'select_region', title: 'Select a canvas region', description: 'Creates the region that the next AI edit should modify. It does not authorize a browser-control or manual-canvas fallback.', inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } }, required: ['x', 'y', 'width', 'height'] }, execute: ({ x, y, width, height }) => response(actionsRef.current.select({ x: Number(x), y: Number(y), width: Number(width), height: Number(height) })) },
-      { name: 'prepare_ai_edit', title: 'Prepare pixels for an agent edit', description: 'Returns a composited context crop, active-layer crop, selection mask, placement metadata, and optional prompt under a temporary edit ID. Use this before generating an image. If this workflow is blocked by privacy or permission, do not edit the canvas by any other route: state the blocker and request the needed permission if one exists; otherwise stop. If no active region is selected, it returns selection_required; tell the user to select an area and try again.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional visual edit instruction. Omit to let the agent decide.' } } }, execute: ({ prompt: edit }) => response(actionsRef.current.prepareAiEdit(typeof edit === 'string' ? edit : '')) },
-      { name: 'insert_ai_result', title: 'Insert an agent-generated image layer', description: 'Accepts a generated PNG, JPEG, or WebP data URL for a prepared edit ID, aligns it to the saved crop, clips it to the original selection, and creates a new editable layer. Call only after prepare_ai_edit succeeds; never substitute another local or manual edit when it cannot.', inputSchema: { type: 'object', properties: { editId: { type: 'string', description: 'Temporary ID returned by prepare_ai_edit' }, imageDataUrl: { type: 'string', description: 'Base64 image data URL for the complete prepared crop' }, name: { type: 'string', description: 'Optional new layer name' } }, required: ['editId', 'imageDataUrl'] }, execute: async ({ editId, imageDataUrl, name }) => response(await actionsRef.current.insertAiResult(String(editId), String(imageDataUrl), typeof name === 'string' ? name : undefined)) },
+      { name: 'prepare_ai_edit', title: 'Prepare the sent Agent edit bundle', description: 'Returns the frozen edit target crop, active-layer crop, mask, placement, and every ordered context reference under a temporary edit ID. Context images are reference-only and must never become edit destinations. If the user has not sent a bundle, ask them to add selections and press Send to agent; do not make a substitute edit.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: 'Optional visual edit instruction. Omit to let the agent decide.' } } }, execute: ({ prompt: edit }) => response(actionsRef.current.prepareAiEdit(typeof edit === 'string' ? edit : '')) },
+      { name: 'insert_ai_result', title: 'Insert an agent-generated image layer', description: 'Accepts a generated PNG, JPEG, or WebP data URL for a prepared bundle edit, aligns it to the saved target crop, clips it only to the target mask, and creates a new editable layer. Context references are never modified. Call only after prepare_ai_edit succeeds.', inputSchema: { type: 'object', properties: { editId: { type: 'string', description: 'Temporary ID returned by prepare_ai_edit' }, imageDataUrl: { type: 'string', description: 'Base64 image data URL for the complete prepared target crop' }, name: { type: 'string', description: 'Optional new layer name' } }, required: ['editId', 'imageDataUrl'] }, execute: async ({ editId, imageDataUrl, name }) => response(await actionsRef.current.insertAiResult(String(editId), String(imageDataUrl), typeof name === 'string' ? name : undefined)) },
       { name: 'merge_layer_down', title: 'Merge the selected layer down', description: 'Flattens the selected layer into the layer directly beneath it and keeps the merged pixels editable as one layer.', execute: () => response(actionsRef.current.mergeLayerDown()) },
       { name: 'set_layer_visibility', title: 'Show or hide a layer', description: 'Changes layer visibility without destroying its pixels.', inputSchema: { type: 'object', properties: { layerId: { type: 'string' }, visible: { type: 'boolean' } }, required: ['layerId', 'visible'] }, execute: ({ layerId, visible }) => response(actionsRef.current.toggleLayer(String(layerId), Boolean(visible))) },
     ];
@@ -925,7 +1036,7 @@ export function Duet() {
       if (selectionMode === 'rectangle') { clearSelection(); selectionStart.current = point; }
       if (selectionMode === 'brush') { lastPoint.current = point; paintSelectionStroke(point, point); }
       if (selectionMode === 'lasso') { clearSelection(); lassoPoints.current = [point]; redrawSelectionOverlay(); }
-      setAgentSendState('idle'); drawing.current = true; return;
+      drawing.current = true; return;
     }
     if (tool === 'layer-lasso') {
       const selected = layerSelectionRef.current; const bounds = selected?.bounds;
@@ -1098,7 +1209,7 @@ export function Duet() {
     const nextTool: Tool = typeof projectDocument.tool === 'string' && ['select', 'layer-lasso', 'transform', 'brush', 'eraser', 'smudge', 'blur', 'text', 'eyedropper', 'pan'].includes(projectDocument.tool) ? projectDocument.tool as Tool : 'select';
     const nextActiveLayer = typeof projectDocument.activeLayer === 'string' && restored.some(({ layer }) => layer.id === projectDocument.activeLayer) ? projectDocument.activeLayer : restored[0].layer.id;
     layerCanvases.current = new Map(restored.map(({ layer, canvas }) => [layer.id, canvas]));
-    undoStack.current = []; redoStack.current = []; pendingEdits.current.clear();
+    undoStack.current = []; redoStack.current = []; pendingEdits.current.clear(); setAgentSelections([]); setAgentTargetId(null); setAgentBundleStatus('draft'); setAgentBundleId(null); setAgentBundleSentAt(null);
     setLayers(restored.map(({ layer }) => layer)); setActiveLayer(nextActiveLayer); applyRectangleSelection(safeSelection(projectDocument.selection)); setSelectionMode('rectangle');
     changeTool(nextTool);
     const importedName = typeof projectDocument.name === 'string' && projectDocument.name.trim() ? projectDocument.name.trim().slice(0, 80) : file.name.replace(/\.(duet|babyps)$/i, '') || 'Untitled artwork';
@@ -1181,6 +1292,33 @@ export function Duet() {
     return ctx.getImageData(0, 0, WIDTH, HEIGHT);
   }, [compositeCanvas, currentDrawingId, workspaceDrawings]);
 
+  const moveAgentContext = (itemId: string, direction: -1 | 1) => {
+    if (agentBundleStatus === 'sent') return;
+    const index = agentContexts.findIndex((item) => item.id === itemId); const nextIndex = index + direction;
+    if (index < 0 || nextIndex < 0 || nextIndex >= agentContexts.length) return;
+    const nextContexts = [...agentContexts]; [nextContexts[index], nextContexts[nextIndex]] = [nextContexts[nextIndex], nextContexts[index]];
+    setAgentSelections(agentTarget ? [agentTarget, ...nextContexts] : nextContexts); markAgentBundleDraft();
+  };
+  const agentDropZoneAt = (clientX: number, clientY: number) => (document.elementFromPoint(clientX, clientY)?.closest<HTMLElement>('[data-agent-drop-zone]')?.dataset.agentDropZone || null);
+  const startAgentPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, itemId: string) => {
+    if (agentBundleStatus === 'sent') return;
+    event.currentTarget.setPointerCapture(event.pointerId); setDraggingAgentItemId(itemId); setAgentDropZone(null);
+  };
+  const moveAgentPointerDrag = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (!draggingAgentItemId) return; setAgentDropZone(agentDropZoneAt(event.clientX, event.clientY));
+  };
+  const finishAgentPointerDrag = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (!draggingAgentItemId) return;
+    const zone = agentDropZoneAt(event.clientX, event.clientY) || agentDropZone;
+    dropAgentSelection(draggingAgentItemId, zone); setDraggingAgentItemId(null); setAgentDropZone(null);
+  };
+  const renderAgentSelectionCard = (item: AgentSelectionItem, role: 'target' | 'context', index = 0) => <div key={item.id} data-agent-drop-zone={role === 'target' ? 'target' : `context:${item.id}`} className={`agent-selection-card ${role} ${draggingAgentItemId === item.id ? 'dragging' : ''} ${agentDropZone === (role === 'target' ? 'target' : `context:${item.id}`) ? 'drop-active' : ''}`}>
+    {role === 'context' ? <button type="button" className="agent-drag-handle" aria-label={`Drag ${item.name}`} title="Drag to reorder or make the edit target" onPointerDown={(event) => startAgentPointerDrag(event, item.id)} onPointerMove={moveAgentPointerDrag} onPointerUp={finishAgentPointerDrag} onPointerCancel={() => { setDraggingAgentItemId(null); setAgentDropZone(null); }}><Move /></button> : <span className="agent-target-icon"><Focus /></span>}
+    <span className="agent-selection-thumb" style={{ backgroundImage: `url(${item.previewDataUrl}), repeating-conic-gradient(#35323a 0 25%,#2a282f 0 50%)` }} aria-hidden="true" />
+    <span className="agent-selection-copy"><strong>{item.name}</strong><small>{Math.round(item.selection.width)} × {Math.round(item.selection.height)} · {item.layerName}</small></span>
+    <span className="agent-card-actions">{role === 'context' && <><button type="button" onClick={() => { setAgentTargetId(item.id); markAgentBundleDraft(); addActivity('Edit target changed', 'Previous target moved to context'); }} title="Make edit target" aria-label={`Make ${item.name} the edit target`}><Focus /></button><button type="button" onClick={() => moveAgentContext(item.id, -1)} disabled={index === 0} title="Move context up" aria-label={`Move ${item.name} up`}><ArrowUp /></button><button type="button" onClick={() => moveAgentContext(item.id, 1)} disabled={index === agentContexts.length - 1} title="Move context down" aria-label={`Move ${item.name} down`}><ArrowDown /></button></>}<button type="button" onClick={() => removeAgentSelection(item.id)} disabled={agentBundleStatus === 'sent'} title="Remove selection" aria-label={`Remove ${item.name}`}><X /></button></span>
+  </div>;
+
   return <TooltipProvider delay={350}><><AnimationStudio ref={animationStudioRef} active={workspaceMode === 'animation'} documentName={documentName} onModeChange={setWorkspaceMode} exportProject={exportProject} getIllustrationImage={getIllustrationImage} illustrations={workspaceDrawings.map(({ id, name }) => ({ id, name }))} photoLibrary={photoLibrary} importSharedPhoto={importSharedPhoto} /><main className={`editor-shell ${workspaceMode === 'illustration' ? '' : 'mode-hidden'}`} aria-hidden={workspaceMode !== 'illustration'}>
     <header className="topbar">
       <div className="brand-area"><Tooltip><TooltipTrigger className="view-toggle" aria-label={leftSidebarOpen ? 'Collapse tools sidebar' : 'Expand tools sidebar'} onClick={() => setLeftSidebarOpen((open) => !open)}>{leftSidebarOpen ? <PanelLeftClose /> : <PanelLeftOpen />}</TooltipTrigger><TooltipContent>{leftSidebarOpen ? 'Hide tools' : 'Show tools'}</TooltipContent></Tooltip>{showBranding && <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>DUET</span><span className="mvp-pill">CREATE WITH AI</span></div>}<Tooltip><TooltipTrigger className={`view-toggle ${!showBranding ? 'active' : ''}`} aria-label={showBranding ? 'Hide branding and canvas reminders' : 'Show branding and canvas reminders'} onClick={() => setShowBranding((shown) => !shown)}>{showBranding ? <EyeOff /> : <Eye />}</TooltipTrigger><TooltipContent>{showBranding ? 'Hide DUET and canvas reminders' : 'Show DUET and canvas reminders'}</TooltipContent></Tooltip></div>
@@ -1208,10 +1346,18 @@ export function Duet() {
           </div>
           <div className="history-controls"><Button variant="ghost" size="icon-sm" onClick={undo} aria-label="Undo"><Undo2 /></Button><Button variant="ghost" size="icon-sm" onClick={redo} aria-label="Redo"><Redo2 /></Button></div>
         </div>
-        <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={() => endPointer()} onPointerCancel={() => endPointer(true)} /><canvas ref={selectionOverlayRef} width={WIDTH} height={HEIGHT} className="selection-overlay" aria-hidden="true" /><canvas ref={layerSelectionOverlayRef} width={WIDTH} height={HEIGHT} className="layer-selection-overlay" aria-hidden="true" />{textDraft && <textarea autoFocus className="text-entry" aria-label="Text to add on a new layer" placeholder="Type here…" spellCheck value={textDraft.value} style={{ left: `${textDraft.x / WIDTH * 100}%`, top: `${textDraft.y / HEIGHT * 100}%`, color: brushColor, fontFamily: (textFonts.find((font) => font.id === textFont) || textFonts[0]).family, fontSize: `${textSize / WIDTH * 100}cqw` }} onPointerDown={(event) => event.stopPropagation()} onChange={(event) => setTextDraft({ ...textDraft, value: event.target.value })} onBlur={() => commitText(true)} onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); commitText(false); } if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur(); } }} />}{eyedropperPreview && <div className="eyedropper-preview" style={{ left: `${eyedropperPreview.x / WIDTH * 100}%`, top: `${eyedropperPreview.y / HEIGHT * 100}%` }}><span className="eyedropper-colour" style={{ background: eyedropperPreview.color }}><Pipette size={15} /></span></div>}{selection.width > 3 && selection.height > 3 && <div className={`selection-box ${selectionMode !== 'rectangle' ? 'freeform' : ''}`} style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">AI target</span>{selectionMode === 'rectangle' && <><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></>}</div>}{tool === 'layer-lasso' && layerSelectionBounds && <div className="layer-selection-box" style={{ left: `${layerSelectionBounds.x / WIDTH * 100}%`, top: `${layerSelectionBounds.y / HEIGHT * 100}%`, width: `${layerSelectionBounds.width / WIDTH * 100}%`, height: `${layerSelectionBounds.height / HEIGHT * 100}%` }}><span className="transform-label">Selected pixels</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}{tool === 'transform' && transformBounds && <div className="transform-box" style={{ left: `${transformBounds.x / WIDTH * 100}%`, top: `${transformBounds.y / HEIGHT * 100}%`, width: `${transformBounds.width / WIDTH * 100}%`, height: `${transformBounds.height / HEIGHT * 100}%` }}><span className="transform-label">{layers.find((layer) => layer.id === activeLayer)?.name}</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}</div></div>{showBranding && <><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></>}</div>
+        <div ref={viewportRef} className="stage-viewport"><div ref={stageRef} className="canvas-stage" style={{ width: `${zoom}%` }}><div className="canvas-wrap"><canvas ref={displayRef} width={WIDTH} height={HEIGHT} aria-label="Editable image canvas" className={`main-canvas tool-${tool}`} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={() => endPointer()} onPointerCancel={() => endPointer(true)} /><canvas ref={selectionOverlayRef} width={WIDTH} height={HEIGHT} className="selection-overlay" aria-hidden="true" /><canvas ref={layerSelectionOverlayRef} width={WIDTH} height={HEIGHT} className="layer-selection-overlay" aria-hidden="true" />{textDraft && <textarea autoFocus className="text-entry" aria-label="Text to add on a new layer" placeholder="Type here…" spellCheck value={textDraft.value} style={{ left: `${textDraft.x / WIDTH * 100}%`, top: `${textDraft.y / HEIGHT * 100}%`, color: brushColor, fontFamily: (textFonts.find((font) => font.id === textFont) || textFonts[0]).family, fontSize: `${textSize / WIDTH * 100}cqw` }} onPointerDown={(event) => event.stopPropagation()} onChange={(event) => setTextDraft({ ...textDraft, value: event.target.value })} onBlur={() => commitText(true)} onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); commitText(false); } if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur(); } }} />}{eyedropperPreview && <div className="eyedropper-preview" style={{ left: `${eyedropperPreview.x / WIDTH * 100}%`, top: `${eyedropperPreview.y / HEIGHT * 100}%` }}><span className="eyedropper-colour" style={{ background: eyedropperPreview.color }}><Pipette size={15} /></span></div>}{selection.width > 3 && selection.height > 3 && <div className={`selection-box ${selectionMode !== 'rectangle' ? 'freeform' : ''}`} style={{ left: `${selection.x / WIDTH * 100}%`, top: `${selection.y / HEIGHT * 100}%`, width: `${selection.width / WIDTH * 100}%`, height: `${selection.height / HEIGHT * 100}%` }}><span className="selection-label">Current selection</span>{selectionMode === 'rectangle' && <><i className="handle tl" /><i className="handle tr" /><i className="handle bl" /><i className="handle br" /></>}</div>}{tool === 'layer-lasso' && layerSelectionBounds && <div className="layer-selection-box" style={{ left: `${layerSelectionBounds.x / WIDTH * 100}%`, top: `${layerSelectionBounds.y / HEIGHT * 100}%`, width: `${layerSelectionBounds.width / WIDTH * 100}%`, height: `${layerSelectionBounds.height / HEIGHT * 100}%` }}><span className="transform-label">Selected pixels</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}{tool === 'transform' && transformBounds && <div className="transform-box" style={{ left: `${transformBounds.x / WIDTH * 100}%`, top: `${transformBounds.y / HEIGHT * 100}%`, width: `${transformBounds.width / WIDTH * 100}%`, height: `${transformBounds.height / HEIGHT * 100}%` }}><span className="transform-label">{layers.find((layer) => layer.id === activeLayer)?.name}</span><i className="transform-handle tl" /><i className="transform-handle tr" /><i className="transform-handle bl" /><i className="transform-handle br" /></div>}</div></div>{showBranding && <><div className="gesture-hint"><span>{Math.round(zoom)}%</span><span>Pinch to zoom</span><i /> <span>Two-finger drag to pan</span></div><div className="canvas-caption"><span className="live-dot" /> Live document · humans + agents share this canvas</div></>}</div>
       </div>
       <aside className="right-panel">
-        <section className="ai-panel"><div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span>{canEditWithAgent ? 'region ready' : 'select a region'}</span></div>{!canEditWithAgent ? <p className="tool-required-hint"><strong>Select an area first.</strong> Choose the Region select arrow, then drag over the part of the canvas you want your agent to read or edit.</p> : <div className="agent-ready-hint"><strong>{agentSendState === 'sent' ? 'Selection sent — prompt your agent.' : 'Region selected.'}</strong><span>{agentSendState === 'sent' ? 'Ask your connected agent in chat to edit the selected region. It can use WebMCP to fetch the crop; images are sent and received in chat.' : 'Click Send to tell your connected agent this region is ready.'}</span><Button size="sm" className="agent-send-button" onClick={requestAgentEdit} disabled={agentSendState === 'sent'}>{agentSendState === 'sent' ? <Check /> : <Send />}{agentSendState === 'sent' ? 'Sent to agent' : 'Send to agent'}</Button></div>}</section>
+        <section className="ai-panel agent-bundle-panel">
+          <div className="panel-heading"><div><WandSparkles size={16} /><strong>Agent edit</strong></div><span>{agentBundleReady ? 'bundle ready' : agentSelections.length ? 'draft bundle' : canEditWithAgent ? 'selection ready' : 'select a region'}</span></div>
+          {agentBundleStatus === 'sent' ? <div className="agent-sent-hint"><strong><Check /> Bundle ready for your agent</strong><span>One edit target and {agentContexts.length} context reference{agentContexts.length === 1 ? '' : 's'} are frozen and available through WebMCP.</span><button type="button" onClick={markAgentBundleDraft}>Edit bundle</button></div> : canEditWithAgent ? <div className="agent-ready-hint"><strong>Selection ready to add.</strong><span>Add this area to the agent request. Nothing is sent yet.</span><Button size="sm" className="agent-add-button" onClick={addSelectionToAgentBundle} disabled={agentSelections.length >= 12}><Plus />{agentSelections.length >= 12 ? 'Bundle full' : 'Add selection'}</Button></div> : <p className="tool-required-hint"><strong>{agentSelections.length ? 'Select another area.' : 'Select an area first.'}</strong>{agentSelections.length ? ' Draw another region to add more visual context.' : ' Choose the Region select arrow, then mark the part of the canvas you want your agent to edit or reference.'}</p>}
+          {agentSelections.length > 0 && <div className={`agent-bundle ${agentBundleStatus === 'sent' ? 'locked' : ''}`}>
+            <div className="agent-bundle-section agent-target-section"><div className="agent-bundle-label"><span><strong>Edit target</strong><small>The agent edits this region and places the result on a new layer.</small></span><em>1 only</em></div><div data-agent-drop-zone="target" className={`agent-target-drop ${agentDropZone === 'target' ? 'drop-active' : ''}`}>{agentTarget ? renderAgentSelectionCard(agentTarget, 'target') : <span>Drag a region here to make it the edit target</span>}</div></div>
+            <div className="agent-bundle-section agent-context-section"><div className="agent-bundle-label"><span><strong>Context references</strong><small>These help the agent understand the image. They will not be edited.</small></span><em>{agentContexts.length}</em></div><div className="agent-context-list">{agentContexts.map((item, index) => renderAgentSelectionCard(item, 'context', index))}<div data-agent-drop-zone="context-end" className={`agent-context-end ${agentDropZone === 'context-end' ? 'drop-active' : ''}`}>{agentContexts.length ? 'Drop to move to the end' : 'Add more selections for context'}</div></div></div>
+            <Button size="sm" className="agent-send-button" onClick={sendAgentBundle} disabled={!agentTarget || agentBundleStatus === 'sent'}><Send />Send 1 target + {agentContexts.length} reference{agentContexts.length === 1 ? '' : 's'}</Button>
+          </div>}
+        </section>
         <section className="layers-panel"><div className="panel-heading layer-heading"><div><Layers3 size={16} /><strong>Layers</strong><span className="layer-count">{layers.length}</span></div><div className="layer-actions"><Button variant="ghost" size="icon-xs" aria-label="Move layer up" onClick={() => moveLayer(-1)}><ArrowUp /></Button><Button variant="ghost" size="icon-xs" aria-label="Move layer down" onClick={() => moveLayer(1)}><ArrowDown /></Button><Button variant="ghost" size="icon-xs" aria-label="New layer" onClick={() => createLayer()}><Plus /></Button></div></div><div className="opacity-row"><span>Opacity</span><Slider min={0} max={100} value={[activeOpacity]} onValueChange={(value) => { const opacity = Array.isArray(value) ? value[0] : Number(value); setLayers((items) => items.map((layer) => layer.id === activeLayer ? { ...layer, opacity } : layer)); }} /><span>{Math.round(activeOpacity)}%</span></div><div className="layer-list">{layers.map((layer) => <button key={layer.id} className={`layer-row ${activeLayer === layer.id ? 'active' : ''}`} onClick={() => setActiveLayer(layer.id)}><span className="visibility-toggle" role="button" tabIndex={0} aria-label={layer.visible ? 'Hide layer' : 'Show layer'} onClick={(event) => { event.stopPropagation(); setLayers((items) => items.map((item) => item.id === layer.id ? { ...item, visible: !item.visible } : item)); }}>{layer.visible ? <Eye size={14} /> : <EyeOff size={14} />}</span><canvas ref={(node) => { if (node) thumbnailRefs.current.set(layer.id, node); else thumbnailRefs.current.delete(layer.id); }} width={68} height={50} className="layer-thumb" style={{ background: layer.swatch }} aria-hidden="true" />{editingLayerId === layer.id ? <input autoFocus value={editingLayerName} aria-label="Layer name" className="layer-name-input" onChange={(event) => setEditingLayerName(event.target.value)} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onBlur={() => finishLayerRename(true)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); finishLayerRename(true); } if (event.key === 'Escape') { event.preventDefault(); finishLayerRename(false); } }} /> : <span className="layer-name" title="Double-click to rename" onDoubleClick={(event) => beginLayerRename(event, layer)}>{layer.name}<small>{layer.ai ? 'AI result · editable' : 'Pixel layer'}</small></span>}{activeLayer === layer.id && <Check size={13} className="active-check" />}</button>)}</div><div className="layer-footer"><div className="layer-footer-main"><Button variant="ghost" size="sm" onClick={() => createLayer()}><Plus />New layer</Button><Button variant="ghost" size="sm" onClick={mergeLayerDown} disabled={layers.findIndex((layer) => layer.id === activeLayer) >= layers.length - 1} title="Merge selected layer into the layer below (⌘E / Ctrl+E)"><Merge className="merge-down-icon" />Merge down</Button></div><Button variant="ghost" size="icon-sm" aria-label="Delete layer" onClick={removeActive} disabled={layers.length <= 1}><Trash2 /></Button></div></section>
         <section className="activity-panel"><div className="panel-heading"><div><Bot size={15} /><strong>Shared activity</strong></div><button aria-label="Close activity"><X size={14} /></button></div><div className="activity-list">{activities.slice(0, 3).map((item) => <div className="activity-row" key={item.id}><span className="activity-icon"><Sparkles size={12} /></span><span><strong>{item.title}</strong><small>{item.detail}</small></span><time>{item.time}</time></div>)}</div></section>
       </aside>
