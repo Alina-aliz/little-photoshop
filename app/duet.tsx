@@ -431,10 +431,12 @@ export function Duet() {
     if (!overlay || !mask) return;
     const ctx = overlay.getContext('2d')!; ctx.clearRect(0, 0, WIDTH, HEIGHT);
     if (selectionHasMaskRef.current) {
-      // Match the selection treatment used by image editors: keep the selected
-      // pixels untouched, dim everything outside, and trace the mask with a
-      // black-and-white moving edge that remains visible on any artwork.
-      ctx.save(); ctx.fillStyle = 'rgba(7, 6, 10, .48)'; ctx.fillRect(0, 0, WIDTH, HEIGHT); ctx.globalCompositeOperation = 'destination-out'; ctx.drawImage(mask, 0, 0); ctx.restore();
+      // Match common image editors: rectangles use a clean border-only
+      // treatment, while irregular masks also dim everything outside them.
+      // The black-and-white moving edge stays visible on any artwork.
+      if (selectionMode !== 'rectangle') {
+        ctx.save(); ctx.fillStyle = 'rgba(7, 6, 10, .48)'; ctx.fillRect(0, 0, WIDTH, HEIGHT); ctx.globalCompositeOperation = 'destination-out'; ctx.drawImage(mask, 0, 0); ctx.restore();
+      }
 
       const edge = selectionEdgeRef.current || makeCanvas(); selectionEdgeRef.current = edge;
       const edgeCtx = edge.getContext('2d')!;
@@ -459,7 +461,7 @@ export function Duet() {
       lassoPoints.current.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
       ctx.stroke(); ctx.restore();
     }
-  }, []);
+  }, [selectionMode]);
 
   useEffect(() => {
     if (selection.width <= 3 || selection.height <= 3) return;
