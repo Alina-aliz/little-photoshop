@@ -1052,6 +1052,56 @@ button {
   border-left: 1px solid rgba(255, 255, 255, 0.07);
   background: #1d1c21;
 }
+.cel-illustration-workspace .animation-panel {
+  padding: 0;
+}
+.cel-illustration-workspace .animation-panel .panel-heading svg {
+  width: 16px;
+  height: 16px;
+}
+.cel-session-warning {
+  margin: 0 0 10px;
+  padding: 8px;
+  border: 1px solid rgba(237, 184, 106, 0.16);
+  border-radius: 7px;
+  color: #a28f80;
+  background: rgba(183, 116, 49, 0.06);
+  font-size: 8px;
+  line-height: 1.45;
+}
+.cel-agent-panel .tool-required-hint,
+.cel-agent-panel .agent-ready-hint {
+  margin-bottom: 0;
+}
+.cel-workbench-layers .layer-thumb {
+  background-image: repeating-conic-gradient(#35323a 0 25%, #2a282f 0 50%);
+  background-size: 8px 8px;
+}
+.cel-workbench-layers .layer-row {
+  grid-template-columns: 21px minmax(0, 1fr);
+}
+.cel-workbench-layers .visibility-toggle,
+.cel-workbench-layer-select {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.cel-workbench-layer-select {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 7px;
+  padding: 0;
+  text-align: left;
+}
+.cel-workbench-layer-select .active-check {
+  width: 13px;
+  height: 13px;
+}
+.animation-canvas.tool-select {
+  cursor: crosshair;
+}
 .cel-layers-panel {
   display: grid;
   gap: 10px;
@@ -3424,6 +3474,9 @@ button {
   .animator-workspace {
     grid-template-columns: 50px minmax(0, 1fr) 190px;
   }
+  .animator-workspace.cel-illustration-workspace {
+    grid-template-columns: 50px minmax(0, 1fr) 228px;
+  }
   .animation-panel {
     padding-inline: 11px;
   }
@@ -3466,11 +3519,11 @@ button {
     display: none;
   }
   .animator-workspace.cel-illustration-workspace {
-    grid-template-columns: 50px minmax(0, 1fr) 190px;
+    grid-template-columns: 50px minmax(0, 1fr) 228px;
   }
   .cel-illustration-workspace .animation-panel {
     display: block;
-    padding-inline: 10px;
+    padding: 0;
   }
   .animator-brand > span {
     display: none;

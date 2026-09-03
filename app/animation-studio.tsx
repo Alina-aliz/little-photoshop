@@ -1,7 +1,10 @@
 'use client';
 
 import {
+  ArrowDown,
+  ArrowUp,
   Brush,
+  Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -26,6 +29,7 @@ import {
   Move,
   Music2,
   Pause,
+  Paintbrush,
   Pipette,
   Play,
   Plus,
@@ -35,11 +39,13 @@ import {
   SkipBack,
   SkipForward,
   Sparkles,
+  SquareDashed,
   Trash2,
   Type as TypeIcon,
   Undo2,
   Unlock,
   Video,
+  WandSparkles,
   X,
 } from 'lucide-react';
 import {
@@ -78,9 +84,21 @@ const MIN_TIMELINE = 96;
 const FRAME_EDITOR_DEFAULT_HEIGHT = 328;
 const FRAME_EDITOR_MIN_HEIGHT = 178;
 const FRAME_EDITOR_ONE_TRACK_HEIGHT = 232;
+const celAgentEditPolicy = {
+  requirement:
+    "For every requested cel illustration edit, use this page's WebMCP tools. Do not use browser clicks, pointer drags, keyboard shortcuts, or visible canvas controls as an alternative editing route.",
+  whenBlocked:
+    'If preparing, sending, or generating the frozen edit target and context pixels is blocked, do not modify the cel. State the exact blocker.',
+  forbiddenFallbacks: [
+    'manual brush or eraser strokes',
+    'local canvas edits',
+    'creating or changing layers as a substitute',
+  ],
+};
 type VideoExportFormat = 'mp4' | 'webm';
 type AnimationTool =
   | 'agent-target'
+  | 'select'
   | 'layer-lasso'
   | 'transform'
   | 'brush'
@@ -91,6 +109,7 @@ type AnimationTool =
   | 'eyedropper'
   | 'pan';
 type TextFont = 'sans' | 'serif' | 'mono' | 'rounded';
+type CelSelectionMode = 'rectangle' | 'brush' | 'lasso';
 type TextDraft = { x: number; y: number; value: string };
 type EyedropperPreview = { x: number; y: number; color: string };
 type CanvasBounds = { x: number; y: number; width: number; height: number };
@@ -100,6 +119,31 @@ type CelEditLayer = {
   name: string;
   visible: boolean;
   opacity: number;
+};
+type CelAgentBundleStatus = 'draft' | 'sent';
+type CelAgentSelectionItem = {
+  id: string;
+  name: string;
+  layerId: string;
+  layerName: string;
+  source: CanvasBounds;
+  selection: CanvasBounds;
+  mask: ImageData;
+  compositeCrop: string;
+  activeLayerCrop: string;
+  maskDataUrl: string;
+  contextImage: string;
+  previewDataUrl: string;
+};
+type CelPendingEdit = {
+  id: string;
+  bundleId: string;
+  frameId: string;
+  prompt: string;
+  source: CanvasBounds;
+  selection: CanvasBounds;
+  mask: ImageData;
+  contextCount: number;
 };
 type CelLayerSelection = {
   layerId: string;
@@ -293,6 +337,18 @@ export type AnimationStudioHandle = {
   getAgentAnimationState: () => unknown;
   prepareAgentAnimationEdit: (input: Record<string, unknown>) => unknown;
   insertAgentCelClip: (input: Record<string, unknown>) => unknown;
+  getCelIllustrationState: () => unknown;
+  prepareCelIllustrationEdit: (prompt?: string) => unknown;
+  insertCelIllustrationResult: (
+    editId: string,
+    imageDataUrl: string,
+    name?: string,
+  ) => Promise<unknown>;
+  createCelIllustrationLayer: (name?: string) => unknown;
+  setCelIllustrationTool: (tool: string) => unknown;
+  selectCelIllustrationRegion: (selection: CanvasBounds) => unknown;
+  mergeCelIllustrationLayerDown: () => unknown;
+  setCelIllustrationLayerVisibility: (layerId: string, visible: boolean) => unknown;
 };
 function makeCanvas() {
   const canvas = document.createElement('canvas');
@@ -922,6 +978,7 @@ const celIllustrationToolMeta: Array<{
   label: string;
   icon: typeof Brush;
 }> = [
+  { id: 'select', label: 'Region select', icon: MousePointer2 },
   { id: 'layer-lasso', label: 'Layer lasso', icon: LassoSelect },
   { id: 'transform', label: 'Transform layer', icon: Move },
   { id: 'brush', label: 'Brush', icon: Brush },
@@ -982,6 +1039,14 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     const celEditCanvases = useRef(new Map<string, HTMLCanvasElement>());
     const celEditFrameId = useRef('');
     const celLassoPoints = useRef<Array<{ x: number; y: number }>>([]);
+    const celRegionLassoPoints = useRef<Array<{ x: number; y: number }>>([]);
+    const celRegionStart = useRef({ x: 0, y: 0 });
+    const celRegionMask = useRef<HTMLCanvasElement | null>(null);
+    const celRegionEdge = useRef<HTMLCanvasElement | null>(null);
+    const celRegionStripe = useRef<HTMLCanvasElement | null>(null);
+    const celRegionHasMask = useRef(false);
+    const celPendingEdits = useRef(new Map<string, CelPendingEdit>());
+    const celAgentSequence = useRef(0);
     const celLayerSelection = useRef<CelLayerSelection | null>(null);
     const activeCelTransform = useRef<ActiveCelTransform | null>(null);
     const activeCelSelectionTransform =
@@ -1045,6 +1110,22 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       useState<CanvasBounds | null>(null);
     const [celSelectionBounds, setCelSelectionBounds] =
       useState<CanvasBounds | null>(null);
+    const [celRegionSelection, setCelRegionSelection] = useState<CanvasBounds>({
+      x: 0,
+      y: 0,
+      width: 0,
+      height: 0,
+    });
+    const [celRegionMode, setCelRegionMode] =
+      useState<CelSelectionMode>('rectangle');
+    const [celRegionBrushSize, setCelRegionBrushSize] = useState(52);
+    const [celAgentSelections, setCelAgentSelections] = useState<
+      CelAgentSelectionItem[]
+    >([]);
+    const [celAgentTargetId, setCelAgentTargetId] = useState<string | null>(null);
+    const [celAgentBundleStatus, setCelAgentBundleStatus] =
+      useState<CelAgentBundleStatus>('draft');
+    const [celAgentBundleId, setCelAgentBundleId] = useState<string | null>(null);
     const [flattenDialogOpen, setFlattenDialogOpen] = useState(false);
     const [frameEditorHeight, setFrameEditorHeight] = useState(
       FRAME_EDITOR_DEFAULT_HEIGHT,
@@ -1102,6 +1183,19 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     const activeCelEditLayerIndex = celEditLayers.findIndex(
       (layer) => layer.id === activeCelEditLayerId,
     );
+    const canEditCelWithAgent =
+      celIllustrationMode &&
+      tool === 'select' &&
+      celRegionSelection.width > 3 &&
+      celRegionSelection.height > 3;
+    const celAgentTarget =
+      celAgentSelections.find((item) => item.id === celAgentTargetId) || null;
+    const celAgentContexts = celAgentSelections.filter(
+      (item) => item.id !== celAgentTargetId,
+    );
+    const celAgentBundleReady =
+      celAgentBundleStatus === 'sent' &&
+      Boolean(celAgentBundleId && celAgentTarget);
     const mp4ExportSupported = useSyncExternalStore(
       () => () => {},
       () => Boolean(supportedRecordingMime('mp4')),
@@ -1200,6 +1294,20 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       [celEditLayers],
     );
 
+    const compositeCelEditCanvas = useCallback(() => {
+      const canvas = makeCanvas();
+      const ctx = canvas.getContext('2d')!;
+      [...celEditLayers].reverse().forEach((layer) => {
+        const source = celEditCanvases.current.get(layer.id);
+        if (!source || !layer.visible) return;
+        ctx.save();
+        ctx.globalAlpha = layer.opacity / 100;
+        ctx.drawImage(source, 0, 0);
+        ctx.restore();
+      });
+      return canvas;
+    }, [celEditLayers]);
+
     const currentPaintCanvas = () =>
       celIllustrationMode
         ? celEditCanvases.current.get(activeCelEditLayerId) || null
@@ -1226,6 +1334,81 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       if (!overlay) return;
       const ctx = overlay.getContext('2d')!;
       ctx.clearRect(0, 0, WIDTH, HEIGHT);
+      const regionMask = celRegionMask.current;
+      if (tool === 'select' && regionMask && celRegionHasMask.current) {
+        if (celRegionMode === 'brush') {
+          ctx.save();
+          ctx.fillStyle = 'rgba(7, 6, 10, .48)';
+          ctx.fillRect(0, 0, WIDTH, HEIGHT);
+          ctx.globalCompositeOperation = 'destination-out';
+          ctx.drawImage(regionMask, 0, 0);
+          ctx.restore();
+        }
+        const edge = celRegionEdge.current || makeCanvas();
+        celRegionEdge.current = edge;
+        const edgeCtx = edge.getContext('2d')!;
+        edgeCtx.clearRect(0, 0, WIDTH, HEIGHT);
+        edgeCtx.globalCompositeOperation = 'source-over';
+        [
+          [-2, 0],
+          [2, 0],
+          [0, -2],
+          [0, 2],
+          [-1, -1],
+          [1, -1],
+          [-1, 1],
+          [1, 1],
+        ].forEach(([x, y]) => edgeCtx.drawImage(regionMask, x, y));
+        edgeCtx.globalCompositeOperation = 'destination-out';
+        edgeCtx.drawImage(regionMask, 0, 0);
+        const stripe = celRegionStripe.current || document.createElement('canvas');
+        if (!celRegionStripe.current) {
+          stripe.width = 12;
+          stripe.height = 12;
+          const stripeCtx = stripe.getContext('2d')!;
+          stripeCtx.fillStyle = '#fff';
+          stripeCtx.fillRect(0, 0, 12, 12);
+          stripeCtx.fillStyle = '#111015';
+          for (let offset = -12; offset < 24; offset += 12) {
+            stripeCtx.beginPath();
+            stripeCtx.moveTo(offset, 0);
+            stripeCtx.lineTo(offset + 6, 0);
+            stripeCtx.lineTo(offset + 18, 12);
+            stripeCtx.lineTo(offset + 12, 12);
+            stripeCtx.closePath();
+            stripeCtx.fill();
+          }
+          celRegionStripe.current = stripe;
+        }
+        const pattern = edgeCtx.createPattern(stripe, 'repeat');
+        if (pattern) {
+          edgeCtx.save();
+          edgeCtx.globalCompositeOperation = 'source-in';
+          edgeCtx.fillStyle = pattern;
+          edgeCtx.fillRect(0, 0, WIDTH, HEIGHT);
+          edgeCtx.restore();
+        }
+        ctx.save();
+        ctx.shadowColor = 'rgba(0,0,0,.85)';
+        ctx.shadowBlur = 1;
+        ctx.drawImage(edge, 0, 0);
+        ctx.restore();
+      }
+      if (tool === 'select' && celRegionLassoPoints.current.length > 1) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(0,0,0,.92)';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        celRegionLassoPoints.current.forEach((point, index) =>
+          index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y),
+        );
+        ctx.stroke();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([7, 5]);
+        ctx.stroke();
+        ctx.restore();
+      }
       const selected = celLayerSelection.current;
       const bounds = selected?.bounds ||
         (celIllustrationMode && tool === 'transform'
@@ -1286,7 +1469,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         ctx.stroke();
         ctx.restore();
       }
-    }, [celIllustrationMode, celTransformBounds, tool]);
+    }, [celIllustrationMode, celRegionMode, celTransformBounds, tool]);
 
     const clearCelLayerSelection = useCallback(() => {
       celLayerSelection.current = null;
@@ -1297,6 +1480,93 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         ?.getContext('2d')
         ?.clearRect(0, 0, WIDTH, HEIGHT);
     }, []);
+
+    const clearCelRegionSelection = useCallback(() => {
+      celRegionMask.current?.getContext('2d')?.clearRect(0, 0, WIDTH, HEIGHT);
+      celRegionHasMask.current = false;
+      celRegionLassoPoints.current = [];
+      setCelRegionSelection({ x: 0, y: 0, width: 0, height: 0 });
+      requestAnimationFrame(redrawCelEditOverlay);
+    }, [redrawCelEditOverlay]);
+
+    const applyCelRectangleSelection = useCallback(
+      (value: CanvasBounds) => {
+        const mask = celRegionMask.current;
+        if (!mask) return value;
+        const safe = {
+          x: clamp(Math.min(value.x, value.x + value.width), 0, WIDTH - 1),
+          y: clamp(Math.min(value.y, value.y + value.height), 0, HEIGHT - 1),
+          width: Math.max(1, Math.min(WIDTH, Math.abs(value.width))),
+          height: Math.max(1, Math.min(HEIGHT, Math.abs(value.height))),
+        };
+        safe.width = Math.min(safe.width, WIDTH - safe.x);
+        safe.height = Math.min(safe.height, HEIGHT - safe.y);
+        const ctx = mask.getContext('2d')!;
+        ctx.clearRect(0, 0, WIDTH, HEIGHT);
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(safe.x, safe.y, safe.width, safe.height);
+        celRegionHasMask.current = safe.width > 3 && safe.height > 3;
+        setCelRegionSelection(safe);
+        requestAnimationFrame(redrawCelEditOverlay);
+        return safe;
+      },
+      [redrawCelEditOverlay],
+    );
+
+    const updateCelRegionFromMask = useCallback(() => {
+      const mask = celRegionMask.current;
+      const bounds = mask ? canvasContentBounds(mask) : null;
+      const next = bounds || { x: 0, y: 0, width: 0, height: 0 };
+      celRegionHasMask.current = Boolean(bounds);
+      setCelRegionSelection(next);
+      requestAnimationFrame(redrawCelEditOverlay);
+      return next;
+    }, [redrawCelEditOverlay]);
+
+    const paintCelRegionStroke = useCallback(
+      (from: { x: number; y: number }, to: { x: number; y: number }) => {
+        const mask = celRegionMask.current;
+        if (!mask) return;
+        const ctx = mask.getContext('2d')!;
+        ctx.save();
+        ctx.strokeStyle = '#fff';
+        ctx.fillStyle = '#fff';
+        ctx.lineWidth = celRegionBrushSize;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        ctx.moveTo(from.x, from.y);
+        ctx.lineTo(to.x, to.y);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(to.x, to.y, celRegionBrushSize / 2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+        celRegionHasMask.current = true;
+        updateCelRegionFromMask();
+      },
+      [celRegionBrushSize, updateCelRegionFromMask],
+    );
+
+    const finishCelRegionLasso = useCallback(() => {
+      const mask = celRegionMask.current;
+      const points = celRegionLassoPoints.current;
+      if (!mask || points.length < 3) {
+        clearCelRegionSelection();
+        return;
+      }
+      const ctx = mask.getContext('2d')!;
+      ctx.clearRect(0, 0, WIDTH, HEIGHT);
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      points.forEach((point, index) =>
+        index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y),
+      );
+      ctx.closePath();
+      ctx.fill();
+      celRegionLassoPoints.current = [];
+      updateCelRegionFromMask();
+    }, [clearCelRegionSelection, updateCelRegionFromMask]);
 
     const clipSource = useCallback((clip: Clip, at: number) => {
       if (clip.type === 'still')
@@ -1481,6 +1751,9 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       base.getContext('2d')!.drawImage(source, 0, 0);
       celEditCanvases.current = new Map([[baseId, base]]);
       celEditFrameId.current = activeFrameId;
+      celRegionMask.current = makeCanvas();
+      celRegionHasMask.current = false;
+      celPendingEdits.current.clear();
       setCelEditLayers([
         { id: baseId, name: 'Current cel', visible: true, opacity: 100 },
       ]);
@@ -1492,6 +1765,12 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       setMediaNotice(null);
       setCelTransformBounds(canvasContentBounds(base));
       clearCelLayerSelection();
+      setCelRegionSelection({ x: 0, y: 0, width: 0, height: 0 });
+      setCelRegionMode('rectangle');
+      setCelAgentSelections([]);
+      setCelAgentTargetId(null);
+      setCelAgentBundleStatus('draft');
+      setCelAgentBundleId(null);
     };
 
     const addCelEditLayer = (name = 'Paint layer') => {
@@ -1539,6 +1818,9 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       });
       celEditCanvases.current.clear();
       celEditFrameId.current = '';
+      celRegionMask.current = null;
+      celRegionEdge.current = null;
+      celPendingEdits.current.clear();
       setCelEditLayers([]);
       setActiveCelEditLayerId('');
       setCelIllustrationMode(false);
@@ -1546,6 +1828,11 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       setTool('brush');
       setCelTransformBounds(null);
       clearCelLayerSelection();
+      setCelRegionSelection({ x: 0, y: 0, width: 0, height: 0 });
+      setCelAgentSelections([]);
+      setCelAgentTargetId(null);
+      setCelAgentBundleStatus('draft');
+      setCelAgentBundleId(null);
       setMediaNotice({
         tone: 'success',
         text: 'Cel layers were flattened into one animation cel.',
@@ -1622,6 +1909,426 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       setActiveCelEditLayerId(below.id);
       setCelTransformBounds(canvasContentBounds(target));
       clearCelLayerSelection();
+    };
+
+    const markCelAgentBundleDraft = () => {
+      setCelAgentBundleStatus('draft');
+      setCelAgentBundleId(null);
+      celPendingEdits.current.clear();
+    };
+
+    const nextCelAgentId = (prefix: string) => {
+      celAgentSequence.current += 1;
+      return `${prefix}-${celAgentSequence.current}`;
+    };
+
+    const captureCelAgentSelection = (): CelAgentSelectionItem | null => {
+      if (!canEditCelWithAgent || !activeCelEditLayer) return null;
+      const target = { ...celRegionSelection };
+      const padding = Math.min(
+        96,
+        Math.max(36, Math.round(Math.min(target.width, target.height) * 0.18)),
+      );
+      const source: CanvasBounds = {
+        x: Math.max(0, Math.floor(target.x - padding)),
+        y: Math.max(0, Math.floor(target.y - padding)),
+        width: 0,
+        height: 0,
+      };
+      source.width = Math.min(
+        WIDTH - source.x,
+        Math.ceil(target.x + target.width + padding) - source.x,
+      );
+      source.height = Math.min(
+        HEIGHT - source.y,
+        Math.ceil(target.y + target.height + padding) - source.y,
+      );
+      const crop = (
+        input: HTMLCanvasElement,
+        mimeType: 'image/png' | 'image/jpeg',
+        quality?: number,
+      ) => {
+        const output = document.createElement('canvas');
+        output.width = source.width;
+        output.height = source.height;
+        output
+          .getContext('2d')!
+          .drawImage(
+            input,
+            source.x,
+            source.y,
+            source.width,
+            source.height,
+            0,
+            0,
+            source.width,
+            source.height,
+          );
+        return output.toDataURL(mimeType, quality);
+      };
+      const selectionCrop = document.createElement('canvas');
+      selectionCrop.width = source.width;
+      selectionCrop.height = source.height;
+      const maskSource = celRegionMask.current;
+      if (maskSource)
+        selectionCrop
+          .getContext('2d')!
+          .drawImage(
+            maskSource,
+            source.x,
+            source.y,
+            source.width,
+            source.height,
+            0,
+            0,
+            source.width,
+            source.height,
+          );
+      const mask = document.createElement('canvas');
+      mask.width = source.width;
+      mask.height = source.height;
+      const maskCtx = mask.getContext('2d')!;
+      maskCtx.fillStyle = '#000';
+      maskCtx.fillRect(0, 0, mask.width, mask.height);
+      maskCtx.drawImage(selectionCrop, 0, 0);
+      const composite = compositeCelEditCanvas();
+      const context = document.createElement('canvas');
+      context.width = source.width;
+      context.height = source.height;
+      const contextCtx = context.getContext('2d')!;
+      contextCtx.drawImage(
+        composite,
+        source.x,
+        source.y,
+        source.width,
+        source.height,
+        0,
+        0,
+        source.width,
+        source.height,
+      );
+      contextCtx.globalCompositeOperation = 'destination-in';
+      contextCtx.drawImage(selectionCrop, 0, 0);
+      const preview = document.createElement('canvas');
+      preview.width = 144;
+      preview.height = 92;
+      const scale = Math.min(
+        preview.width / source.width,
+        preview.height / source.height,
+      );
+      const previewWidth = source.width * scale;
+      const previewHeight = source.height * scale;
+      preview
+        .getContext('2d')!
+        .drawImage(
+          context,
+          (preview.width - previewWidth) / 2,
+          (preview.height - previewHeight) / 2,
+          previewWidth,
+          previewHeight,
+        );
+      const activeLayerCanvas =
+        celEditCanvases.current.get(activeCelEditLayer.id) || makeCanvas();
+      return {
+        id: nextCelAgentId('cel-selection'),
+        name: `Region ${celAgentSelections.length + 1}`,
+        layerId: activeCelEditLayer.id,
+        layerName: activeCelEditLayer.name,
+        source,
+        selection: target,
+        mask: selectionCrop
+          .getContext('2d')!
+          .getImageData(0, 0, source.width, source.height),
+        compositeCrop: crop(composite, 'image/jpeg', 0.9),
+        activeLayerCrop: crop(activeLayerCanvas, 'image/png'),
+        maskDataUrl: mask.toDataURL('image/png'),
+        contextImage: context.toDataURL('image/png'),
+        previewDataUrl: preview.toDataURL('image/png'),
+      };
+    };
+
+    const addCelSelectionToAgentBundle = () => {
+      if (celAgentBundleStatus === 'sent' || celAgentSelections.length >= 12)
+        return;
+      const item = captureCelAgentSelection();
+      if (!item) return;
+      setCelAgentSelections((items) => [...items, item]);
+      if (!celAgentTargetId) setCelAgentTargetId(item.id);
+      markCelAgentBundleDraft();
+      clearCelRegionSelection();
+    };
+
+    const removeCelAgentSelection = (itemId: string) => {
+      setCelAgentSelections((items) => {
+        const remaining = items.filter((item) => item.id !== itemId);
+        if (celAgentTargetId === itemId)
+          setCelAgentTargetId(remaining[0]?.id || null);
+        return remaining;
+      });
+      markCelAgentBundleDraft();
+    };
+
+    const moveCelAgentContext = (itemId: string, offset: -1 | 1) => {
+      setCelAgentSelections((items) => {
+        const target = items.find((item) => item.id === celAgentTargetId);
+        const contexts = items.filter((item) => item.id !== celAgentTargetId);
+        const index = contexts.findIndex((item) => item.id === itemId);
+        const nextIndex = index + offset;
+        if (index < 0 || nextIndex < 0 || nextIndex >= contexts.length)
+          return items;
+        [contexts[index], contexts[nextIndex]] = [
+          contexts[nextIndex],
+          contexts[index],
+        ];
+        return target ? [target, ...contexts] : contexts;
+      });
+      markCelAgentBundleDraft();
+    };
+
+    const sendCelAgentBundle = () => {
+      if (!celAgentTarget) return;
+      setCelAgentBundleId(nextCelAgentId('cel-bundle'));
+      setCelAgentBundleStatus('sent');
+      celPendingEdits.current.clear();
+    };
+
+    const prepareCelIllustrationEdit = (editPrompt = '') => {
+      const target = celAgentTarget;
+      if (
+        !celIllustrationMode ||
+        celAgentBundleStatus !== 'sent' ||
+        !celAgentBundleId ||
+        !target
+      )
+        return {
+          ready: false,
+          code: 'cel_bundle_required',
+          message:
+            'Open Illustrate cel, add at least one region to Agent edit, and press Send to agent before requesting pixels.',
+          agentPolicy: celAgentEditPolicy,
+        };
+      const cleanPrompt = editPrompt.trim();
+      const contexts = celAgentSelections.filter((item) => item.id !== target.id);
+      const id = nextCelAgentId('cel-edit');
+      celPendingEdits.current.set(id, {
+        id,
+        bundleId: celAgentBundleId,
+        frameId: celEditFrameId.current,
+        prompt: cleanPrompt,
+        source: { ...target.source },
+        selection: { ...target.selection },
+        mask: target.mask,
+        contextCount: contexts.length,
+      });
+      while (celPendingEdits.current.size > 6)
+        celPendingEdits.current.delete(celPendingEdits.current.keys().next().value!);
+      const relativeSelection = {
+        x: target.selection.x - target.source.x,
+        y: target.selection.y - target.source.y,
+        width: target.selection.width,
+        height: target.selection.height,
+      };
+      const targetPayload = {
+        id: target.id,
+        name: target.name,
+        layer: { id: target.layerId, name: target.layerName },
+        compositeCrop: {
+          dataUrl: target.compositeCrop,
+          mimeType: 'image/jpeg',
+          width: target.source.width,
+          height: target.source.height,
+        },
+        activeLayerCrop: {
+          dataUrl: target.activeLayerCrop,
+          mimeType: 'image/png',
+          width: target.source.width,
+          height: target.source.height,
+        },
+        mask: {
+          dataUrl: target.maskDataUrl,
+          mimeType: 'image/png',
+          width: target.source.width,
+          height: target.source.height,
+          whiteMeans: 'editable',
+        },
+        selection: relativeSelection,
+        placement: target.source,
+      };
+      return {
+        editId: id,
+        bundleId: celAgentBundleId,
+        mode: 'cel-illustration',
+        frameId: celEditFrameId.current,
+        prompt: cleanPrompt || null,
+        target: targetPayload,
+        context: contexts.map((item, order) => ({
+          id: item.id,
+          order,
+          name: item.name,
+          role: 'context',
+          image: {
+            dataUrl: item.contextImage,
+            mimeType: 'image/png',
+            width: item.source.width,
+            height: item.source.height,
+          },
+          selection: item.selection,
+          placement: item.source,
+        })),
+        compositeCrop: targetPayload.compositeCrop,
+        activeLayerCrop: targetPayload.activeLayerCrop,
+        mask: targetPayload.mask,
+        selection: relativeSelection,
+        placement: target.source,
+        outputContract: `Return one PNG or WebP of exactly ${target.source.width}×${target.source.height}px. The app will reveal it only through the edit-target mask as a new temporary cel layer.`,
+        agentPolicy: celAgentEditPolicy,
+      };
+    };
+
+    const insertCelIllustrationResult = async (
+      editId: string,
+      imageDataUrl: string,
+      requestedName?: string,
+    ) => {
+      const pending = celPendingEdits.current.get(editId);
+      if (!pending)
+        throw new Error('Unknown or expired editId. Call prepare_ai_edit again.');
+      if (!celIllustrationMode || pending.frameId !== celEditFrameId.current)
+        throw new Error('Return to the cel illustration session that owns this edit.');
+      if (!/^data:image\/(png|jpeg|webp);base64,/i.test(imageDataUrl))
+        throw new Error('imageDataUrl must be a base64 PNG, JPEG, or WebP data URL.');
+      if (imageDataUrl.length > 14_000_000)
+        throw new Error('Generated image is larger than the 10 MB MVP limit.');
+      const image = new Image();
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () =>
+          reject(new Error('Generated image could not be decoded.'));
+        image.src = imageDataUrl;
+      });
+      const id = nextCelAgentId('cel-layer-ai');
+      const canvas = makeCanvas();
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(
+        image,
+        pending.source.x,
+        pending.source.y,
+        pending.source.width,
+        pending.source.height,
+      );
+      const mask = document.createElement('canvas');
+      mask.width = pending.source.width;
+      mask.height = pending.source.height;
+      mask.getContext('2d')!.putImageData(pending.mask, 0, 0);
+      ctx.save();
+      ctx.globalCompositeOperation = 'destination-in';
+      ctx.drawImage(mask, pending.source.x, pending.source.y);
+      ctx.restore();
+      celEditCanvases.current.set(id, canvas);
+      const name =
+        requestedName?.trim() ||
+        `AI — ${pending.prompt.slice(0, 34) || 'agent edit'}${pending.prompt.length > 34 ? '…' : ''}`;
+      setCelEditLayers((items) => [
+        { id, name, visible: true, opacity: 100 },
+        ...items,
+      ]);
+      setActiveCelEditLayerId(id);
+      setCelTransformBounds(canvasContentBounds(canvas));
+      celPendingEdits.current.delete(editId);
+      requestAnimationFrame(render);
+      return {
+        layerId: id,
+        name,
+        bundleId: pending.bundleId,
+        placement: pending.source,
+        clippedToSelection: pending.selection,
+        contextReferencesUsed: pending.contextCount,
+        mode: 'cel-illustration',
+      };
+    };
+
+    const getCelIllustrationState = () => ({
+      active: active && celIllustrationMode,
+      mode: 'cel-illustration',
+      canvas: { width: WIDTH, height: HEIGHT, zoom },
+      frameId: celEditFrameId.current || null,
+      activeTool: tool,
+      activeLayer: activeCelEditLayerId,
+      selection: celRegionSelection,
+      agentPolicy: celAgentEditPolicy,
+      agentEdit: celAgentBundleReady
+        ? {
+            ready: true,
+            bundleId: celAgentBundleId,
+            target: celAgentTarget
+              ? {
+                  id: celAgentTarget.id,
+                  name: celAgentTarget.name,
+                  selection: celAgentTarget.selection,
+                  layerId: celAgentTarget.layerId,
+                }
+              : null,
+            context: celAgentContexts.map((item, order) => ({
+              id: item.id,
+              name: item.name,
+              order,
+              selection: item.selection,
+            })),
+            nextStep:
+              'Call prepare_ai_edit to fetch the frozen cel target pixels and context references, then insert through insert_ai_result.',
+          }
+        : {
+            ready: false,
+            code: celAgentSelections.length
+              ? 'cel_bundle_not_sent'
+              : 'cel_bundle_required',
+            draft: {
+              targetId: celAgentTargetId,
+              contextCount: celAgentContexts.length,
+              currentSelectionReady: canEditCelWithAgent,
+            },
+            userInstruction:
+              'Tell the user to choose Region select in Illustrate cel, add a region to Agent edit, and press Send to agent.',
+          },
+      layers: celEditLayers.map(({ id, name, visible, opacity }) => ({
+        id,
+        name,
+        visible,
+        opacity,
+        temporary: true,
+      })),
+    });
+
+    const setCelIllustrationTool = (next: string) => {
+      if (!celIllustrationMode)
+        return { changed: false, reason: 'Cel illustration mode is not active.' };
+      const allowed = celIllustrationToolMeta.map((item) => item.id);
+      if (!allowed.includes(next as AnimationTool))
+        return { changed: false, reason: 'Unknown cel illustration tool.' };
+      setTool(next as AnimationTool);
+      return { changed: true, tool: next };
+    };
+
+    const selectCelIllustrationRegion = (selection: CanvasBounds) => {
+      if (!celIllustrationMode)
+        return { selected: false, reason: 'Cel illustration mode is not active.' };
+      setTool('select');
+      setCelRegionMode('rectangle');
+      return applyCelRectangleSelection(selection);
+    };
+
+    const setCelIllustrationLayerVisibility = (
+      layerId: string,
+      visible: boolean,
+    ) => {
+      if (!celEditLayers.some((layer) => layer.id === layerId))
+        return { changed: false, reason: 'Unknown cel illustration layer.' };
+      setCelEditLayers((items) =>
+        items.map((layer) =>
+          layer.id === layerId ? { ...layer, visible } : layer,
+        ),
+      );
+      return { changed: true, layerId, visible };
     };
     const beginAgentTargetDrag = (
       event: React.PointerEvent<HTMLButtonElement>,
@@ -2189,6 +2896,21 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         return;
       }
       event.currentTarget.setPointerCapture(event.pointerId);
+      if (celIllustrationMode && tool === 'select') {
+        drawing.current = true;
+        lastPoint.current = at;
+        if (celRegionMode === 'rectangle') {
+          clearCelRegionSelection();
+          celRegionStart.current = at;
+        } else if (celRegionMode === 'brush') {
+          paintCelRegionStroke(at, at);
+        } else {
+          clearCelRegionSelection();
+          celRegionLassoPoints.current = [at];
+          redrawCelEditOverlay();
+        }
+        return;
+      }
       if (celIllustrationMode && tool === 'layer-lasso') {
         const selected = celLayerSelection.current;
         const bounds = selected?.bounds;
@@ -2263,7 +2985,28 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       }
       if (!drawing.current) return;
       const next = point(event);
-      if (
+      if (celIllustrationMode && tool === 'select') {
+        if (celRegionMode === 'rectangle') {
+          const start = celRegionStart.current;
+          applyCelRectangleSelection({
+            x: Math.min(start.x, next.x),
+            y: Math.min(start.y, next.y),
+            width: Math.abs(next.x - start.x),
+            height: Math.abs(next.y - start.y),
+          });
+        } else if (celRegionMode === 'brush') {
+          paintCelRegionStroke(lastPoint.current, next);
+        } else {
+          const points = celRegionLassoPoints.current;
+          const previous = points[points.length - 1];
+          if (
+            !previous ||
+            Math.hypot(next.x - previous.x, next.y - previous.y) > 2
+          )
+            points.push(next);
+          redrawCelEditOverlay();
+        }
+      } else if (
         celIllustrationMode &&
         tool === 'layer-lasso' &&
         activeCelSelectionTransform.current
@@ -2288,6 +3031,13 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       lastPoint.current = next;
     };
     const pointerUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
+      if (
+        drawing.current &&
+        celIllustrationMode &&
+        tool === 'select' &&
+        celRegionMode === 'lasso'
+      )
+        finishCelRegionLasso();
       if (
         drawing.current &&
         celIllustrationMode &&
@@ -2317,6 +3067,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         event.currentTarget.releasePointerCapture(event.pointerId);
       if (
         celIllustrationMode &&
+        tool !== 'select' &&
         tool !== 'layer-lasso' &&
         tool !== 'pan'
       ) {
@@ -3665,6 +4416,16 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       getAgentAnimationState,
       prepareAgentAnimationEdit,
       insertAgentCelClip,
+      getCelIllustrationState,
+      prepareCelIllustrationEdit,
+      insertCelIllustrationResult,
+      createCelIllustrationLayer: (name = 'Agent layer') => ({
+        layerId: addCelEditLayer(name),
+      }),
+      setCelIllustrationTool,
+      selectCelIllustrationRegion,
+      mergeCelIllustrationLayerDown: mergeCelEditLayerDown,
+      setCelIllustrationLayerVisibility,
     }));
 
     useEffect(() => {
@@ -3985,6 +4746,8 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
                     setCelTransformBounds(
                       canvas ? canvasContentBounds(canvas) : null,
                     );
+                  } else if (id === 'select') {
+                    requestAnimationFrame(redrawCelEditOverlay);
                   } else if (id !== 'layer-lasso') {
                     celEditOverlayRef.current
                       ?.getContext('2d')
@@ -4208,6 +4971,78 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
                   />
                   <code>{textSize}px</code>
                   <em>Click the cel, type, then click away</em>
+                </>
+              )}
+              {tool === 'select' && celIllustrationMode && (
+                <>
+                  <div className="selection-modes" aria-label="Selection shape">
+                    <button
+                      className={celRegionMode === 'rectangle' ? 'active' : ''}
+                      title="Rectangle selection"
+                      aria-label="Rectangle selection"
+                      onClick={() => {
+                        setCelRegionMode('rectangle');
+                        clearCelRegionSelection();
+                      }}
+                    >
+                      <SquareDashed />
+                    </button>
+                    <button
+                      className={celRegionMode === 'brush' ? 'active' : ''}
+                      title="Brush selection"
+                      aria-label="Brush selection"
+                      onClick={() => {
+                        setCelRegionMode('brush');
+                        clearCelRegionSelection();
+                      }}
+                    >
+                      <Paintbrush />
+                    </button>
+                    <button
+                      className={celRegionMode === 'lasso' ? 'active' : ''}
+                      title="Lasso selection"
+                      aria-label="Lasso selection"
+                      onClick={() => {
+                        setCelRegionMode('lasso');
+                        clearCelRegionSelection();
+                      }}
+                    >
+                      <LassoSelect />
+                    </button>
+                  </div>
+                  {celRegionMode === 'brush' && (
+                    <>
+                      <span>Size</span>
+                      <Slider
+                        min={8}
+                        max={180}
+                        value={[celRegionBrushSize]}
+                        onValueChange={(value) =>
+                          setCelRegionBrushSize(
+                            Math.round(
+                              Array.isArray(value) ? value[0] : Number(value),
+                            ),
+                          )
+                        }
+                      />
+                      <code>{celRegionBrushSize}px</code>
+                    </>
+                  )}
+                  <em>
+                    {celRegionMode === 'rectangle'
+                      ? 'Drag a rectangle'
+                      : celRegionMode === 'brush'
+                        ? 'Paint the area to include'
+                        : 'Draw around an area · release to close'}
+                  </em>
+                  <button
+                    className="selection-clear"
+                    onClick={clearCelRegionSelection}
+                    title="Clear selection"
+                    aria-label="Clear selection"
+                  >
+                    <X />
+                  </button>
                 </>
               )}
               {tool === 'eyedropper' && (
@@ -4894,149 +5729,380 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
           </div>
           <aside className="animation-panel">
             {celIllustrationMode ? (
-              <div className="cel-layers-panel">
-                <div className="cel-layers-heading">
-                  <span>
-                    <Layers3 />
-                    <strong>Cel layers</strong>
-                  </span>
-                  <small>{celEditLayers.length}</small>
-                </div>
-                <p>
-                  These layers belong only to this editing session. Returning
-                  to Animate permanently flattens them into one cel.
-                </p>
-                {mediaNotice && (
-                  <output
-                    className={`animation-media-notice ${mediaNotice.tone}`}
-                  >
-                    {mediaNotice.text}
-                  </output>
-                )}
-                {activeCelEditLayer && (
-                  <label className="cel-layer-opacity">
-                    <span>Opacity</span>
-                    <Slider
-                      min={0}
-                      max={100}
-                      value={[activeCelEditLayer.opacity]}
-                      onValueChange={(value) => {
-                        const opacity = Math.round(
-                          Array.isArray(value) ? value[0] : Number(value),
-                        );
-                        setCelEditLayers((items) =>
-                          items.map((layer) =>
-                            layer.id === activeCelEditLayer.id
-                              ? { ...layer, opacity }
-                              : layer,
-                          ),
-                        );
-                      }}
-                    />
-                    <strong>{activeCelEditLayer.opacity}%</strong>
-                  </label>
-                )}
-                <div className="cel-layer-list">
-                  {celEditLayers.map((layer) => (
+              <>
+                <section className="ai-panel agent-bundle-panel cel-agent-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <WandSparkles />
+                      <strong>Agent edit</strong>
+                    </div>
+                    <span>
+                      {celAgentBundleReady
+                        ? 'bundle ready'
+                        : celAgentSelections.length
+                          ? 'draft bundle'
+                          : canEditCelWithAgent
+                            ? 'selection ready'
+                            : 'select a region'}
+                    </span>
+                  </div>
+                  {celAgentBundleStatus === 'sent' ? (
+                    <div className="agent-sent-hint">
+                      <strong>
+                        <Check /> Bundle ready for your agent
+                      </strong>
+                      <span>
+                        One edit target and {celAgentContexts.length} context
+                        reference{celAgentContexts.length === 1 ? '' : 's'} are
+                        frozen and available through WebMCP.
+                      </span>
+                      <button type="button" onClick={markCelAgentBundleDraft}>
+                        Edit bundle
+                      </button>
+                    </div>
+                  ) : canEditCelWithAgent ? (
+                    <div className="agent-ready-hint">
+                      <strong>Selection ready to add.</strong>
+                      <span>
+                        Add this area to the agent request. Nothing is sent yet.
+                      </span>
+                      <Button
+                        size="sm"
+                        className="agent-add-button"
+                        onClick={addCelSelectionToAgentBundle}
+                        disabled={celAgentSelections.length >= 12}
+                      >
+                        <Plus />
+                        {celAgentSelections.length >= 12
+                          ? 'Bundle full'
+                          : 'Add selection'}
+                      </Button>
+                    </div>
+                  ) : (
+                    <p className="tool-required-hint">
+                      <strong>
+                        {celAgentSelections.length
+                          ? 'Select another area.'
+                          : 'Select an area first.'}
+                      </strong>{' '}
+                      {celAgentSelections.length
+                        ? 'Draw another region to add more visual context.'
+                        : 'Choose Region select, then mark the part of this cel you want your agent to edit or reference.'}
+                    </p>
+                  )}
+                  {celAgentSelections.length > 0 && (
                     <div
-                      key={layer.id}
-                      className={
-                        layer.id === activeCelEditLayerId ? 'active' : ''
-                      }
+                      className={`agent-bundle ${celAgentBundleStatus === 'sent' ? 'locked' : ''}`}
                     >
-                      <button
-                        type="button"
-                        className="cel-layer-visibility"
-                        aria-label={`${layer.visible ? 'Hide' : 'Show'} ${layer.name}`}
-                        onClick={() => {
+                      <div className="agent-bundle-section agent-target-section">
+                        <div className="agent-bundle-label">
+                          <span>
+                            <strong>Edit target</strong>
+                            <small>
+                              The agent edits this region and adds the result as
+                              a new temporary layer.
+                            </small>
+                          </span>
+                          <em>1 only</em>
+                        </div>
+                        <div className="agent-target-drop">
+                          {celAgentTarget ? (
+                            <div className="agent-selection-card target">
+                              <span className="agent-target-icon">
+                                <Focus />
+                              </span>
+                              <span
+                                className="agent-selection-thumb"
+                                style={{
+                                  backgroundImage: `url(${celAgentTarget.previewDataUrl}), repeating-conic-gradient(#35323a 0 25%,#2a282f 0 50%)`,
+                                }}
+                                aria-hidden="true"
+                              />
+                              <span className="agent-selection-copy">
+                                <strong>{celAgentTarget.name}</strong>
+                                <small>
+                                  {Math.round(celAgentTarget.selection.width)} ×{' '}
+                                  {Math.round(celAgentTarget.selection.height)} ·{' '}
+                                  {celAgentTarget.layerName}
+                                </small>
+                              </span>
+                              <span className="agent-card-actions">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    removeCelAgentSelection(celAgentTarget.id)
+                                  }
+                                  disabled={celAgentBundleStatus === 'sent'}
+                                  aria-label={`Remove ${celAgentTarget.name}`}
+                                >
+                                  <X />
+                                </button>
+                              </span>
+                            </div>
+                          ) : (
+                            <span>Select a region to create an edit target</span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="agent-bundle-section agent-context-section">
+                        <div className="agent-bundle-label">
+                          <span>
+                            <strong>Context references</strong>
+                            <small>
+                              These help the agent understand the cel. They will
+                              not be edited.
+                            </small>
+                          </span>
+                          <em>{celAgentContexts.length}</em>
+                        </div>
+                        <div className="agent-context-list">
+                          {celAgentContexts.map((item, index) => (
+                            <div
+                              key={item.id}
+                              className="agent-selection-card context"
+                            >
+                              <span className="agent-target-icon">
+                                <Move />
+                              </span>
+                              <span
+                                className="agent-selection-thumb"
+                                style={{
+                                  backgroundImage: `url(${item.previewDataUrl}), repeating-conic-gradient(#35323a 0 25%,#2a282f 0 50%)`,
+                                }}
+                                aria-hidden="true"
+                              />
+                              <span className="agent-selection-copy">
+                                <strong>{item.name}</strong>
+                                <small>
+                                  {Math.round(item.selection.width)} ×{' '}
+                                  {Math.round(item.selection.height)} ·{' '}
+                                  {item.layerName}
+                                </small>
+                              </span>
+                              <span className="agent-card-actions">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setCelAgentTargetId(item.id);
+                                    markCelAgentBundleDraft();
+                                  }}
+                                  title="Make edit target"
+                                  aria-label={`Make ${item.name} the edit target`}
+                                >
+                                  <Focus />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    moveCelAgentContext(item.id, -1)
+                                  }
+                                  disabled={index === 0}
+                                  aria-label={`Move ${item.name} up`}
+                                >
+                                  <ArrowUp />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => moveCelAgentContext(item.id, 1)}
+                                  disabled={
+                                    index === celAgentContexts.length - 1
+                                  }
+                                  aria-label={`Move ${item.name} down`}
+                                >
+                                  <ArrowDown />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    removeCelAgentSelection(item.id)
+                                  }
+                                  disabled={celAgentBundleStatus === 'sent'}
+                                  aria-label={`Remove ${item.name}`}
+                                >
+                                  <X />
+                                </button>
+                              </span>
+                            </div>
+                          ))}
+                          <div className="agent-context-end">
+                            {celAgentContexts.length
+                              ? 'Use the arrows to reorder context'
+                              : 'Add more selections for context'}
+                          </div>
+                        </div>
+                      </div>
+                      <Button
+                        size="sm"
+                        className="agent-send-button"
+                        onClick={sendCelAgentBundle}
+                        disabled={
+                          !celAgentTarget || celAgentBundleStatus === 'sent'
+                        }
+                      >
+                        <Send /> Send 1 target + {celAgentContexts.length}{' '}
+                        reference{celAgentContexts.length === 1 ? '' : 's'}
+                      </Button>
+                    </div>
+                  )}
+                </section>
+                <section className="layers-panel cel-workbench-layers">
+                  <div className="panel-heading layer-heading">
+                    <div>
+                      <Layers3 />
+                      <strong>Layers</strong>
+                      <span className="layer-count">
+                        {celEditLayers.length}
+                      </span>
+                    </div>
+                    <div className="layer-actions">
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Move layer up"
+                        onClick={() => moveCelEditLayer(-1)}
+                        disabled={activeCelEditLayerIndex <= 0}
+                      >
+                        <ArrowUp />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Move layer down"
+                        onClick={() => moveCelEditLayer(1)}
+                        disabled={
+                          activeCelEditLayerIndex < 0 ||
+                          activeCelEditLayerIndex >= celEditLayers.length - 1
+                        }
+                      >
+                        <ArrowDown />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="New layer"
+                        onClick={() => addCelEditLayer()}
+                      >
+                        <Plus />
+                      </Button>
+                    </div>
+                  </div>
+                  <p className="cel-session-warning">
+                    These layers belong only to this editing session. Returning
+                    to Animate permanently flattens them into one cel.
+                  </p>
+                  {activeCelEditLayer && (
+                    <div className="opacity-row">
+                      <span>Opacity</span>
+                      <Slider
+                        min={0}
+                        max={100}
+                        value={[activeCelEditLayer.opacity]}
+                        onValueChange={(value) => {
+                          const opacity = Math.round(
+                            Array.isArray(value) ? value[0] : Number(value),
+                          );
                           setCelEditLayers((items) =>
-                            items.map((item) =>
-                              item.id === layer.id
-                                ? { ...item, visible: !item.visible }
-                                : item,
+                            items.map((layer) =>
+                              layer.id === activeCelEditLayer.id
+                                ? { ...layer, opacity }
+                                : layer,
                             ),
                           );
                         }}
-                      >
-                        {layer.visible ? <Eye /> : <EyeOff />}
-                      </button>
-                      <button
-                        type="button"
-                        className="cel-layer-select"
-                        aria-label={`Select layer ${layer.name}`}
-                        aria-pressed={layer.id === activeCelEditLayerId}
-                        onClick={() => selectCelEditLayer(layer.id)}
-                      >
-                        <canvas
-                          ref={(node) => {
-                            if (node)
-                              celLayerThumbnailRefs.current.set(layer.id, node);
-                            else
-                              celLayerThumbnailRefs.current.delete(layer.id);
-                          }}
-                          width={48}
-                          height={32}
-                        />
-                        <span className="cel-layer-name">
-                          <strong>{layer.name}</strong>
-                          <small>Illustration layer</small>
-                        </span>
-                      </button>
+                      />
+                      <span>{activeCelEditLayer.opacity}%</span>
                     </div>
-                  ))}
-                </div>
-                <div className="cel-layer-order-actions">
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    onClick={() => moveCelEditLayer(-1)}
-                    disabled={activeCelEditLayerIndex <= 0}
-                    aria-label="Move layer up"
-                  >
-                    <ChevronUp />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    onClick={() => moveCelEditLayer(1)}
-                    disabled={
-                      activeCelEditLayerIndex < 0 ||
-                      activeCelEditLayerIndex >= celEditLayers.length - 1
-                    }
-                    aria-label="Move layer down"
-                  >
-                    <ChevronDown />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => addCelEditLayer()}
-                  >
-                    <Plus /> New layer
-                  </Button>
-                </div>
-                <div className="cel-layer-footer-actions">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={mergeCelEditLayerDown}
-                    disabled={
-                      activeCelEditLayerIndex < 0 ||
-                      activeCelEditLayerIndex >= celEditLayers.length - 1
-                    }
-                  >
-                    <Merge /> Merge down
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    onClick={deleteCelEditLayer}
-                    aria-label="Delete layer"
-                  >
-                    <Trash2 />
-                  </Button>
-                </div>
-              </div>
+                  )}
+                  <div className="layer-list">
+                    {celEditLayers.map((layer) => (
+                      <div
+                        key={layer.id}
+                        className={`layer-row ${activeCelEditLayerId === layer.id ? 'active' : ''}`}
+                      >
+                        <button
+                          type="button"
+                          className="visibility-toggle"
+                          aria-label={layer.visible ? 'Hide layer' : 'Show layer'}
+                          onClick={() => {
+                            setCelEditLayers((items) =>
+                              items.map((item) =>
+                                item.id === layer.id
+                                  ? { ...item, visible: !item.visible }
+                                  : item,
+                              ),
+                            );
+                          }}
+                        >
+                          {layer.visible ? <Eye /> : <EyeOff />}
+                        </button>
+                        <button
+                          type="button"
+                          className="cel-workbench-layer-select"
+                          aria-label={`Select layer ${layer.name}`}
+                          onClick={() => selectCelEditLayer(layer.id)}
+                        >
+                          <canvas
+                            ref={(node) => {
+                              if (node)
+                                celLayerThumbnailRefs.current.set(layer.id, node);
+                              else
+                                celLayerThumbnailRefs.current.delete(layer.id);
+                            }}
+                            width={68}
+                            height={50}
+                            className="layer-thumb"
+                            aria-hidden="true"
+                          />
+                          <span className="layer-name">
+                            {layer.name}
+                            <small>Pixel layer</small>
+                          </span>
+                          {activeCelEditLayerId === layer.id && (
+                            <Check className="active-check" />
+                          )}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="layer-footer">
+                    <div className="layer-footer-main">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => addCelEditLayer()}
+                      >
+                        <Plus /> New layer
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={mergeCelEditLayerDown}
+                        disabled={
+                          activeCelEditLayerIndex < 0 ||
+                          activeCelEditLayerIndex >= celEditLayers.length - 1
+                        }
+                      >
+                        <Merge className="merge-down-icon" /> Merge down
+                      </Button>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Delete layer"
+                      onClick={deleteCelEditLayer}
+                    >
+                      <Trash2 />
+                    </Button>
+                  </div>
+                  {mediaNotice && (
+                    <output
+                      className={`animation-media-notice ${mediaNotice.tone}`}
+                    >
+                      {mediaNotice.text}
+                    </output>
+                  )}
+                </section>
+              </>
             ) : (
               <>
                 <section className="animation-ai-panel">
