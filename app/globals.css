@@ -100,6 +100,9 @@ button {
   box-shadow: 0 1px 0 rgba(0, 0, 0, 0.4);
   z-index: 20;
 }
+.topbar > * {
+  min-width: 0;
+}
 .brand-area,
 .brand-lockup,
 .header-actions,
@@ -280,23 +283,31 @@ button {
   overflow: hidden;
 }
 .header-actions > [data-slot='button'] {
+  min-width: 0;
   flex: 0 0 auto;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.header-actions > [data-slot='button'] > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .header-action-short {
   display: none;
 }
-@media (min-width: 1041px) {
+@media (min-width: 1121px) {
   .header-actions .header-save-button {
-    width: 88px;
+    width: 124px;
     justify-content: center;
   }
   .header-actions .header-export-button {
-    width: 104px;
+    width: 140px;
     justify-content: center;
   }
   .header-actions .export-workspace-button {
-    width: 132px;
+    width: 172px;
     justify-content: center;
   }
 }
@@ -359,6 +370,7 @@ button {
   display: none !important;
 }
 .mode-switch {
+  max-width: 100%;
   display: inline-flex;
   align-items: center;
   gap: 2px;
@@ -368,6 +380,7 @@ button {
   background: rgba(0, 0, 0, 0.16);
 }
 .mode-switch button {
+  min-width: 0;
   height: 22px;
   padding: 0 8px;
   border: 0;
@@ -378,6 +391,9 @@ button {
   font-size: 8px;
   font-weight: 620;
   letter-spacing: 0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .mode-switch button:hover {
   color: #d8d3dc;
@@ -402,6 +418,7 @@ button {
   display: flex;
   align-items: center;
   gap: 8px;
+  overflow: hidden;
 }
 .animator-brand > strong {
   font-size: 13px;
@@ -3051,7 +3068,7 @@ button {
     padding-inline: 34px;
   }
 }
-@media (max-width: 1040px) {
+@media (max-width: 1120px) {
   .header-actions > [data-slot='button'] {
     height: 30px !important;
     padding-inline: 8px !important;
@@ -3180,6 +3197,9 @@ button {
   .animator-brand > strong {
     display: none;
   }
+  .animator-topbar > .animator-brand {
+    width: 34px;
+  }
   .header-document-name,
   .document-title {
     display: none;
@@ -3191,5 +3211,32 @@ button {
   }
   .header-action-short {
     display: none;
+  }
+}
+@media (max-width: 420px) {
+  .topbar {
+    grid-template-columns: 34px minmax(0, 1fr);
+    gap: 3px;
+    padding-inline: 6px;
+  }
+  .header-center {
+    max-width: 96px;
+  }
+  .mode-switch button {
+    padding-inline: 5px;
+    font-size: 7px;
+  }
+  .header-actions {
+    width: max-content;
+    justify-self: end;
+    gap: 3px;
+  }
+  .header-actions > [data-slot='button'] {
+    width: 28px;
+    height: 28px !important;
+  }
+  .header-actions > [data-slot='button'] svg {
+    width: 14px;
+    height: 14px;
   }
 }

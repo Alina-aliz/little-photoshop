@@ -3047,7 +3047,6 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
               </button>
               <button className="active">Animate</button>
             </div>
-            <span className="header-document-name" aria-hidden="true" />
           </div>
           <div className="header-actions">
             <Button
