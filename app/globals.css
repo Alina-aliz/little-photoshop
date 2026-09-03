@@ -89,7 +89,7 @@ button,textarea,input { font: inherit; } button { color: inherit; }
 .color-button { width: 33px; height: 33px; display: grid; place-items: center; border: 0; border-radius: 7px; background: transparent; cursor: pointer; }
 .color-button:hover { background: rgba(255,255,255,.055); }
 .color-button>span { width: 18px; height: 18px; border-radius: 50%; border: 2px solid #eee; box-shadow: 0 0 0 1px rgba(0,0,0,.7),0 2px 7px rgba(0,0,0,.3); }
-.colour-picker { position: absolute; z-index: 50; left: 39px; top: -10px; width: 248px; padding: 11px; border: 1px solid rgba(255,255,255,.14); border-radius: 11px; background: rgba(31,29,37,.98); box-shadow: 0 18px 44px rgba(0,0,0,.52),0 0 0 1px rgba(88,62,112,.14); backdrop-filter: blur(16px); }
+.colour-picker { position: fixed; z-index: 50; left: 47px; bottom: 12px; width: min(248px,calc(100vw - 64px)); max-height: calc(100vh - 66px); max-height: calc(100dvh - 66px); overflow-y: auto; overscroll-behavior: contain; padding: 11px; border: 1px solid rgba(255,255,255,.14); border-radius: 11px; background: rgba(31,29,37,.98); box-shadow: 0 18px 44px rgba(0,0,0,.52),0 0 0 1px rgba(88,62,112,.14); backdrop-filter: blur(16px); scrollbar-width: thin; scrollbar-color: #4a4450 transparent; }
 .picker-heading,.recent-heading,.hex-row { display: flex; align-items: center; justify-content: space-between; }
 .picker-heading { margin-bottom: 9px; }.picker-heading strong { color: #e9e5ec; font-size: 10px; font-weight: 630; }.picker-heading code { color: #a8a1ae; font: 8px var(--font-geist-mono); }
 .colour-fields { display: grid; grid-template-columns: minmax(0,1fr) 19px; gap: 11px; height: 164px; margin-bottom: 10px; }
