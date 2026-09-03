@@ -206,6 +206,10 @@ export function Duet() {
   const displayRef = useRef<HTMLCanvasElement>(null);
   const selectionMaskRef = useRef<HTMLCanvasElement | null>(null);
   const selectionOverlayRef = useRef<HTMLCanvasElement>(null);
+  const selectionEdgeRef = useRef<HTMLCanvasElement | null>(null);
+  const selectionStripeRef = useRef<HTMLCanvasElement | null>(null);
+  const selectionHasMaskRef = useRef(false);
+  const selectionDashPhaseRef = useRef(0);
   const lassoPoints = useRef<Array<{ x: number; y: number }>>([]);
   const layerSelectionOverlayRef = useRef<HTMLCanvasElement>(null);
   const layerLassoPoints = useRef<Array<{ x: number; y: number }>>([]);
@@ -422,17 +426,51 @@ export function Duet() {
   }, []);
   const render = useCallback(() => renderLayerList(layers), [layers, renderLayerList]);
 
-  const redrawSelectionOverlay = useCallback(() => {
+  const redrawSelectionOverlay = useCallback((rebuildEdge = true) => {
     const overlay = selectionOverlayRef.current; const mask = selectionMaskRef.current;
     if (!overlay || !mask) return;
     const ctx = overlay.getContext('2d')!; ctx.clearRect(0, 0, WIDTH, HEIGHT);
-    ctx.save(); ctx.globalAlpha = .3; ctx.drawImage(mask, 0, 0); ctx.globalCompositeOperation = 'source-in'; ctx.fillStyle = '#8d65ff'; ctx.fillRect(0, 0, WIDTH, HEIGHT); ctx.restore();
+    if (selectionHasMaskRef.current) {
+      // Match the selection treatment used by image editors: keep the selected
+      // pixels untouched, dim everything outside, and trace the mask with a
+      // black-and-white moving edge that remains visible on any artwork.
+      ctx.save(); ctx.fillStyle = 'rgba(7, 6, 10, .48)'; ctx.fillRect(0, 0, WIDTH, HEIGHT); ctx.globalCompositeOperation = 'destination-out'; ctx.drawImage(mask, 0, 0); ctx.restore();
+
+      const edge = selectionEdgeRef.current || makeCanvas(); selectionEdgeRef.current = edge;
+      const edgeCtx = edge.getContext('2d')!;
+      if (rebuildEdge) {
+        edgeCtx.clearRect(0, 0, WIDTH, HEIGHT); edgeCtx.globalCompositeOperation = 'source-over';
+        const offsets = [[-2, 0], [2, 0], [0, -2], [0, 2], [-1, -1], [1, -1], [-1, 1], [1, 1]];
+        offsets.forEach(([x, y]) => edgeCtx.drawImage(mask, x, y));
+        edgeCtx.globalCompositeOperation = 'destination-out'; edgeCtx.drawImage(mask, 0, 0);
+      }
+
+      const stripe = selectionStripeRef.current || document.createElement('canvas');
+      if (!selectionStripeRef.current) { stripe.width = 12; stripe.height = 12; const stripeCtx = stripe.getContext('2d')!; stripeCtx.fillStyle = '#fff'; stripeCtx.fillRect(0, 0, 12, 12); stripeCtx.fillStyle = '#111015'; for (let offset = -12; offset < 24; offset += 12) { stripeCtx.beginPath(); stripeCtx.moveTo(offset, 0); stripeCtx.lineTo(offset + 6, 0); stripeCtx.lineTo(offset + 18, 12); stripeCtx.lineTo(offset + 12, 12); stripeCtx.closePath(); stripeCtx.fill(); } selectionStripeRef.current = stripe; }
+      const pattern = edgeCtx.createPattern(stripe, 'repeat');
+      if (pattern) { const phase = selectionDashPhaseRef.current; edgeCtx.save(); edgeCtx.globalCompositeOperation = 'source-in'; edgeCtx.translate(-phase, 0); edgeCtx.fillStyle = pattern; edgeCtx.fillRect(phase, 0, WIDTH + 12, HEIGHT); edgeCtx.restore(); }
+      ctx.save(); ctx.shadowColor = 'rgba(0,0,0,.85)'; ctx.shadowBlur = 1; ctx.drawImage(edge, 0, 0); ctx.restore();
+    }
     if (lassoPoints.current.length > 1) {
-      ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,.95)'; ctx.lineWidth = 2; ctx.setLineDash([7, 5]); ctx.beginPath();
+      ctx.save(); ctx.strokeStyle = 'rgba(0,0,0,.92)'; ctx.lineWidth = 4; ctx.beginPath();
+      lassoPoints.current.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+      ctx.stroke(); ctx.restore();
+      ctx.save(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.setLineDash([7, 5]); ctx.lineDashOffset = -selectionDashPhaseRef.current; ctx.beginPath();
       lassoPoints.current.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
       ctx.stroke(); ctx.restore();
     }
   }, []);
+
+  useEffect(() => {
+    if (selection.width <= 3 || selection.height <= 3) return;
+    let animationFrame = 0; let previousTime = 0;
+    const animateSelectionEdge = (time: number) => {
+      if (time - previousTime >= 120) { selectionDashPhaseRef.current = (selectionDashPhaseRef.current + 1) % 12; redrawSelectionOverlay(false); previousTime = time; }
+      animationFrame = requestAnimationFrame(animateSelectionEdge);
+    };
+    animationFrame = requestAnimationFrame(animateSelectionEdge);
+    return () => cancelAnimationFrame(animationFrame);
+  }, [redrawSelectionOverlay, selection.height, selection.width]);
   const redrawLayerSelectionOverlay = useCallback(() => {
     const overlay = layerSelectionOverlayRef.current; if (!overlay) return;
     const ctx = overlay.getContext('2d')!; ctx.clearRect(0, 0, WIDTH, HEIGHT);
@@ -483,21 +521,24 @@ export function Duet() {
   }, [redrawLayerSelectionOverlay, render]);
   const clearSelection = useCallback(() => {
     const mask = selectionMaskRef.current; if (mask) mask.getContext('2d')!.clearRect(0, 0, WIDTH, HEIGHT);
+    selectionHasMaskRef.current = false;
     lassoPoints.current = []; setSelection({ x: 0, y: 0, width: 0, height: 0 }); redrawSelectionOverlay();
   }, [redrawSelectionOverlay]);
   const applyRectangleSelection = useCallback((rect: Selection) => {
     const mask = selectionMaskRef.current; if (!mask) return;
     const safe = safeSelection(rect); const ctx = mask.getContext('2d')!; ctx.clearRect(0, 0, WIDTH, HEIGHT); ctx.fillStyle = '#fff'; ctx.fillRect(safe.x, safe.y, safe.width, safe.height);
+    selectionHasMaskRef.current = safe.width > 3 && safe.height > 3;
     setSelection(safe); redrawSelectionOverlay();
   }, [redrawSelectionOverlay]);
   const updateSelectionFromMask = useCallback(() => {
     const mask = selectionMaskRef.current; const bounds = mask ? contentBounds(mask) : null;
-    const next = bounds || { x: 0, y: 0, width: 0, height: 0 }; setSelection(next); redrawSelectionOverlay(); return next;
+    const next = bounds || { x: 0, y: 0, width: 0, height: 0 }; selectionHasMaskRef.current = !!bounds; setSelection(next); redrawSelectionOverlay(); return next;
   }, [redrawSelectionOverlay]);
   const paintSelectionStroke = useCallback((from: { x: number; y: number }, to: { x: number; y: number }) => {
     const mask = selectionMaskRef.current; if (!mask) return;
     const ctx = mask.getContext('2d')!; ctx.save(); ctx.strokeStyle = '#fff'; ctx.fillStyle = '#fff'; ctx.lineWidth = selectionBrushSize; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
     ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke(); ctx.beginPath(); ctx.arc(to.x, to.y, selectionBrushSize / 2, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+    selectionHasMaskRef.current = true;
     const radius = selectionBrushSize / 2; const strokeLeft = Math.max(0, Math.min(from.x, to.x) - radius); const strokeTop = Math.max(0, Math.min(from.y, to.y) - radius); const strokeRight = Math.min(WIDTH, Math.max(from.x, to.x) + radius); const strokeBottom = Math.min(HEIGHT, Math.max(from.y, to.y) + radius);
     setSelection((current) => current.width > 0 && current.height > 0 ? { x: Math.min(current.x, strokeLeft), y: Math.min(current.y, strokeTop), width: Math.max(current.x + current.width, strokeRight) - Math.min(current.x, strokeLeft), height: Math.max(current.y + current.height, strokeBottom) - Math.min(current.y, strokeTop) } : { x: strokeLeft, y: strokeTop, width: strokeRight - strokeLeft, height: strokeBottom - strokeTop });
     redrawSelectionOverlay();
@@ -513,7 +554,8 @@ export function Duet() {
   useEffect(() => {
     if (selectionMaskRef.current) return;
     const mask = makeCanvas(); const ctx = mask.getContext('2d')!; ctx.fillStyle = '#fff'; ctx.fillRect(selection.x, selection.y, selection.width, selection.height); selectionMaskRef.current = mask;
-    requestAnimationFrame(redrawSelectionOverlay);
+    selectionHasMaskRef.current = selection.width > 3 && selection.height > 3;
+    requestAnimationFrame(() => redrawSelectionOverlay());
   }, [redrawSelectionOverlay, selection]);
 
   useEffect(() => {
@@ -595,7 +637,7 @@ export function Duet() {
   const restoreDrawingState = useCallback((state: DrawingState) => {
     restoreLayerSnapshot(state.snapshot); clearLayerSelection(); changeTool(state.tool); setBrushSize(state.brushSize); setBrushOpacity(state.brushOpacity); setColor(state.brushColor); setEffectStrength(state.effectStrength); setTextFont(state.textFont); setTextSize(state.textSize);
     setSelectionMode(state.selectionMode); setSelectionBrushSize(state.selectionBrushSize); setSelection({ ...state.selection });
-    const mask = selectionMaskRef.current || makeCanvas(); mask.getContext('2d')!.putImageData(state.selectionMask, 0, 0); selectionMaskRef.current = mask;
+    const mask = selectionMaskRef.current || makeCanvas(); mask.getContext('2d')!.putImageData(state.selectionMask, 0, 0); selectionMaskRef.current = mask; selectionHasMaskRef.current = state.selection.width > 3 && state.selection.height > 3;
     if (state.layerSelection) {
       const pixels = document.createElement('canvas'); pixels.width = state.layerSelection.pixelWidth; pixels.height = state.layerSelection.pixelHeight; pixels.getContext('2d')!.putImageData(state.layerSelection.pixels, 0, 0);
       layerSelectionRef.current = { layerId: state.layerSelection.layerId, base: state.layerSelection.base, pixels, source: { ...state.layerSelection.source }, bounds: { ...state.layerSelection.bounds } };

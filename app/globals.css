@@ -1929,17 +1929,12 @@ button {
 .selection-box {
   position: absolute;
   z-index: 3;
-  border: 1px solid rgba(255, 255, 255, 0.95);
-  box-shadow:
-    0 0 0 1px rgba(74, 55, 112, 0.9),
-    0 0 24px rgba(117, 80, 255, 0.2);
+  border: 0;
+  box-shadow: none;
   pointer-events: none;
 }
 .selection-box::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border: 1px dashed rgba(130, 92, 255, 0.95);
+  display: none;
 }
 .selection-box.freeform {
   border: 0;
@@ -1956,15 +1951,17 @@ button {
   font-size: 9px;
   padding: 3px 6px;
   border-radius: 4px 4px 4px 0;
-  background: #7657d7;
-  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.2);
+  background: rgba(24, 22, 29, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.38);
 }
 .handle {
   position: absolute;
   width: 6px;
   height: 6px;
   background: #fff;
-  border: 1px solid #7054ce;
+  border: 1px solid #111015;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.72);
 }
 .handle.tl {
   left: -4px;
