@@ -1059,12 +1059,16 @@ export function Duet() {
     }
     setImportMenuOpen(false); addActivity('Photo placed from library', asset.name);
   };
-  const importRasterImage = async (file: File) => {
+  const importSharedPhoto = async (file: File) => {
     if (!file.type.startsWith('image/')) throw new Error('Choose a supported image file.');
     if (file.size > MAX_PHOTO_BYTES) throw new Error('This photo is larger than the 25 MB import limit.');
     const dataUrl = await fileDataUrl(file); const image = await loadImage(dataUrl);
     const asset: PhotoAsset = { id: `photo-${Date.now()}-${Math.random().toString(16).slice(2)}`, name: file.name.slice(0, 120), dataUrl, width: image.naturalWidth, height: image.naturalHeight, createdAt: Date.now() };
     setPhotoLibrary((items) => [asset, ...items]); savePhotoAsset(asset).catch(() => addActivity('Photo saved for this session', 'Browser storage was unavailable'));
+    return asset;
+  };
+  const importRasterImage = async (file: File) => {
+    const asset = await importSharedPhoto(file);
     await placePhotoAsset(asset); addActivity('Photo imported and saved', file.name);
   };
   const importProject = async (file: File) => {
@@ -1162,9 +1166,21 @@ export function Duet() {
     setEditingDocumentName(false);
   };
   const activeOpacity = layers.find((layer) => layer.id === activeLayer)?.opacity ?? 100;
-  const getIllustrationImage = useCallback(() => displayRef.current?.getContext('2d')?.getImageData(0, 0, WIDTH, HEIGHT) || null, []);
+  const getIllustrationImage = useCallback((drawingId = currentDrawingId) => {
+    if (drawingId === currentDrawingId) return compositeCanvas().getContext('2d')!.getImageData(0, 0, WIDTH, HEIGHT);
+    const snapshot = workspaceDrawings.find((drawing) => drawing.id === drawingId)?.state?.snapshot;
+    if (!snapshot) return null;
+    const canvas = makeCanvas(); const ctx = canvas.getContext('2d')!;
+    [...snapshot.layers].reverse().forEach((layer) => {
+      if (!layer.visible) return;
+      const pixels = snapshot.pixels.find((entry) => entry.id === layer.id)?.image; if (!pixels) return;
+      const source = makeCanvas(); source.getContext('2d')!.putImageData(pixels, 0, 0);
+      ctx.save(); ctx.globalAlpha = layer.opacity / 100; ctx.globalCompositeOperation = layer.blend; ctx.drawImage(source, 0, 0); ctx.restore();
+    });
+    return ctx.getImageData(0, 0, WIDTH, HEIGHT);
+  }, [compositeCanvas, currentDrawingId, workspaceDrawings]);
 
-  return <TooltipProvider delay={350}><><AnimationStudio active={workspaceMode === 'animation'} documentName={documentName} onModeChange={setWorkspaceMode} getIllustrationImage={getIllustrationImage} /><main className={`editor-shell ${workspaceMode === 'illustration' ? '' : 'mode-hidden'}`} aria-hidden={workspaceMode !== 'illustration'}>
+  return <TooltipProvider delay={350}><><AnimationStudio active={workspaceMode === 'animation'} documentName={documentName} onModeChange={setWorkspaceMode} getIllustrationImage={getIllustrationImage} illustrations={workspaceDrawings.map(({ id, name }) => ({ id, name }))} photoLibrary={photoLibrary} importSharedPhoto={importSharedPhoto} /><main className={`editor-shell ${workspaceMode === 'illustration' ? '' : 'mode-hidden'}`} aria-hidden={workspaceMode !== 'illustration'}>
     <header className="topbar">
       <div className="brand-area"><Tooltip><TooltipTrigger className="view-toggle" aria-label={leftSidebarOpen ? 'Collapse tools sidebar' : 'Expand tools sidebar'} onClick={() => setLeftSidebarOpen((open) => !open)}>{leftSidebarOpen ? <PanelLeftClose /> : <PanelLeftOpen />}</TooltipTrigger><TooltipContent>{leftSidebarOpen ? 'Hide tools' : 'Show tools'}</TooltipContent></Tooltip>{showBranding && <div className="brand-lockup"><div className="brand-mark"><Sparkles size={15} /></div><span>DUET</span><span className="mvp-pill">CREATE WITH AI</span></div>}<Tooltip><TooltipTrigger className={`view-toggle ${!showBranding ? 'active' : ''}`} aria-label={showBranding ? 'Hide branding and canvas reminders' : 'Show branding and canvas reminders'} onClick={() => setShowBranding((shown) => !shown)}>{showBranding ? <EyeOff /> : <Eye />}</TooltipTrigger><TooltipContent>{showBranding ? 'Hide DUET and canvas reminders' : 'Show DUET and canvas reminders'}</TooltipContent></Tooltip><div className="mode-switch" aria-label="Workspace mode"><button className="active" onClick={() => setWorkspaceMode('illustration')}>Illustrate</button><button onClick={() => setWorkspaceMode('animation')}>Animate</button></div></div>
       <div ref={documentMenuRef} className="document-title">{editingDocumentName ? <input autoFocus aria-label="Document name" value={documentNameDraft} maxLength={80} onChange={(event) => setDocumentNameDraft(event.target.value)} onBlur={() => finishDocumentRename(true)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); finishDocumentRename(true); } if (event.key === 'Escape') { event.preventDefault(); finishDocumentRename(false); } }} /> : <><button type="button" className="document-rename" aria-label="Rename document" title="Click to rename" onClick={beginDocumentRename}><span>{documentName}</span></button><button type="button" className={`document-menu-trigger ${documentMenuOpen ? 'active' : ''}`} aria-label="Switch drawings" aria-expanded={documentMenuOpen} onClick={() => setDocumentMenuOpen((open) => !open)}><ChevronDown size={13} /></button></>}{documentMenuOpen && !editingDocumentName && <div className="document-menu"><button className="new-drawing-button" onClick={createBlankDrawing}><Plus />New blank drawing</button><span className="document-menu-label">Drawings</span>{workspaceDrawings.map((drawing) => <button key={drawing.id} className={drawing.id === currentDrawingId ? 'active' : ''} onClick={() => switchDrawing(drawing.id)}><span>{drawing.name}</span>{drawing.id === currentDrawingId && <Check />}</button>)}</div>}</div>
