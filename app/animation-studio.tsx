@@ -1,6 +1,6 @@
 'use client';
 
-import { Brush, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Download, Droplets, Eraser, Eye, EyeOff, Film, Focus, Ghost, GripHorizontal, Hand, ImagePlus, Lock, Music2, Pause, Pipette, Play, Plus, Redo2, Scissors, SkipBack, SkipForward, Sparkles, Trash2, Type as TypeIcon, Undo2, Unlock, Video } from 'lucide-react';
+import { Brush, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Download, Droplets, Eraser, Eye, EyeOff, Film, Focus, Ghost, GripHorizontal, Hand, ImagePlus, Lock, Music2, Pause, Pipette, Play, Plus, Redo2, Scissors, Send, SkipBack, SkipForward, Sparkles, Trash2, Type as TypeIcon, Undo2, Unlock, Video, X } from 'lucide-react';
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
@@ -19,13 +19,21 @@ type EyedropperPreview = { x: number; y: number; color: string };
 type SharedPhotoAsset = { id: string; name: string; dataUrl: string; width: number; height: number; createdAt: number };
 type IllustrationSource = { id: string; name: string };
 type Track = { id: string; name: string; kind: 'visual' | 'audio'; visible: boolean; locked: boolean };
-type CelClip = { id: string; type: 'cel'; trackId: string; name: string; start: number; duration: number; opacity: number; exposure: number; finalHold: number; frameIds: string[] };
+type CelClip = { id: string; type: 'cel'; trackId: string; name: string; start: number; duration: number; opacity: number; exposure: number; finalHold: number; frameIds: string[]; agentRecipe?: AgentClipRecipe };
 type StillClip = { id: string; type: 'still'; trackId: string; name: string; start: number; duration: number; opacity: number };
 type VideoClip = { id: string; type: 'video'; trackId: string; name: string; start: number; duration: number; opacity: number; volume: number; url: string; sourceOffset: number };
 type AudioClip = { id: string; type: 'audio'; trackId: string; name: string; start: number; duration: number; volume: number; url: string };
 type Clip = CelClip | StillClip | VideoClip | AudioClip;
 type ClipDrag = { id: string; mode: 'move' | 'start' | 'end'; clientX: number; start: number; duration: number; sourceOffset: number };
 type FrameEditorResize = { pointerId: number; startY: number; startHeight: number };
+type AgentShapeType = 'line' | 'path' | 'rectangle' | 'circle' | 'polygon';
+type AgentEasing = 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out';
+type AgentPoint = { x: number; y: number };
+type AgentKeyframe = { frame: number; translateX: number; translateY: number; scale: number; rotation: number; opacity: number; easing: AgentEasing };
+type AgentShape = { id: string; type: AgentShapeType; x: number; y: number; width: number; height: number; radius: number; points: AgentPoint[]; closed: boolean; fillColor: string | null; strokeColor: string | null; strokeWidth: number; opacity: number; keyframes: AgentKeyframe[] };
+type AgentClipRecipe = { requestId: string; name: string; durationSeconds: number; requestedCelFps: number; actualCelFps: number; exposure: number; frameCount: number; objects: AgentShape[] };
+type AgentClipRequest = { id: string; startFrame: number; insertAboveTrackId: string | null; insertAboveTrackName: string | null };
+type AgentClipResult = { trackId: string; clipId: string; name: string; frameCount: number };
 type Props = {
   active: boolean;
   documentName: string;
@@ -36,13 +44,101 @@ type Props = {
   photoLibrary: SharedPhotoAsset[];
   importSharedPhoto: (file: File) => Promise<SharedPhotoAsset>;
 };
-export type AnimationStudioHandle = { exportWorkspace: () => Promise<void> };
+export type AnimationStudioHandle = {
+  exportWorkspace: () => Promise<void>;
+  getAgentAnimationState: () => unknown;
+  insertAgentCelClip: (input: Record<string, unknown>) => unknown;
+};
 function makeCanvas() { const canvas = document.createElement('canvas'); canvas.width = WIDTH; canvas.height = HEIGHT; return canvas; }
 function clamp(value: number, min: number, max: number) { return Math.max(min, Math.min(max, value)); }
 function getMaxFrameEditorHeight() { return typeof window === 'undefined' ? FRAME_EDITOR_DEFAULT_HEIGHT : Math.max(FRAME_EDITOR_MIN_HEIGHT, Math.min(560, window.innerHeight - 250)); }
 function rgbToHex(r: number, g: number, b: number) { return `#${[r, g, b].map((value) => clamp(Math.round(value), 0, 255).toString(16).padStart(2, '0')).join('')}`; }
 function uid(prefix: string) { return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`; }
 function safeName(name: string) { return name.trim().replace(/[<>:"/\\|?*]/g, '-').replace(/\s+/g, ' ').replace(/[. ]+$/g, '').slice(0, 80) || 'Untitled animation'; }
+function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function readNumber(value: unknown, fallback: number, min: number, max: number, label: string) { if (value === undefined || value === null) return fallback; const parsed = Number(value); if (!Number.isFinite(parsed)) throw new Error(`${label} must be a finite number.`); return clamp(parsed, min, max); }
+function readColour(value: unknown, fallback: string | null, label: string) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value !== 'string') throw new Error(`${label} must be a hex colour or "none".`);
+  if (value.toLowerCase() === 'none') return null;
+  const colour = value.trim();
+  if (/^#[0-9a-f]{3}$/i.test(colour)) return `#${colour.slice(1).split('').map((character) => character + character).join('')}`.toUpperCase();
+  if (/^#[0-9a-f]{6}$/i.test(colour)) return colour.toUpperCase();
+  throw new Error(`${label} must be a hex colour such as #FF6B5F or "none".`);
+}
+function easingValue(easing: AgentEasing, progress: number) { if (easing === 'ease-in') return progress * progress; if (easing === 'ease-out') return 1 - (1 - progress) ** 2; if (easing === 'ease-in-out') return progress < .5 ? 2 * progress * progress : 1 - (-2 * progress + 2) ** 2 / 2; return progress; }
+function parseAgentShape(value: unknown, index: number, frameCount: number): AgentShape {
+  if (!isRecord(value)) throw new Error(`Object ${index + 1} must be an object.`);
+  const type = value.type;
+  if (typeof type !== 'string' || !['line', 'path', 'rectangle', 'circle', 'polygon'].includes(type)) throw new Error(`Object ${index + 1} has an unsupported shape type.`);
+  const shapeType = type as AgentShapeType;
+  const x = readNumber(value.x, WIDTH / 2, -WIDTH * 2, WIDTH * 3, `Object ${index + 1} x`);
+  const y = readNumber(value.y, HEIGHT / 2, -HEIGHT * 2, HEIGHT * 3, `Object ${index + 1} y`);
+  const width = readNumber(value.width, 120, 1, WIDTH * 2, `Object ${index + 1} width`);
+  const height = readNumber(value.height, 120, 1, HEIGHT * 2, `Object ${index + 1} height`);
+  const radius = readNumber(value.radius, 60, 1, Math.max(WIDTH, HEIGHT), `Object ${index + 1} radius`);
+  const rawPoints = Array.isArray(value.points) ? value.points.slice(0, 160) : [];
+  const points = rawPoints.map((point, pointIndex) => { if (!isRecord(point)) throw new Error(`Point ${pointIndex + 1} in object ${index + 1} is invalid.`); return { x: readNumber(point.x, 0, -WIDTH * 2, WIDTH * 3, 'Point x'), y: readNumber(point.y, 0, -HEIGHT * 2, HEIGHT * 3, 'Point y') }; });
+  if (shapeType === 'line' && points.length !== 2) throw new Error(`Line ${index + 1} requires exactly two points.`);
+  if (shapeType === 'path' && points.length < 2) throw new Error(`Path ${index + 1} requires at least two points.`);
+  if (shapeType === 'polygon' && points.length < 3) throw new Error(`Polygon ${index + 1} requires at least three points.`);
+  const fillDefault = shapeType === 'rectangle' || shapeType === 'circle' || shapeType === 'polygon' ? '#FFFFFF' : null;
+  const strokeDefault = shapeType === 'line' || shapeType === 'path' ? '#FFFFFF' : null;
+  const fillColor = readColour(value.fillColor, fillDefault, `Object ${index + 1} fillColor`);
+  const strokeColor = readColour(value.strokeColor, strokeDefault, `Object ${index + 1} strokeColor`);
+  if (!fillColor && !strokeColor) throw new Error(`Object ${index + 1} needs a fill or stroke colour.`);
+
+  const rawKeyframes = Array.isArray(value.keyframes) ? value.keyframes.slice(0, 32) : [];
+  const ordered = rawKeyframes.map((keyframe, keyframeIndex) => { if (!isRecord(keyframe)) throw new Error(`Keyframe ${keyframeIndex + 1} in object ${index + 1} is invalid.`); return { value: keyframe, frame: Math.round(readNumber(keyframe.frame, 0, 0, frameCount - 1, 'Keyframe frame')) }; }).sort((a, b) => a.frame - b.frame);
+  let previous: AgentKeyframe = { frame: 0, translateX: 0, translateY: 0, scale: 1, rotation: 0, opacity: 1, easing: 'linear' };
+  const keyed = new Map<number, AgentKeyframe>();
+  ordered.forEach(({ value: keyframe, frame }) => {
+    const easing = typeof keyframe.easing === 'string' ? keyframe.easing as AgentEasing : previous.easing;
+    if (!['linear', 'ease-in', 'ease-out', 'ease-in-out'].includes(easing)) throw new Error(`Object ${index + 1} uses an unsupported easing value.`);
+    previous = {
+      frame,
+      translateX: readNumber(keyframe.translateX, previous.translateX, -WIDTH * 3, WIDTH * 3, 'translateX'),
+      translateY: readNumber(keyframe.translateY, previous.translateY, -HEIGHT * 3, HEIGHT * 3, 'translateY'),
+      scale: readNumber(keyframe.scale, previous.scale, .01, 20, 'scale'),
+      rotation: readNumber(keyframe.rotation, previous.rotation, -3600, 3600, 'rotation'),
+      opacity: readNumber(keyframe.opacity, previous.opacity, 0, 1, 'keyframe opacity'),
+      easing,
+    };
+    keyed.set(frame, previous);
+  });
+  if (!keyed.has(0)) keyed.set(0, { frame: 0, translateX: 0, translateY: 0, scale: 1, rotation: 0, opacity: 1, easing: 'linear' });
+  return { id: (typeof value.id === 'string' ? value.id : `shape-${index + 1}`).slice(0, 80), type: shapeType, x, y, width, height, radius, points, closed: Boolean(value.closed), fillColor, strokeColor, strokeWidth: readNumber(value.strokeWidth, 4, 0, 96, `Object ${index + 1} strokeWidth`), opacity: readNumber(value.opacity, 1, 0, 1, `Object ${index + 1} opacity`), keyframes: [...keyed.values()].sort((a, b) => a.frame - b.frame) };
+}
+function parseAgentClipRecipe(input: Record<string, unknown>, projectFps: number): AgentClipRecipe {
+  const requestId = typeof input.requestId === 'string' ? input.requestId.trim() : '';
+  if (!requestId) throw new Error('requestId is required. Ask the user to press Send to agent in Animate first.');
+  const durationSeconds = readNumber(input.durationSeconds, 1, .25, 3, 'durationSeconds');
+  const requestedCelFps = readNumber(input.celFps, Math.min(8, projectFps), 1, 24, 'celFps');
+  const exposure = clamp(Math.round(projectFps / Math.min(requestedCelFps, projectFps)), 1, 12);
+  const actualCelFps = projectFps / exposure;
+  const frameCount = Math.round(clamp(durationSeconds * actualCelFps, 1, 24));
+  if (!Array.isArray(input.objects) || !input.objects.length) throw new Error('At least one coloured shape is required.');
+  if (input.objects.length > 48) throw new Error('This first version supports up to 48 shapes per clip.');
+  return { requestId, name: safeName(typeof input.name === 'string' ? input.name : 'AI clip'), durationSeconds, requestedCelFps, actualCelFps, exposure, frameCount, objects: input.objects.map((object, index) => parseAgentShape(object, index, frameCount)) };
+}
+function shapeCentre(shape: AgentShape) { if (shape.type === 'rectangle' || shape.type === 'circle') return { x: shape.x, y: shape.y }; const xs = shape.points.map((point) => point.x); const ys = shape.points.map((point) => point.y); return { x: (Math.min(...xs) + Math.max(...xs)) / 2, y: (Math.min(...ys) + Math.max(...ys)) / 2 }; }
+function transformAt(shape: AgentShape, frame: number) {
+  const frames = shape.keyframes; const before = [...frames].reverse().find((keyframe) => keyframe.frame <= frame) || frames[0]; const after = frames.find((keyframe) => keyframe.frame >= frame) || frames[frames.length - 1];
+  if (before.frame === after.frame) return before;
+  const progress = easingValue(before.easing, (frame - before.frame) / (after.frame - before.frame));
+  const mix = (start: number, end: number) => start + (end - start) * progress;
+  return { ...before, translateX: mix(before.translateX, after.translateX), translateY: mix(before.translateY, after.translateY), scale: mix(before.scale, after.scale), rotation: mix(before.rotation, after.rotation), opacity: mix(before.opacity, after.opacity) };
+}
+function renderAgentShape(ctx: CanvasRenderingContext2D, shape: AgentShape, frame: number) {
+  const transform = transformAt(shape, frame); const centre = shapeCentre(shape);
+  ctx.save(); ctx.globalAlpha = shape.opacity * transform.opacity; ctx.translate(centre.x + transform.translateX, centre.y + transform.translateY); ctx.rotate(transform.rotation * Math.PI / 180); ctx.scale(transform.scale, transform.scale); ctx.translate(-centre.x, -centre.y); ctx.beginPath();
+  if (shape.type === 'rectangle') ctx.rect(shape.x - shape.width / 2, shape.y - shape.height / 2, shape.width, shape.height);
+  else if (shape.type === 'circle') ctx.arc(shape.x, shape.y, shape.radius, 0, Math.PI * 2);
+  else { shape.points.forEach((point, index) => { if (index) ctx.lineTo(point.x, point.y); else ctx.moveTo(point.x, point.y); }); if (shape.type === 'polygon' || (shape.type === 'path' && shape.closed)) ctx.closePath(); }
+  if (shape.fillColor && shape.type !== 'line') { ctx.fillStyle = shape.fillColor; ctx.fill(); }
+  if (shape.strokeColor && shape.strokeWidth > 0) { ctx.strokeStyle = shape.strokeColor; ctx.lineWidth = shape.strokeWidth; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.stroke(); }
+  ctx.restore();
+}
 function download(blob: Blob, name: string) { const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = name; document.body.appendChild(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1500); }
 function seekVideo(video: HTMLVideoElement, time: number) { return new Promise<void>((resolve) => { const target = clamp(time, 0, Number.isFinite(video.duration) ? Math.max(0, video.duration - .001) : time); if (video.readyState >= 2 && Math.abs(video.currentTime - target) < .01) { resolve(); return; } let settled = false; const finish = () => { if (settled) return; settled = true; video.removeEventListener('seeked', finish); video.removeEventListener('loadeddata', retry); window.clearTimeout(timeout); resolve(); }; const retry = () => { try { video.currentTime = target; } catch { finish(); } }; const timeout = window.setTimeout(finish, 1200); video.addEventListener('seeked', finish, { once: true }); if (video.readyState >= 1) retry(); else video.addEventListener('loadeddata', retry, { once: true }); }); }
 function celDuration(frameCount: number, exposure: number, finalHold = 0) { return Math.max(1, frameCount * exposure + finalHold); }
@@ -130,6 +226,8 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
   const [frameEditorHeight, setFrameEditorHeight] = useState(FRAME_EDITOR_DEFAULT_HEIGHT);
   const [timelineManuallyCollapsed, setTimelineManuallyCollapsed] = useState(false);
   const [bottomDrawerCollapsed, setBottomDrawerCollapsed] = useState(false);
+  const [agentClipRequest, setAgentClipRequest] = useState<AgentClipRequest | null>(null);
+  const [agentClipResult, setAgentClipResult] = useState<AgentClipResult | null>(null);
 
   const activeClip = clips.find((clip) => clip.id === activeClipId) || null;
   const activeTrack = tracks.find((track) => track.id === activeClip?.trackId) || null;
@@ -374,7 +472,84 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
     exportProject();
     await exportAnimation();
   };
-  useImperativeHandle(ref, () => ({ exportWorkspace }));
+  const armAgentClipRequest = () => {
+    const insertionTrack = selectedTrack?.kind === 'visual' ? selectedTrack : tracks.find((track) => track.kind === 'visual') || null;
+    setPlaying(false);
+    setAgentClipResult(null);
+    setAgentClipRequest({ id: uid('animation-request'), startFrame: playhead, insertAboveTrackId: insertionTrack?.id || null, insertAboveTrackName: insertionTrack?.name || null });
+  };
+  const getAgentAnimationState = () => ({
+    mode: 'animation',
+    active,
+    canvas: { width: WIDTH, height: HEIGHT },
+    timeline: { fps, playhead, durationFrames: timelineFrames },
+    tracks: tracks.map(({ id, name, kind, visible, locked }, order) => ({ id, name, kind, visible, locked, order, stacking: kind === 'visual' ? 'Earlier visual tracks draw on top' : undefined })),
+    aiClipRequest: agentClipRequest ? {
+      ready: true,
+      requestId: agentClipRequest.id,
+      attachments: [],
+      startFrame: agentClipRequest.startFrame,
+      insertAboveTrack: agentClipRequest.insertAboveTrackId ? { id: agentClipRequest.insertAboveTrackId, name: agentClipRequest.insertAboveTrackName } : null,
+      constraints: { durationSeconds: { min: .25, max: 3 }, celFps: { min: 1, max: 24 }, maxGeneratedCels: 24, maxObjects: 48, canvasCoordinates: { width: WIDTH, height: HEIGHT }, colours: 'Use #RRGGBB or "none" for fillColor and strokeColor.' },
+      supportedShapes: {
+        line: 'Exactly two canvas-coordinate points; strokeColor is required unless a default is acceptable.',
+        path: 'Two or more canvas-coordinate points; set closed=true when a filled closed path is wanted.',
+        rectangle: 'x and y are the centre; width and height describe its size.',
+        circle: 'x and y are the centre; radius describes its size.',
+        polygon: 'Three or more canvas-coordinate points.',
+      },
+      motion: 'Each keyframe uses a cel frame index plus optional translateX, translateY, scale, rotation in degrees, opacity 0–1, and easing: linear, ease-in, ease-out, or ease-in-out.',
+      nextStep: 'Use the user\'s chat prompt as creative context, then call insert_ai_cel_clip with this requestId and a constrained coloured-shape recipe.',
+    } : {
+      ready: false,
+      attachments: [],
+      userInstruction: 'Tell the user to open Animate and press Send to agent in the AI clip panel. Do not insert a clip until they do.',
+      lastGeneratedClip: agentClipResult,
+    },
+  });
+  const insertAgentCelClip = (input: Record<string, unknown>) => {
+    if (!agentClipRequest) throw new Error('No animation request is ready. Ask the user to press Send to agent in Animate first.');
+    const recipe = parseAgentClipRecipe(input, fps);
+    if (recipe.requestId !== agentClipRequest.id) throw new Error('This animation request is stale or belongs to a different request. Ask the user to press Send to agent again.');
+
+    const trackId = uid('track-ai');
+    const clipId = uid('cel-ai');
+    const frameIds = Array.from({ length: recipe.frameCount }, (_, frame) => {
+      const frameId = uid(`frame-ai-${frame + 1}`);
+      const canvas = makeCanvas();
+      const context = canvas.getContext('2d')!;
+      recipe.objects.forEach((shape) => renderAgentShape(context, shape, frame));
+      frameCanvases.current.set(frameId, canvas);
+      return frameId;
+    });
+    const track: Track = { id: trackId, name: `AI — ${recipe.name}`, kind: 'visual', visible: true, locked: false };
+    const clip: CelClip = { id: clipId, type: 'cel', trackId, name: recipe.name, start: agentClipRequest.startFrame, duration: celDuration(frameIds.length, recipe.exposure), opacity: 100, exposure: recipe.exposure, finalHold: 0, frameIds, agentRecipe: recipe };
+    setTracks((items) => { const targetIndex = agentClipRequest.insertAboveTrackId ? items.findIndex((item) => item.id === agentClipRequest.insertAboveTrackId) : -1; if (targetIndex < 0) return [track, ...items]; return [...items.slice(0, targetIndex), track, ...items.slice(targetIndex)]; });
+    setClips((items) => [...items, clip]);
+    setActiveTrackId(trackId);
+    setActiveClipId(clipId);
+    setActiveFrameId(frameIds[0]);
+    setPlayhead(agentClipRequest.startFrame);
+    setTimelineManuallyCollapsed(false);
+    setBottomDrawerCollapsed(false);
+    setAgentClipRequest(null);
+    setAgentClipResult({ trackId, clipId, name: recipe.name, frameCount: recipe.frameCount });
+    setMediaNotice({ tone: 'success', text: `${recipe.name} was rendered into ${recipe.frameCount} editable cels on a new track.` });
+    return { inserted: true, trackId, clipId, name: recipe.name, startFrame: clip.start, generatedCels: recipe.frameCount, exposure: recipe.exposure, actualCelFps: recipe.actualCelFps, coloursPreserved: true };
+  };
+  const removeAgentGeneratedTrack = () => {
+    if (!agentClipResult) return;
+    const removedClips = clips.filter((clip) => clip.trackId === agentClipResult.trackId);
+    removedClips.forEach((clip) => { if (clip.type === 'cel') clip.frameIds.forEach((frameId) => { frameCanvases.current.delete(frameId); undoStacks.current.delete(frameId); redoStacks.current.delete(frameId); }); });
+    const nextTracks = tracks.filter((track) => track.id !== agentClipResult.trackId);
+    const nextClips = clips.filter((clip) => clip.trackId !== agentClipResult.trackId);
+    const fallbackTrack = nextTracks.find((track) => track.kind === 'visual') || nextTracks[0] || null;
+    const fallbackClip = fallbackTrack ? nextClips.find((clip) => clip.trackId === fallbackTrack.id) || null : null;
+    setTracks(nextTracks); setClips(nextClips); setActiveTrackId(fallbackTrack?.id || ''); setActiveClipId(fallbackClip?.id || ''); if (fallbackClip?.type === 'cel') setActiveFrameId(fallbackClip.frameIds[0]);
+    setAgentClipResult(null);
+    setMediaNotice({ tone: 'success', text: 'The generated AI track was removed.' });
+  };
+  useImperativeHandle(ref, () => ({ exportWorkspace, getAgentAnimationState, insertAgentCelClip }));
 
   useEffect(() => { if (initialized.current) return; initialized.current = true; frameCanvases.current.set('animation-frame-1', makeCanvas()); }, []);
   useEffect(() => { const fitFrameEditor = () => setFrameEditorHeight((height) => clamp(height, FRAME_EDITOR_MIN_HEIGHT, getMaxFrameEditorHeight())); fitFrameEditor(); window.addEventListener('resize', fitFrameEditor); return () => window.removeEventListener('resize', fitFrameEditor); }, []);
@@ -399,7 +574,26 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(function
           <div className={`sequence-timeline ${timelineCollapsed ? 'collapsed' : ''}`}><div className="sequence-toolbar"><span><button className="timeline-collapse-button" onClick={toggleTimeline} aria-label={timelineCollapsed ? 'Expand timeline' : 'Collapse timeline'} aria-expanded={!timelineCollapsed}>{timelineCollapsed ? <ChevronUp /> : <ChevronDown />}</button><Film /><strong>Timeline</strong><small>{(timelineFrames / fps).toFixed(1)}s</small></span><span><button onClick={addVisualTrack} title="Add visual track"><Plus />Track</button><button onClick={deleteTrack} disabled={!selectedTrack} title="Delete selected track"><Trash2 />Track</button><button onClick={() => moveTrack(-1)} disabled={selectedTrackIndex <= 0} title="Move selected track up" aria-label="Move selected track up"><ChevronUp /></button><button onClick={() => moveTrack(1)} disabled={selectedTrackIndex < 0 || selectedTrackIndex >= tracks.length - 1} title="Move selected track down" aria-label="Move selected track down"><ChevronDown /></button><button onClick={addCelClip} disabled={!selectedTrack || selectedTrack.kind !== 'visual' || selectedTrack.locked} title={!selectedTrack ? 'Select a visual track first' : selectedTrack.kind !== 'visual' ? 'Cel clips need a visual track' : selectedTrack.locked ? 'Unlock this track to add a cel clip' : `Add cel clip to ${selectedTrack.name}`}><Plus />Cel clip</button><button onClick={() => videoInputRef.current?.click()} disabled={!selectedTrack || selectedTrack.kind !== 'visual' || selectedTrack.locked} title={!selectedTrack ? 'Select a visual track first' : selectedTrack.kind !== 'visual' ? 'Videos need a visual track' : selectedTrack.locked ? 'Unlock this track to import video' : `Import MOV or WebM to ${selectedTrack.name}`}><Video />Video</button><button onClick={() => audioInputRef.current?.click()}><Music2 />Audio</button><button onClick={splitClip} disabled={!activeClip || activeClip.type === 'audio' || (activeClip.type === 'cel' && activeClip.frameIds.length < 2)}><Scissors />Split</button><button onClick={duplicateClip} disabled={!activeClip}><Copy /></button><button onClick={deleteClip} disabled={!activeClip} title="Delete selected clip"><Trash2 /></button></span></div><div className="sequence-scroll"><div className="sequence-grid" style={{ width: timelineFrames * PX + 132 }}><div className="time-ruler" style={{ marginLeft: 132, width: timelineFrames * PX }}>{seconds.map((second) => <span key={second} style={{ left: second * fps * PX }}>{second}s</span>)}</div>{tracks.map((track) => <div className={`track-row ${track.id === activeTrackId ? 'active' : ''}`} key={track.id}><div className="track-label"><button onClick={() => toggleTrack(track.id, 'visible')} aria-label={track.visible ? `Hide ${track.name}` : `Show ${track.name}`}>{track.visible ? <Eye /> : <EyeOff />}</button><button onClick={() => toggleTrack(track.id, 'locked')} aria-label={track.locked ? `Unlock ${track.name}` : `Lock ${track.name}`}>{track.locked ? <Lock /> : <Unlock />}</button><button className="track-name" onClick={() => selectTrack(track.id)} aria-pressed={track.id === activeTrackId} title={`Select ${track.name} track`}>{track.kind === 'audio' ? <Music2 /> : <Film />}<span>{track.name}</span></button></div><div className="track-lane" style={{ width: timelineFrames * PX }} onPointerDown={(event) => setPlayheadFromLane(event, track.id)}>{clips.filter((clip) => clip.trackId === track.id).map((clip) => <button key={clip.id} className={`sequence-clip ${clip.type} ${clip.id === activeClipId ? 'active' : ''}`} style={{ left: clip.start * PX, width: Math.max(clip.duration * PX, 20) }} onPointerDown={(event) => beginDrag(event, clip, 'move')} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={endDrag} title={clip.type === 'cel' ? `${clip.frameIds.length} cels · length follows cel timing` : clip.type === 'video' ? `${clip.name} · MOV/WebM video` : undefined}>{clip.type !== 'cel' && <i className="clip-handle start" onPointerDown={(event) => beginDrag(event, clip, 'start')} />}<span>{clip.type === 'audio' ? <Music2 /> : clip.type === 'video' ? <Video /> : clip.type === 'cel' ? <Brush /> : <ImagePlus />}{clip.name}</span>{clip.type === 'audio' && <b className="audio-wave">▂▅▃▇▄▆▂▅▃▆▂▇</b>}{clip.type !== 'cel' && <i className="clip-handle end" onPointerDown={(event) => beginDrag(event, clip, 'end')} />}</button>)}</div></div>)}<i className="timeline-playhead" style={{ left: 132 + playhead * PX }} /></div></div></div>
         </div></>}</div>
       </div>
-      <aside className="animation-panel"><div className="animation-panel-heading"><Film /><div><strong>Hybrid timeline</strong><span>{documentName}</span></div></div><p>Arrange cels, video, and audio in tracks. Higher tracks draw on top. Clips on one track snap apart instead of overlapping. Photos and illustrations are inserted into the selected cel.</p>{mediaNotice && <div className={`animation-media-notice ${mediaNotice.tone}`} role="status">{mediaNotice.text}</div>}{activeClip?.type === 'cel' && <button className="illustration-frame-button" onClick={useIllustration}><ImagePlus />Use illustration as cel</button>}<div className="animation-stat"><span>Playhead</span><strong>{(playhead / fps).toFixed(2)}s</strong></div><div className="animation-stat"><span>Track</span><strong>{selectedTrack?.name || 'None'}</strong></div><div className="animation-stat"><span>Clip</span><strong>{activeClip?.name || 'None'}</strong></div>{activeClip && activeClip.type !== 'audio' && <label className="clip-property"><span>Opacity</span><Slider min={0} max={100} value={[activeClip.opacity]} onValueChange={(value) => updateActive({ opacity: Math.round(Array.isArray(value) ? value[0] : Number(value)) })} /><strong>{activeClip.opacity}%</strong></label>}{activeClip?.type === 'still' && <label className="clip-property"><span>Duration</span><input type="number" min={1} value={activeClip.duration} onChange={(event) => updateClipDuration(Math.max(1, Number(event.target.value) || 1))} /><strong>frames</strong></label>}{activeClip?.type === 'cel' && <><div className="clip-property calculated explained"><span>Length on track</span><output>{activeClip.frameIds.length} cels × {activeClip.exposure} + {activeClip.finalHold}</output><strong>{activeClip.duration} fr</strong></div><p className="cel-setting-help">Total frames this cel clip occupies on its track.</p><label className="clip-property explained" aria-describedby="cel-hold-help"><span>Cel hold</span><input type="number" min={1} max={12} value={activeClip.exposure} onChange={(event) => updateCelTiming({ exposure: clamp(Number(event.target.value) || 1, 1, 12) })} /><strong>fr/cel</strong></label><p id="cel-hold-help" className="cel-setting-help">Frames each cel remains visible before the next cel.</p><label className="clip-property explained" aria-describedby="end-hold-help"><span>End hold</span><input type="number" min={0} max={240} value={activeClip.finalHold} onChange={(event) => updateCelTiming({ finalHold: clamp(Number(event.target.value) || 0, 0, 240) })} /><strong>fr</strong></label><p id="end-hold-help" className="cel-setting-help">Extra frames the final cel remains visible before this clip ends.</p></>}{(activeClip?.type === 'audio' || activeClip?.type === 'video') && <label className="clip-property"><span>Volume</span><Slider min={0} max={100} value={[activeClip.volume]} onValueChange={(value) => updateActive({ volume: Math.round(Array.isArray(value) ? value[0] : Number(value)) })} /><strong>{activeClip.volume}%</strong></label>}<div className="animation-shortcuts"><strong>Shortcuts</strong><span>Space · Play / pause</span><span>← → · Move playhead</span><span>⌘Z · Undo cel stroke</span></div></aside>
+      <aside className="animation-panel">
+        <section className="animation-ai-panel">
+          <div className="animation-ai-heading"><span><Sparkles /><strong>AI clip</strong></span><small>SHAPES + MOTION</small></div>
+          {!agentClipRequest && !agentClipResult && <><p>Create a short cel clip from coloured lines, paths and shapes. No images are attached in this first version.</p><Button size="sm" className="animation-ai-send" onClick={armAgentClipRequest}><Send />Send to agent</Button></>}
+          {agentClipRequest && <output className="animation-ai-ready"><button onClick={() => setAgentClipRequest(null)} aria-label="Cancel AI clip request" title="Cancel request"><X /></button><strong>Ready for your prompt</strong><span>Now ask your agent to generate a short clip. This request contains no images.</span><small>Starts at frame {agentClipRequest.startFrame + 1}{agentClipRequest.insertAboveTrackName ? ` · above ${agentClipRequest.insertAboveTrackName}` : ''}</small></output>}
+          {agentClipResult && <output className="animation-ai-result"><strong><Sparkles />{agentClipResult.name} inserted</strong><span>{agentClipResult.frameCount} editable cels on a new track.</span><div><button onClick={removeAgentGeneratedTrack}><Undo2 />Undo insert</button><button onClick={armAgentClipRequest}><Plus />New request</button></div></output>}
+        </section>
+        <div className="animation-panel-heading"><Film /><div><strong>Hybrid timeline</strong><span>{documentName}</span></div></div>
+        <p>Arrange cels, video, and audio in tracks. Higher tracks draw on top. Clips on one track snap apart instead of overlapping. Photos and illustrations are inserted into the selected cel.</p>
+        {mediaNotice && <div className={`animation-media-notice ${mediaNotice.tone}`} role="status">{mediaNotice.text}</div>}
+        {activeClip?.type === 'cel' && <button className="illustration-frame-button" onClick={useIllustration}><ImagePlus />Use illustration as cel</button>}
+        <div className="animation-stat"><span>Playhead</span><strong>{(playhead / fps).toFixed(2)}s</strong></div>
+        <div className="animation-stat"><span>Track</span><strong>{selectedTrack?.name || 'None'}</strong></div>
+        <div className="animation-stat"><span>Clip</span><strong>{activeClip?.name || 'None'}</strong></div>
+        {activeClip && activeClip.type !== 'audio' && <label className="clip-property"><span>Opacity</span><Slider min={0} max={100} value={[activeClip.opacity]} onValueChange={(value) => updateActive({ opacity: Math.round(Array.isArray(value) ? value[0] : Number(value)) })} /><strong>{activeClip.opacity}%</strong></label>}
+        {activeClip?.type === 'still' && <label className="clip-property"><span>Duration</span><input type="number" min={1} value={activeClip.duration} onChange={(event) => updateClipDuration(Math.max(1, Number(event.target.value) || 1))} /><strong>frames</strong></label>}
+        {activeClip?.type === 'cel' && <><div className="clip-property calculated explained"><span>Length on track</span><output>{activeClip.frameIds.length} cels × {activeClip.exposure} + {activeClip.finalHold}</output><strong>{activeClip.duration} fr</strong></div><p className="cel-setting-help">Total frames this cel clip occupies on its track.</p><label className="clip-property explained" aria-describedby="cel-hold-help"><span>Cel hold</span><input type="number" min={1} max={12} value={activeClip.exposure} onChange={(event) => updateCelTiming({ exposure: clamp(Number(event.target.value) || 1, 1, 12) })} /><strong>fr/cel</strong></label><p id="cel-hold-help" className="cel-setting-help">Frames each cel remains visible before the next cel.</p><label className="clip-property explained" aria-describedby="end-hold-help"><span>End hold</span><input type="number" min={0} max={240} value={activeClip.finalHold} onChange={(event) => updateCelTiming({ finalHold: clamp(Number(event.target.value) || 0, 0, 240) })} /><strong>fr</strong></label><p id="end-hold-help" className="cel-setting-help">Extra frames the final cel remains visible before this clip ends.</p></>}
+        {(activeClip?.type === 'audio' || activeClip?.type === 'video') && <label className="clip-property"><span>Volume</span><Slider min={0} max={100} value={[activeClip.volume]} onValueChange={(value) => updateActive({ volume: Math.round(Array.isArray(value) ? value[0] : Number(value)) })} /><strong>{activeClip.volume}%</strong></label>}
+        <div className="animation-shortcuts"><strong>Shortcuts</strong><span>Space · Play / pause</span><span>← → · Move playhead</span><span>⌘Z · Undo cel stroke</span></div>
+      </aside>
       <input ref={imageInputRef} className="hidden" type="file" accept="image/*" onChange={importStill} /><input ref={videoInputRef} className="hidden" type="file" accept=".mov,.webm,video/quicktime,video/webm" onChange={importVideo} /><input ref={audioInputRef} className="hidden" type="file" accept="audio/*" onChange={importAudio} />
     </section>
   </main>;
