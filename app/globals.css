@@ -297,13 +297,56 @@ button {
 .header-action-short {
   display: none;
 }
+.header-menu-chevron {
+  width: 11px !important;
+  height: 11px !important;
+  margin-left: 1px;
+  color: #77717e;
+}
+.video-export-menu {
+  width: 212px;
+  padding: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 9px;
+  color: #e9e3ec;
+  background: #232027;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.38);
+}
+.video-export-menu-item {
+  min-height: 45px;
+  gap: 9px;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+.video-export-menu-item > svg {
+  color: #bd75ea;
+}
+.video-export-menu-item > span {
+  min-width: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+}
+.video-export-menu-item strong {
+  color: #eee8f1;
+  font-size: 10px;
+  font-weight: 650;
+}
+.video-export-menu-item small {
+  overflow: hidden;
+  color: #817a87;
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 @media (min-width: 1121px) {
   .animator-topbar .header-actions .header-save-button {
     width: 124px;
     justify-content: center;
   }
   .animator-topbar .header-actions .header-export-button {
-    width: 140px;
+    width: 156px;
     justify-content: center;
   }
   .animator-topbar .header-actions .export-workspace-button {
@@ -3146,6 +3189,9 @@ button {
     padding-inline: 0 !important;
   }
   .header-action-short {
+    display: none;
+  }
+  .header-menu-chevron {
     display: none;
   }
 }

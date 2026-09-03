@@ -48,6 +48,12 @@ import {
   useState,
 } from 'react';
 import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { Slider } from '@/components/ui/slider';
 
 const WIDTH = 960;
@@ -57,6 +63,7 @@ const MIN_TIMELINE = 96;
 const FRAME_EDITOR_DEFAULT_HEIGHT = 328;
 const FRAME_EDITOR_MIN_HEIGHT = 178;
 const FRAME_EDITOR_ONE_TRACK_HEIGHT = 232;
+type VideoExportFormat = 'mp4' | 'webm';
 type AnimationTool =
   | 'agent-target'
   | 'brush'
@@ -847,6 +854,28 @@ const animationToolMeta: Array<{
   { id: 'pan', label: 'Pan canvas', icon: Hand },
 ];
 
+const recordingMimeCandidates: Record<VideoExportFormat, string[]> = {
+  mp4: [
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4;codecs=avc1.4D401E,mp4a.40.2',
+    'video/mp4',
+  ],
+  webm: [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ],
+};
+
+function supportedRecordingMime(format: VideoExportFormat) {
+  if (typeof MediaRecorder === 'undefined') return '';
+  return (
+    recordingMimeCandidates[format].find((candidate) =>
+      MediaRecorder.isTypeSupported(candidate),
+    ) || ''
+  );
+}
+
 export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
   function AnimationStudio(
     {
@@ -919,6 +948,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     const [fps, setFps] = useState(8);
     const [playing, setPlaying] = useState(false);
     const [exporting, setExporting] = useState(false);
+    const [mp4ExportSupported, setMp4ExportSupported] = useState(false);
     const [frameEditorHeight, setFrameEditorHeight] = useState(
       FRAME_EDITOR_DEFAULT_HEIGHT,
     );
@@ -970,6 +1000,10 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     const agentTargetDurationFrames = targetClip
       ? Math.max(1, agentTarget.endFrame - agentTarget.startFrame)
       : 0;
+
+    useEffect(() => {
+      setMp4ExportSupported(Boolean(supportedRecordingMime('mp4')));
+    }, []);
 
     const zoomAt = useCallback(
       (requestedZoom: number, clientX?: number, clientY?: number) => {
@@ -2258,8 +2292,16 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
           download(blob, `${safeName(documentName)}-frame-${playhead + 1}.png`);
       }, 'image/png');
     };
-    const exportAnimation = async () => {
+    const exportAnimation = async (format: VideoExportFormat = 'webm') => {
       if (exporting) return;
+      const requestedMime = supportedRecordingMime(format);
+      if (format === 'mp4' && !requestedMime) {
+        setMediaNotice({
+          tone: 'error',
+          text: 'MP4 export is not supported in this browser. Choose WebM instead.',
+        });
+        return;
+      }
       setExporting(true);
       setPlaying(false);
       audioElements.current.forEach((audio) => audio.pause());
@@ -2362,12 +2404,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         }
 
         mediaStream = new MediaStream(streamTracks);
-        const mime =
-          [
-            'video/webm;codecs=vp9,opus',
-            'video/webm;codecs=vp8,opus',
-            'video/webm',
-          ].find((candidate) => MediaRecorder.isTypeSupported(candidate)) || '';
+        const mime = requestedMime || supportedRecordingMime('webm');
         const recorder = new MediaRecorder(mediaStream, {
           ...(mime ? { mimeType: mime } : {}),
           videoBitsPerSecond: 5_000_000,
@@ -2414,9 +2451,10 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         }
         recorder.stop();
         await stopped;
+        const outputMime = recorder.mimeType || mime || `video/${format}`;
         download(
-          new Blob(chunks, { type: mime || 'video/webm' }),
-          `${safeName(documentName)}.webm`,
+          new Blob(chunks, { type: outputMime }),
+          `${safeName(documentName)}.${format}`,
         );
       } finally {
         scheduledSources.forEach((source) => {
@@ -2433,7 +2471,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
     const exportWorkspace = async () => {
       if (exporting) return;
       exportProject();
-      await exportAnimation();
+      await exportAnimation('webm');
     };
     const buildAgentSamples = (clip: CelClip, target: AgentTarget) => {
       const cadence = Math.max(1, Math.floor(fps * 0.5));
@@ -3061,23 +3099,64 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
               <span className="header-action-full">Save frame</span>
               <span className="header-action-short">Save</span>
             </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="header-export-button"
-              onClick={() => void exportAnimation()}
-              disabled={exporting}
-              aria-label="Export animation as WebM"
-              title="Export WebM"
-            >
-              <Download />
-              <span className="header-action-full">
-                {exporting ? 'Rendering…' : 'Export WebM'}
-              </span>
-              <span className="header-action-short">
-                {exporting ? 'Rendering…' : 'Export'}
-              </span>
-            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                data-slot="button"
+                render={
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="header-export-button"
+                  />
+                }
+                disabled={exporting}
+                aria-label="Export animation video"
+                title="Export video"
+              >
+                <Download />
+                <span className="header-action-full">
+                  {exporting ? 'Rendering…' : 'Export video'}
+                </span>
+                <span className="header-action-short">
+                  {exporting ? 'Rendering…' : 'Export'}
+                </span>
+                <ChevronDown className="header-menu-chevron" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="end"
+                sideOffset={7}
+                className="video-export-menu"
+              >
+                <DropdownMenuItem
+                  className="video-export-menu-item"
+                  disabled={!mp4ExportSupported || exporting}
+                  onClick={() => void exportAnimation('mp4')}
+                  label="Export MP4"
+                >
+                  <Download />
+                  <span>
+                    <strong>MP4</strong>
+                    <small>
+                      {mp4ExportSupported
+                        ? 'Most compatible'
+                        : 'Not supported in this browser'}
+                    </small>
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="video-export-menu-item"
+                  disabled={exporting}
+                  onClick={() => void exportAnimation('webm')}
+                  label="Export WebM"
+                >
+                  <Download />
+                  <span>
+                    <strong>WebM</strong>
+                    <small>Best for web</small>
+                  </span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <Button
               size="sm"
               className="export-button export-workspace-button"
