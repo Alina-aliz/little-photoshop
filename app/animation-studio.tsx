@@ -84,6 +84,7 @@ const MIN_TIMELINE = 96;
 const FRAME_EDITOR_DEFAULT_HEIGHT = 328;
 const FRAME_EDITOR_MIN_HEIGHT = 178;
 const FRAME_EDITOR_ONE_TRACK_HEIGHT = 232;
+const ROTATE_HANDLE_OFFSET = 34;
 const celAgentEditPolicy = {
   requirement:
     "For every requested cel illustration edit, use this page's WebMCP tools. Do not use browser clicks, pointer drags, keyboard shortcuts, or visible canvas controls as an alternative editing route.",
@@ -114,6 +115,7 @@ type TextDraft = { x: number; y: number; value: string };
 type EyedropperPreview = { x: number; y: number; color: string };
 type CanvasBounds = { x: number; y: number; width: number; height: number };
 type TransformMode = 'move' | 'tl' | 'tr' | 'bl' | 'br';
+type SelectionTransformMode = TransformMode | 'rotate';
 type CelEditLayer = {
   id: string;
   name: string;
@@ -151,6 +153,7 @@ type CelLayerSelection = {
   pixels: HTMLCanvasElement;
   source: CanvasBounds;
   bounds: CanvasBounds;
+  rotation: number;
 };
 type ActiveCelTransform = {
   source: CanvasBounds;
@@ -160,8 +163,10 @@ type ActiveCelTransform = {
 };
 type ActiveCelSelectionTransform = {
   start: CanvasBounds;
+  startRotation: number;
   pointer: { x: number; y: number };
-  mode: TransformMode;
+  pointerAngle: number;
+  mode: SelectionTransformMode;
 };
 type SharedPhotoAsset = {
   id: string;
@@ -412,6 +417,62 @@ function visualDifference(
 }
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+function canvasBoundsCenter(bounds: CanvasBounds) {
+  return { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 };
+}
+function rotateCanvasPoint(point: { x: number; y: number }, centre: { x: number; y: number }, degrees: number) {
+  const radians = degrees * Math.PI / 180;
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+  const dx = point.x - centre.x;
+  const dy = point.y - centre.y;
+  return { x: centre.x + dx * cosine - dy * sine, y: centre.y + dx * sine + dy * cosine };
+}
+function celRotationHandlePoint(bounds: CanvasBounds, rotation: number) {
+  const centre = canvasBoundsCenter(bounds);
+  const handleY = bounds.y >= ROTATE_HANDLE_OFFSET + 8
+    ? bounds.y - ROTATE_HANDLE_OFFSET
+    : bounds.y + bounds.height + ROTATE_HANDLE_OFFSET;
+  return rotateCanvasPoint({ x: centre.x, y: handleY }, centre, rotation);
+}
+function pointInRotatedCelSelection(bounds: CanvasBounds, point: { x: number; y: number }, rotation: number, padding = 0) {
+  const local = rotateCanvasPoint(point, canvasBoundsCenter(bounds), -rotation);
+  return local.x >= bounds.x - padding && local.x <= bounds.x + bounds.width + padding && local.y >= bounds.y - padding && local.y <= bounds.y + bounds.height + padding;
+}
+function celSelectionTransformModeAtPoint(bounds: CanvasBounds, point: { x: number; y: number }, rotation: number): SelectionTransformMode {
+  const handle = celRotationHandlePoint(bounds, rotation);
+  if (Math.hypot(point.x - handle.x, point.y - handle.y) <= 18) return 'rotate';
+  const local = rotateCanvasPoint(point, canvasBoundsCenter(bounds), -rotation);
+  const edge = 18;
+  const left = Math.abs(local.x - bounds.x) < edge;
+  const right = Math.abs(local.x - (bounds.x + bounds.width)) < edge;
+  const top = Math.abs(local.y - bounds.y) < edge;
+  const bottom = Math.abs(local.y - (bounds.y + bounds.height)) < edge;
+  if (left && top) return 'tl';
+  if (right && top) return 'tr';
+  if (left && bottom) return 'bl';
+  if (right && bottom) return 'br';
+  return 'move';
+}
+function resizeRotatedCelSelection(start: CanvasBounds, point: { x: number; y: number }, mode: Exclude<SelectionTransformMode, 'move' | 'rotate'>, rotation: number): CanvasBounds {
+  const centre = canvasBoundsCenter(start);
+  const local = rotateCanvasPoint(point, centre, -rotation);
+  const anchorX = mode.includes('l') ? start.x + start.width : start.x;
+  const anchorY = mode.includes('t') ? start.y + start.height : start.y;
+  const width = Math.max(12, Math.abs(anchorX - local.x));
+  const height = Math.max(12, Math.abs(anchorY - local.y));
+  const localCentre = { x: (anchorX + (mode.includes('l') ? anchorX - width : anchorX + width)) / 2, y: (anchorY + (mode.includes('t') ? anchorY - height : anchorY + height)) / 2 };
+  const worldCentre = rotateCanvasPoint(localCentre, centre, rotation);
+  return { x: worldCentre.x - width / 2, y: worldCentre.y - height / 2, width, height };
+}
+function drawRotatedCelSelection(ctx: CanvasRenderingContext2D, pixels: HTMLCanvasElement, bounds: CanvasBounds, rotation: number) {
+  const centre = canvasBoundsCenter(bounds);
+  ctx.save();
+  ctx.translate(centre.x, centre.y);
+  ctx.rotate(rotation * Math.PI / 180);
+  ctx.drawImage(pixels, 0, 0, pixels.width, pixels.height, -bounds.width / 2, -bounds.height / 2, bounds.width, bounds.height);
+  ctx.restore();
 }
 function getMaxFrameEditorHeight() {
   return typeof window === 'undefined'
@@ -1417,16 +1478,11 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       if (selected) {
         ctx.save();
         ctx.globalAlpha = 0.28;
-        ctx.drawImage(
+        drawRotatedCelSelection(
+          ctx,
           selected.pixels,
-          0,
-          0,
-          selected.pixels.width,
-          selected.pixels.height,
-          selected.bounds.x,
-          selected.bounds.y,
-          selected.bounds.width,
-          selected.bounds.height,
+          selected.bounds,
+          selected.rotation,
         );
         ctx.globalCompositeOperation = 'source-in';
         ctx.fillStyle = '#65d9ff';
@@ -1434,24 +1490,53 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         ctx.restore();
       }
       if (bounds) {
+        const rotation = selected?.rotation || 0;
+        const centre = canvasBoundsCenter(bounds);
         ctx.save();
+        ctx.translate(centre.x, centre.y);
+        ctx.rotate(rotation * Math.PI / 180);
+        const left = -bounds.width / 2;
+        const top = -bounds.height / 2;
+        const handleY = bounds.y >= ROTATE_HANDLE_OFFSET + 8
+          ? top - ROTATE_HANDLE_OFFSET
+          : -top + ROTATE_HANDLE_OFFSET;
+        const frameEdgeY = handleY < 0 ? top : -top;
+        const stemEndY = handleY < 0 ? handleY + 7 : handleY - 7;
         ctx.strokeStyle = 'rgba(0,0,0,.92)';
         ctx.lineWidth = 4;
         ctx.setLineDash([8, 6]);
-        ctx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height);
+        ctx.strokeRect(left, top, bounds.width, bounds.height);
         ctx.strokeStyle = '#fff';
         ctx.lineWidth = 2;
         ctx.lineDashOffset = 7;
-        ctx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height);
+        ctx.strokeRect(left, top, bounds.width, bounds.height);
+        ctx.setLineDash([]);
         (['tl', 'tr', 'bl', 'br'] as const).forEach((corner) => {
-          const x = corner.includes('l') ? bounds.x : bounds.x + bounds.width;
-          const y = corner.includes('t') ? bounds.y : bounds.y + bounds.height;
+          const x = corner.includes('l') ? left : -left;
+          const y = corner.includes('t') ? top : -top;
           ctx.fillStyle = '#fff';
           ctx.fillRect(x - 5, y - 5, 10, 10);
           ctx.strokeStyle = '#6f4ce4';
           ctx.lineWidth = 2;
           ctx.strokeRect(x - 5, y - 5, 10, 10);
         });
+        if (selected) {
+          ctx.beginPath();
+          ctx.moveTo(0, frameEdgeY);
+          ctx.lineTo(0, stemEndY);
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 3;
+          ctx.shadowColor = 'rgba(0,0,0,.85)';
+          ctx.shadowBlur = 2;
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(0, handleY, 7, 0, Math.PI * 2);
+          ctx.fillStyle = '#fff';
+          ctx.fill();
+          ctx.strokeStyle = '#6f4ce4';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
         ctx.restore();
       }
       if (celLassoPoints.current.length > 1) {
@@ -2761,6 +2846,7 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
         pixels,
         source: bounds,
         bounds: { ...bounds },
+        rotation: 0,
       };
       celLassoPoints.current = [];
       setCelSelectionBounds({ ...bounds });
@@ -2777,7 +2863,8 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       const canvas = celEditCanvases.current.get(selected.layerId);
       if (!canvas) return;
       const start = transform.start;
-      let next: CanvasBounds;
+      let next: CanvasBounds = start;
+      let rotation = transform.startRotation;
       if (transform.mode === 'move') {
         next = {
           x: clamp(
@@ -2793,37 +2880,26 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
           width: start.width,
           height: start.height,
         };
+      } else if (transform.mode === 'rotate') {
+        const centre = canvasBoundsCenter(start);
+        const angle = Math.atan2(at.y - centre.y, at.x - centre.x);
+        rotation = transform.startRotation +
+          (angle - transform.pointerAngle) * 180 / Math.PI;
       } else {
-        const anchorX = transform.mode.includes('l')
-          ? start.x + start.width
-          : start.x;
-        const anchorY = transform.mode.includes('t')
-          ? start.y + start.height
-          : start.y;
-        const rawX = transform.mode.includes('l') ? at.x : start.x;
-        const rawY = transform.mode.includes('t') ? at.y : start.y;
-        next = {
-          x: Math.min(anchorX, rawX),
-          y: Math.min(anchorY, rawY),
-          width: Math.max(12, Math.abs(anchorX - rawX)),
-          height: Math.max(12, Math.abs(anchorY - rawY)),
-        };
+        next = resizeRotatedCelSelection(
+          start,
+          at,
+          transform.mode,
+          transform.startRotation,
+        );
       }
       const ctx = canvas.getContext('2d')!;
       ctx.putImageData(selected.base, 0, 0);
-      ctx.drawImage(
-        selected.pixels,
-        0,
-        0,
-        selected.pixels.width,
-        selected.pixels.height,
-        next.x,
-        next.y,
-        next.width,
-        next.height,
-      );
+      drawRotatedCelSelection(ctx, selected.pixels, next, rotation);
       selected.bounds = next;
+      selected.rotation = rotation;
       setCelSelectionBounds({ ...next });
+      redrawCelEditOverlay();
       render();
     };
 
@@ -2832,19 +2908,12 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       if (!selected) return;
       const id = addCelEditLayer('Selection copy');
       const canvas = celEditCanvases.current.get(id)!;
-      canvas
-        .getContext('2d')!
-        .drawImage(
-          selected.pixels,
-          0,
-          0,
-          selected.pixels.width,
-          selected.pixels.height,
-          selected.bounds.x,
-          selected.bounds.y,
-          selected.bounds.width,
-          selected.bounds.height,
-        );
+      drawRotatedCelSelection(
+        canvas.getContext('2d')!,
+        selected.pixels,
+        selected.bounds,
+        selected.rotation,
+      );
       celLayerSelection.current = null;
       setCelSelectionBounds(null);
       setCelTransformBounds(canvasContentBounds(canvas));
@@ -2914,12 +2983,18 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
       if (celIllustrationMode && tool === 'layer-lasso') {
         const selected = celLayerSelection.current;
         const bounds = selected?.bounds;
+        const rotation = selected?.rotation || 0;
+        const rotateHandle = bounds
+          ? celRotationHandlePoint(bounds, rotation)
+          : null;
         const inside =
           !!bounds &&
-          at.x >= bounds.x - 18 &&
-          at.x <= bounds.x + bounds.width + 18 &&
-          at.y >= bounds.y - 18 &&
-          at.y <= bounds.y + bounds.height + 18;
+          (pointInRotatedCelSelection(bounds, at, rotation, 18) ||
+            (!!rotateHandle &&
+              Math.hypot(
+                at.x - rotateHandle.x,
+                at.y - rotateHandle.y,
+              ) <= 18));
         if (
           selected &&
           selected.layerId === activeCelEditLayerId &&
@@ -2927,10 +3002,13 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
           inside
         ) {
           pushUndo();
+          const centre = canvasBoundsCenter(bounds);
           activeCelSelectionTransform.current = {
             start: { ...bounds },
+            startRotation: rotation,
             pointer: at,
-            mode: transformModeAtPoint(bounds, at),
+            pointerAngle: Math.atan2(at.y - centre.y, at.x - centre.x),
+            mode: celSelectionTransformModeAtPoint(bounds, at, rotation),
           };
         } else {
           clearCelLayerSelection();
@@ -5054,23 +5132,26 @@ export const AnimationStudio = forwardRef<AnimationStudioHandle, Props>(
               {tool === 'layer-lasso' && celIllustrationMode && (
                 <>
                   {celSelectionBounds ? (
-                    <span className="cel-lasso-actions">
-                      <button onClick={cloneCelLayerSelection}>
-                        <Copy /> Clone
-                      </button>
-                      <button onClick={deleteCelLayerSelection}>
-                        <Trash2 /> Delete
-                      </button>
-                      <button
-                        className="icon-only"
-                        onClick={clearCelLayerSelection}
-                        aria-label="Clear layer selection"
-                      >
-                        <X />
-                      </button>
-                    </span>
+                    <>
+                      <span className="cel-lasso-actions">
+                        <button onClick={cloneCelLayerSelection}>
+                          <Copy /> Clone
+                        </button>
+                        <button onClick={deleteCelLayerSelection}>
+                          <Trash2 /> Delete
+                        </button>
+                        <button
+                          className="icon-only"
+                          onClick={clearCelLayerSelection}
+                          aria-label="Clear layer selection"
+                        >
+                          <X />
+                        </button>
+                      </span>
+                      <em>Drag the circle above the selection to rotate</em>
+                    </>
                   ) : (
-                    <em>Draw around pixels, then drag or resize the selection</em>
+                    <em>Draw around pixels, then move, resize, or rotate the selection</em>
                   )}
                 </>
               )}

@@ -42,7 +42,7 @@ type WebMCPTool = { name: string; title?: string; description: string; inputSche
 type ToolExecutionOptions = { signal: AbortSignal };
 type SavedProjectLayer = Omit<Layer, 'blend'> & { blend: string; pixels: string };
 type LayerSnapshot = { layers: Layer[]; activeLayer: string; pixels: Array<{ id: string; image: ImageData }> };
-type SavedLayerSelection = { layerId: string; base: ImageData; pixels: ImageData; pixelWidth: number; pixelHeight: number; source: Selection; bounds: Selection };
+type SavedLayerSelection = { layerId: string; base: ImageData; pixels: ImageData; pixelWidth: number; pixelHeight: number; source: Selection; bounds: Selection; rotation?: number };
 type DrawingState = {
   snapshot: LayerSnapshot;
   selection: Selection;
@@ -71,9 +71,10 @@ type HistoryEntry =
   | { kind: 'pixels'; layerId: string; image: ImageData }
   | { kind: 'layers'; before: LayerSnapshot; after: LayerSnapshot };
 type TransformMode = 'move' | 'tl' | 'tr' | 'bl' | 'br';
+type SelectionTransformMode = TransformMode | 'rotate';
 type ActiveTransform = { source: Selection; image: ImageData; pointer: { x: number; y: number }; mode: TransformMode };
-type LayerSelectionData = { layerId: string; base: ImageData; pixels: HTMLCanvasElement; source: Selection; bounds: Selection };
-type ActiveLayerSelectionTransform = { start: Selection; pointer: { x: number; y: number }; mode: TransformMode };
+type LayerSelectionData = { layerId: string; base: ImageData; pixels: HTMLCanvasElement; source: Selection; bounds: Selection; rotation: number };
+type ActiveLayerSelectionTransform = { start: Selection; startRotation: number; pointer: { x: number; y: number }; pointerAngle: number; mode: SelectionTransformMode };
 type DuetProject = {
   format: 'duet'; version: 1; exportedAt: string;
   canvas: { width: number; height: number; finalImage: string };
@@ -90,6 +91,7 @@ declare global {
 const WIDTH = 960;
 const HEIGHT = 640;
 const MIN_SELECTION_SIZE = 4;
+const ROTATE_HANDLE_OFFSET = 34;
 const MAX_PROJECT_BYTES = 64 * 1024 * 1024;
 const MAX_PROJECT_LAYERS = 64;
 const MAX_PHOTO_BYTES = 25 * 1024 * 1024;
@@ -164,6 +166,52 @@ function contentBounds(canvas: HTMLCanvasElement): Selection | null {
     left = Math.min(left, x); top = Math.min(top, y); right = Math.max(right, x); bottom = Math.max(bottom, y);
   }
   return right < 0 ? null : { x: left, y: top, width: right - left + 1, height: bottom - top + 1 };
+}
+function selectionCenter(bounds: Selection) {
+  return { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 };
+}
+function rotatePoint(point: { x: number; y: number }, centre: { x: number; y: number }, degrees: number) {
+  const radians = degrees * Math.PI / 180; const cosine = Math.cos(radians); const sine = Math.sin(radians); const dx = point.x - centre.x; const dy = point.y - centre.y;
+  return { x: centre.x + dx * cosine - dy * sine, y: centre.y + dx * sine + dy * cosine };
+}
+function rotationHandlePoint(bounds: Selection, rotation: number) {
+  const centre = selectionCenter(bounds);
+  const handleY = bounds.y >= ROTATE_HANDLE_OFFSET + 8 ? bounds.y - ROTATE_HANDLE_OFFSET : bounds.y + bounds.height + ROTATE_HANDLE_OFFSET;
+  return rotatePoint({ x: centre.x, y: handleY }, centre, rotation);
+}
+function pointInRotatedSelection(bounds: Selection, point: { x: number; y: number }, rotation: number, padding = 0) {
+  const local = rotatePoint(point, selectionCenter(bounds), -rotation);
+  return local.x >= bounds.x - padding && local.x <= bounds.x + bounds.width + padding && local.y >= bounds.y - padding && local.y <= bounds.y + bounds.height + padding;
+}
+function selectionTransformModeAtPoint(bounds: Selection, point: { x: number; y: number }, rotation: number): SelectionTransformMode {
+  const rotateHandle = rotationHandlePoint(bounds, rotation);
+  if (Math.hypot(point.x - rotateHandle.x, point.y - rotateHandle.y) <= 18) return 'rotate';
+  const local = rotatePoint(point, selectionCenter(bounds), -rotation); const edge = 18;
+  const left = Math.abs(local.x - bounds.x) < edge; const right = Math.abs(local.x - (bounds.x + bounds.width)) < edge; const top = Math.abs(local.y - bounds.y) < edge; const bottom = Math.abs(local.y - (bounds.y + bounds.height)) < edge;
+  if (left && top) return 'tl'; if (right && top) return 'tr'; if (left && bottom) return 'bl'; if (right && bottom) return 'br';
+  return 'move';
+}
+function resizeRotatedSelection(start: Selection, point: { x: number; y: number }, mode: Exclude<SelectionTransformMode, 'move' | 'rotate'>, rotation: number): Selection {
+  const centre = selectionCenter(start); const local = rotatePoint(point, centre, -rotation);
+  const anchorX = mode.includes('l') ? start.x + start.width : start.x; const anchorY = mode.includes('t') ? start.y + start.height : start.y;
+  const width = Math.max(12, Math.abs(anchorX - local.x)); const height = Math.max(12, Math.abs(anchorY - local.y));
+  const localCentre = { x: (anchorX + (mode.includes('l') ? anchorX - width : anchorX + width)) / 2, y: (anchorY + (mode.includes('t') ? anchorY - height : anchorY + height)) / 2 };
+  const worldCentre = rotatePoint(localCentre, centre, rotation);
+  return { x: worldCentre.x - width / 2, y: worldCentre.y - height / 2, width, height };
+}
+function drawRotatedSelection(ctx: CanvasRenderingContext2D, pixels: HTMLCanvasElement, bounds: Selection, rotation: number) {
+  const centre = selectionCenter(bounds); ctx.save(); ctx.translate(centre.x, centre.y); ctx.rotate(rotation * Math.PI / 180); ctx.drawImage(pixels, 0, 0, pixels.width, pixels.height, -bounds.width / 2, -bounds.height / 2, bounds.width, bounds.height); ctx.restore();
+}
+function drawRotatedSelectionFrame(ctx: CanvasRenderingContext2D, bounds: Selection, rotation: number) {
+  const centre = selectionCenter(bounds); const left = -bounds.width / 2; const top = -bounds.height / 2;
+  const handleY = bounds.y >= ROTATE_HANDLE_OFFSET + 8 ? top - ROTATE_HANDLE_OFFSET : -top + ROTATE_HANDLE_OFFSET;
+  const frameEdgeY = handleY < 0 ? top : -top; const stemEndY = handleY < 0 ? handleY + 7 : handleY - 7;
+  ctx.save(); ctx.translate(centre.x, centre.y); ctx.rotate(rotation * Math.PI / 180);
+  ctx.strokeStyle = 'rgba(0,0,0,.92)'; ctx.lineWidth = 4; ctx.setLineDash([8, 6]); ctx.strokeRect(left, top, bounds.width, bounds.height);
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.lineDashOffset = 7; ctx.strokeRect(left, top, bounds.width, bounds.height); ctx.setLineDash([]);
+  ([[-bounds.width / 2, -bounds.height / 2], [bounds.width / 2, -bounds.height / 2], [-bounds.width / 2, bounds.height / 2], [bounds.width / 2, bounds.height / 2]] as const).forEach(([x, y]) => { ctx.fillStyle = '#fff'; ctx.fillRect(x - 5, y - 5, 10, 10); ctx.strokeStyle = '#6f4ce4'; ctx.lineWidth = 2; ctx.strokeRect(x - 5, y - 5, 10, 10); });
+  ctx.beginPath(); ctx.moveTo(0, frameEdgeY); ctx.lineTo(0, stemEndY); ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.shadowColor = 'rgba(0,0,0,.85)'; ctx.shadowBlur = 2; ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, handleY, 7, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = '#6f4ce4'; ctx.lineWidth = 2; ctx.stroke(); ctx.restore();
 }
 const agentEditPolicy = {
   requirement: 'For every requested document edit, use this page\'s WebMCP tools. Do not use browser clicks, pointer drags, keyboard shortcuts, or the visible canvas controls as an alternative editing route.',
@@ -485,8 +533,9 @@ export function Duet() {
     const selected = layerSelectionRef.current;
     if (selected) {
       ctx.save(); ctx.globalAlpha = .34;
-      ctx.drawImage(selected.pixels, 0, 0, selected.pixels.width, selected.pixels.height, selected.bounds.x, selected.bounds.y, selected.bounds.width, selected.bounds.height);
+      drawRotatedSelection(ctx, selected.pixels, selected.bounds, selected.rotation);
       ctx.globalCompositeOperation = 'source-in'; ctx.fillStyle = '#65d9ff'; ctx.fillRect(0, 0, WIDTH, HEIGHT); ctx.restore();
+      drawRotatedSelectionFrame(ctx, selected.bounds, selected.rotation);
     }
     if (layerLassoPoints.current.length > 1) {
       ctx.save(); ctx.strokeStyle = 'rgba(128,221,255,.98)'; ctx.lineWidth = 2; ctx.setLineDash([7, 5]); ctx.beginPath();
@@ -508,24 +557,24 @@ export function Duet() {
     const pixelsCtx = pixels.getContext('2d')!; pixelsCtx.drawImage(source, bounds.x, bounds.y, bounds.width, bounds.height, 0, 0, bounds.width, bounds.height);
     pixelsCtx.globalCompositeOperation = 'destination-in'; pixelsCtx.drawImage(mask, bounds.x, bounds.y, bounds.width, bounds.height, 0, 0, bounds.width, bounds.height);
     const baseCanvas = makeCanvas(); const baseCtx = baseCanvas.getContext('2d')!; baseCtx.drawImage(source, 0, 0); baseCtx.globalCompositeOperation = 'destination-out'; baseCtx.drawImage(mask, 0, 0);
-    const selected: LayerSelectionData = { layerId: activeLayer, base: baseCtx.getImageData(0, 0, WIDTH, HEIGHT), pixels, source: bounds, bounds: { ...bounds } };
+    const selected: LayerSelectionData = { layerId: activeLayer, base: baseCtx.getImageData(0, 0, WIDTH, HEIGHT), pixels, source: bounds, bounds: { ...bounds }, rotation: 0 };
     layerSelectionRef.current = selected; layerLassoPoints.current = []; setLayerSelectionBounds({ ...bounds }); redrawLayerSelectionOverlay(); return bounds;
   }, [activeLayer, clearLayerSelection, redrawLayerSelectionOverlay]);
   const redrawLayerSelectionTransform = useCallback((transform: ActiveLayerSelectionTransform, point: { x: number; y: number }) => {
     const selected = layerSelectionRef.current; if (!selected) return;
     const canvas = layerCanvases.current.get(selected.layerId); if (!canvas) return;
-    const start = transform.start; let next: Selection;
+    const start = transform.start; let next: Selection = start; let rotation = transform.startRotation;
     if (transform.mode === 'move') {
       const dx = point.x - transform.pointer.x; const dy = point.y - transform.pointer.y;
       next = { x: Math.max(-start.width + 8, Math.min(WIDTH - 8, start.x + dx)), y: Math.max(-start.height + 8, Math.min(HEIGHT - 8, start.y + dy)), width: start.width, height: start.height };
+    } else if (transform.mode === 'rotate') {
+      const centre = selectionCenter(start); const angle = Math.atan2(point.y - centre.y, point.x - centre.x);
+      rotation = transform.startRotation + (angle - transform.pointerAngle) * 180 / Math.PI;
     } else {
-      const anchorX = transform.mode.includes('l') ? start.x + start.width : start.x; const anchorY = transform.mode.includes('t') ? start.y + start.height : start.y;
-      const rawX = transform.mode.includes('l') ? point.x : start.x; const rawY = transform.mode.includes('t') ? point.y : start.y;
-      const width = Math.max(12, Math.abs(anchorX - rawX)); const height = Math.max(12, Math.abs(anchorY - rawY));
-      next = { x: Math.min(anchorX, rawX), y: Math.min(anchorY, rawY), width, height };
+      next = resizeRotatedSelection(start, point, transform.mode, transform.startRotation);
     }
-    const ctx = canvas.getContext('2d')!; ctx.putImageData(selected.base, 0, 0); ctx.drawImage(selected.pixels, 0, 0, selected.pixels.width, selected.pixels.height, next.x, next.y, next.width, next.height);
-    selected.bounds = next; setLayerSelectionBounds(next); redrawLayerSelectionOverlay(); render();
+    const ctx = canvas.getContext('2d')!; ctx.putImageData(selected.base, 0, 0); drawRotatedSelection(ctx, selected.pixels, next, rotation);
+    selected.bounds = next; selected.rotation = rotation; setLayerSelectionBounds(next); redrawLayerSelectionOverlay(); render();
   }, [redrawLayerSelectionOverlay, render]);
   const clearSelection = useCallback(() => {
     const mask = selectionMaskRef.current; if (mask) mask.getContext('2d')!.clearRect(0, 0, WIDTH, HEIGHT);
@@ -632,7 +681,7 @@ export function Duet() {
     const mask = selectionMaskRef.current || makeCanvas(); const selected = layerSelectionRef.current; const viewport = viewportRef.current;
     const layerSelection: SavedLayerSelection | null = selected ? {
       layerId: selected.layerId, base: selected.base, pixels: selected.pixels.getContext('2d')!.getImageData(0, 0, selected.pixels.width, selected.pixels.height),
-      pixelWidth: selected.pixels.width, pixelHeight: selected.pixels.height, source: { ...selected.source }, bounds: { ...selected.bounds },
+      pixelWidth: selected.pixels.width, pixelHeight: selected.pixels.height, source: { ...selected.source }, bounds: { ...selected.bounds }, rotation: selected.rotation,
     } : null;
     return {
       snapshot: captureLayerSnapshot(layers, activeLayer), selection: { ...selection }, selectionMask: mask.getContext('2d')!.getImageData(0, 0, WIDTH, HEIGHT), selectionMode, selectionBrushSize, layerSelection,
@@ -648,7 +697,7 @@ export function Duet() {
     const mask = selectionMaskRef.current || makeCanvas(); mask.getContext('2d')!.putImageData(state.selectionMask, 0, 0); selectionMaskRef.current = mask; selectionHasMaskRef.current = state.selection.width > 3 && state.selection.height > 3;
     if (state.layerSelection) {
       const pixels = document.createElement('canvas'); pixels.width = state.layerSelection.pixelWidth; pixels.height = state.layerSelection.pixelHeight; pixels.getContext('2d')!.putImageData(state.layerSelection.pixels, 0, 0);
-      layerSelectionRef.current = { layerId: state.layerSelection.layerId, base: state.layerSelection.base, pixels, source: { ...state.layerSelection.source }, bounds: { ...state.layerSelection.bounds } };
+      layerSelectionRef.current = { layerId: state.layerSelection.layerId, base: state.layerSelection.base, pixels, source: { ...state.layerSelection.source }, bounds: { ...state.layerSelection.bounds }, rotation: state.layerSelection.rotation || 0 };
       setLayerSelectionBounds({ ...state.layerSelection.bounds });
     }
     const nextZoom = clamp(state.zoom, 25, 400); zoomRef.current = nextZoom; setZoom(nextZoom); setLeftSidebarOpen(state.chrome.leftSidebarOpen); setRightSidebarOpen(state.chrome.rightSidebarOpen); setShowBranding(state.chrome.showBranding);
@@ -686,7 +735,7 @@ export function Duet() {
     const selected = layerSelectionRef.current; if (!selected || selected.layerId !== activeLayer) return;
     const before = captureLayerSnapshot(layers, activeLayer);
     const id = `layer-${Date.now()}-${Math.random().toString(16).slice(2)}`; const canvas = makeCanvas();
-    canvas.getContext('2d')!.drawImage(selected.pixels, 0, 0, selected.pixels.width, selected.pixels.height, selected.bounds.x, selected.bounds.y, selected.bounds.width, selected.bounds.height);
+    drawRotatedSelection(canvas.getContext('2d')!, selected.pixels, selected.bounds, selected.rotation);
     layerCanvases.current.set(id, canvas);
     const activeIndex = Math.max(0, layers.findIndex((layer) => layer.id === activeLayer));
     const sourceName = layers[activeIndex]?.name || 'Layer';
@@ -1118,11 +1167,13 @@ export function Duet() {
     }
     if (tool === 'layer-lasso') {
       const selected = layerSelectionRef.current; const bounds = selected?.bounds;
-      const inside = !!bounds && point.x >= bounds.x - 18 && point.x <= bounds.x + bounds.width + 18 && point.y >= bounds.y - 18 && point.y <= bounds.y + bounds.height + 18;
+      const rotation = selected?.rotation || 0; const rotateHandle = bounds ? rotationHandlePoint(bounds, rotation) : null;
+      const inside = !!bounds && (pointInRotatedSelection(bounds, point, rotation, 18) || (!!rotateHandle && Math.hypot(point.x - rotateHandle.x, point.y - rotateHandle.y) <= 18));
       if (selected && selected.layerId === activeLayer && bounds && inside) {
         const ctx = layerCanvases.current.get(activeLayer)?.getContext('2d'); if (!ctx) return;
         undoStack.current.push({ kind: 'pixels', layerId: activeLayer, image: ctx.getImageData(0, 0, WIDTH, HEIGHT) }); if (undoStack.current.length > 15) undoStack.current.shift(); redoStack.current = [];
-        activeLayerSelectionTransform.current = { start: { ...bounds }, pointer: point, mode: transformModeAtPoint(bounds, point) };
+        const centre = selectionCenter(bounds);
+        activeLayerSelectionTransform.current = { start: { ...bounds }, startRotation: rotation, pointer: point, pointerAngle: Math.atan2(point.y - centre.y, point.x - centre.x), mode: selectionTransformModeAtPoint(bounds, point, rotation) };
       } else {
         clearLayerSelection(); layerLassoPoints.current = [point]; redrawLayerSelectionOverlay();
       }
@@ -1187,7 +1238,7 @@ export function Duet() {
       if (finalSelection.width > MIN_SELECTION_SIZE && finalSelection.height > MIN_SELECTION_SIZE) addActivity('Region selected', `${selectionMode === 'rectangle' ? 'Rectangle' : selectionMode === 'brush' ? 'Brush mask' : 'Lasso'} · ${Math.round(finalSelection.width)} × ${Math.round(finalSelection.height)} px`);
     }
     if (drawing.current && tool === 'layer-lasso') {
-      if (activeLayerSelectionTransform.current) addActivity('Selected pixels transformed', 'Move or resize · undoable');
+      if (activeLayerSelectionTransform.current) addActivity('Selected pixels transformed', 'Move, resize, or rotate · undoable');
       else if (cancelled) clearLayerSelection();
       else {
         const bounds = finishLayerLasso();
@@ -1419,7 +1470,7 @@ export function Duet() {
             {(tool === 'smudge' || tool === 'blur') && <><span className="bar-label">Strength</span><Slider className="brush-opacity-slider" min={1} max={100} value={[effectStrength]} onValueChange={(value) => setEffectStrength(Math.round(Array.isArray(value) ? value[0] : Number(value)))} /><span className="opacity-readout">{effectStrength}%</span></>}
             {tool === 'text' && <><label className="bar-label" htmlFor="text-font">Font</label><select id="text-font" className="font-select" value={textFont} onChange={(event) => setTextFont(event.target.value as TextFont)}>{textFonts.map((font) => <option key={font.id} value={font.id}>{font.label}</option>)}</select><span className="bar-label">Size</span><Slider className="text-size-slider" min={10} max={180} value={[textSize]} onValueChange={(value) => setTextSize(Math.round(Array.isArray(value) ? value[0] : Number(value)))} /><span className="size-readout">{textSize}px</span><span className="bar-hint">Click the canvas, type, then click away</span></>}
             {tool === 'select' && <><div className="selection-modes" aria-label="Selection shape"><button className={selectionMode === 'rectangle' ? 'active' : ''} title="Rectangle selection" aria-label="Rectangle selection" onClick={() => changeSelectionMode('rectangle')}><SquareDashed /></button><button className={selectionMode === 'brush' ? 'active' : ''} title="Brush selection" aria-label="Brush selection" onClick={() => changeSelectionMode('brush')}><Paintbrush /></button><button className={selectionMode === 'lasso' ? 'active' : ''} title="Lasso selection" aria-label="Lasso selection" onClick={() => changeSelectionMode('lasso')}><LassoSelect /></button></div>{selectionMode === 'brush' && <><span className="bar-label">Size</span><Slider className="selection-brush-slider" min={8} max={180} value={[selectionBrushSize]} onValueChange={(value) => setSelectionBrushSize(Math.round(Array.isArray(value) ? value[0] : Number(value)))} /><span className="size-readout">{selectionBrushSize}px</span></>}<span className="bar-hint">{selectionMode === 'rectangle' ? 'Drag a rectangle' : selectionMode === 'brush' ? 'Paint the area to include' : 'Draw around an area · release to close'}</span><button className="selection-clear" onClick={clearSelection} title="Clear selection" aria-label="Clear selection"><X /></button></>}
-            {tool === 'layer-lasso' && <>{layerSelectionBounds ? <div className="layer-lasso-actions"><button onClick={cloneLayerSelection} title="Clone selection to a new layer"><Copy />Clone</button><button onClick={deleteLayerSelection} title="Delete selected pixels"><Trash2 />Delete</button><button className="icon-only" onClick={clearLayerSelection} title="Clear selection" aria-label="Clear layer selection"><X /></button></div> : <span className="bar-hint">Draw around pixels on the active layer</span>}</>}
+            {tool === 'layer-lasso' && <>{layerSelectionBounds ? <><div className="layer-lasso-actions"><button onClick={cloneLayerSelection} title="Clone selection to a new layer"><Copy />Clone</button><button onClick={deleteLayerSelection} title="Delete selected pixels"><Trash2 />Delete</button><button className="icon-only" onClick={clearLayerSelection} title="Clear selection" aria-label="Clear layer selection"><X /></button></div><span className="bar-hint">Drag the circle to rotate</span></> : <span className="bar-hint">Draw around pixels on the active layer</span>}</>}
             {tool === 'transform' && <span className="bar-hint">Drag layer to move · drag a corner to resize</span>}{tool === 'eyedropper' && <span className="bar-hint">Press and drag to preview · release to choose</span>}
           </div>
           <div className="history-controls"><Button variant="ghost" size="icon-sm" onClick={undo} aria-label="Undo"><Undo2 /></Button><Button variant="ghost" size="icon-sm" onClick={redo} aria-label="Redo"><Redo2 /></Button></div>

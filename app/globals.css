@@ -2307,6 +2307,11 @@ button {
     0 0 24px rgba(74, 184, 255, 0.18);
   pointer-events: none;
 }
+.layer-selection-box {
+  /* Layer-lasso transforms render on the canvas so the frame and rotation
+     handle stay perfectly aligned at every zoom level. */
+  display: none;
+}
 .transform-box::before,
 .layer-selection-box::before {
   content: '';
